@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::BufRead;
+use std::io::Read;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Bencode {
     Int(i64),
     Bytes(Vec<u8>),
     List(Vec<Bencode>),
-    Dict(BTreeMap<Vec<u8>, Bencode>)
+    Dict(BTreeMap<Vec<u8>, Bencode>),
 }
 
 #[derive(Debug)]
@@ -19,7 +19,7 @@ pub enum Error {
     TrailingData(usize),
     InvalidDictKey(usize),
     ParseIntError(std::num::ParseIntError),
-    Other(String)
+    Other(String),
 }
 
 impl From<std::num::ParseIntError> for Error {
@@ -59,19 +59,19 @@ fn encode_to(value: &Bencode, out: &mut Vec<u8>) {
             out.push(b'i');
             out.extend_from_slice(i.to_string().as_bytes());
             out.push(b'e');
-        },
+        }
         Bencode::Bytes(bytes) => {
             out.extend_from_slice(bytes.len().to_string().as_bytes());
             out.push(b':');
             out.extend_from_slice(bytes);
-        },
+        }
         Bencode::List(items) => {
             out.push(b'l');
             for it in items {
                 encode_to(it, out);
             }
             out.push(b'e');
-        },
+        }
         Bencode::Dict(map) => {
             out.push(b'd');
             for (k, v) in map.iter() {
@@ -81,12 +81,15 @@ fn encode_to(value: &Bencode, out: &mut Vec<u8>) {
                 encode_to(v, out);
             }
             out.push(b'e');
-        },
+        }
     }
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Bencode> {
-    let mut p = Parser { data: bytes, pos: 0 };
+    let mut p = Parser {
+        data: bytes,
+        pos: 0,
+    };
     let v = p.parse_value()?;
     if p.pos != bytes.len() {
         return Err(Error::TrailingData(p.pos));
@@ -96,7 +99,7 @@ pub fn decode(bytes: &[u8]) -> Result<Bencode> {
 
 struct Parser<'a> {
     data: &'a [u8],
-    pos: usize
+    pos: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -116,7 +119,7 @@ impl<'a> Parser<'a> {
             b'l' => self.parse_list(),
             b'd' => self.parse_dict(),
             b'0'..=b'9' => self.parse_bytes(),
-            other => Err(Error::UnexpectedByte(other, self.pos))
+            other => Err(Error::UnexpectedByte(other, self.pos)),
         }
     }
 
@@ -140,7 +143,8 @@ impl<'a> Parser<'a> {
         } else if slice[0] == b'0' && slice.len() > 1 {
             return Err(Error::LeadingZero(self.pos));
         }
-        let s = std::str::from_utf8(slice).map_err(|_| Error::InvalidInteger(String::from("not utf8")))?;
+        let s = std::str::from_utf8(slice)
+            .map_err(|_| Error::InvalidInteger(String::from("not utf8")))?;
         let val = s.parse::<i64>().map_err(Error::from)?;
         self.pos = end + 1;
         Ok(Bencode::Int(val))
@@ -175,7 +179,8 @@ impl<'a> Parser<'a> {
         if len_slice[0] == b'0' && len_slice.len() > 1 {
             return Err(Error::LeadingZero(len_start));
         }
-        let len_str = std::str::from_utf8(len_slice).map_err(|_| Error::InvalidInteger(String::from("not utf8")))?;
+        let len_str = std::str::from_utf8(len_slice)
+            .map_err(|_| Error::InvalidInteger(String::from("not utf8")))?;
         let len = len_str.parse::<usize>().map_err(Error::from)?;
         self.pos = colon + 1;
         if self.pos + len > self.data.len() {
@@ -185,14 +190,14 @@ impl<'a> Parser<'a> {
         self.pos += len;
         Ok(Bencode::Bytes(bytes))
     }
-    
+
     fn parse_dict(&mut self) -> Result<Bencode> {
         assert_eq!(self.next()?, b'd');
         let mut map = BTreeMap::new();
         while self.peek()? != b'e' {
             let key = match self.parse_bytes()? {
                 Bencode::Bytes(k) => k,
-                _ => return Err(Error::InvalidDictKey(self.pos))
+                _ => return Err(Error::InvalidDictKey(self.pos)),
             };
             let val = self.parse_value()?;
             map.insert(key, val);
@@ -202,22 +207,29 @@ impl<'a> Parser<'a> {
     }
 }
 
-pub fn decode_from_reader<R: BufRead>(mut reader: R) -> Result<Bencode> {
-    let mut parser = StreamParser { reader: &mut reader, buf: Vec::new(), pos: 0 };
+pub fn decode_from_reader<R: Read>(mut reader: R) -> Result<Bencode> {
+    let mut parser = StreamParser {
+        reader: &mut reader,
+        buf: Vec::new(),
+        pos: 0,
+    };
     parser.parse_value()
 }
 
-struct StreamParser<'a, R: BufRead> {
+struct StreamParser<'a, R: Read> {
     reader: &'a mut R,
     buf: Vec<u8>,
-    pos: usize
+    pos: usize,
 }
 
-impl<'a, R: BufRead> StreamParser<'a, R> {
+impl<'a, R: Read> StreamParser<'a, R> {
     fn peek(&mut self) -> Result<u8> {
         if self.pos >= self.buf.len() {
             let mut byte = [0u8; 1];
-            let n = self.reader.read(&mut byte).map_err(|e| Error::Other(e.to_string()))?;
+            let n = self
+                .reader
+                .read(&mut byte)
+                .map_err(|e| Error::Other(e.to_string()))?;
             if n == 0 {
                 return Err(Error::UnexpectedEof);
             }
@@ -238,7 +250,7 @@ impl<'a, R: BufRead> StreamParser<'a, R> {
             b'l' => self.parse_list(),
             b'd' => self.parse_dict(),
             b'0'..=b'9' => self.parse_bytes(),
-            other => Err(Error::UnexpectedByte(other, self.pos))
+            other => Err(Error::UnexpectedByte(other, self.pos)),
         }
     }
 
@@ -247,10 +259,13 @@ impl<'a, R: BufRead> StreamParser<'a, R> {
         let mut buf = Vec::new();
         loop {
             let b = self.next()?;
-            if  b == b'e' { break; }
+            if b == b'e' {
+                break;
+            }
             buf.push(b);
         }
-        let s = std::str::from_utf8(&buf).map_err(|_| Error::InvalidInteger(String::from("not utf8")))?;
+        let s = std::str::from_utf8(&buf)
+            .map_err(|_| Error::InvalidInteger(String::from("not utf8")))?;
         let val = s.parse::<i64>().map_err(Error::from)?;
         Ok(Bencode::Int(val))
     }
@@ -259,13 +274,18 @@ impl<'a, R: BufRead> StreamParser<'a, R> {
         let mut len_buf = Vec::new();
         loop {
             let b = self.next()?;
-            if b == b':' { break; }
+            if b == b':' {
+                break;
+            }
             len_buf.push(b);
         }
-        let len_str = std::str::from_utf8(&len_buf).map_err(|_| Error::InvalidInteger(String::from("not utf8")))?;
+        let len_str = std::str::from_utf8(&len_buf)
+            .map_err(|_| Error::InvalidInteger(String::from("not utf8")))?;
         let len = len_str.parse::<usize>().map_err(Error::from)?;
         let mut data = vec![0u8; len];
-        self.reader.read_exact(&mut data).map_err(|e| Error::Other(e.to_string()))?;
+        self.reader
+            .read_exact(&mut data)
+            .map_err(|e| Error::Other(e.to_string()))?;
         Ok(Bencode::Bytes(data))
     }
 
@@ -285,7 +305,7 @@ impl<'a, R: BufRead> StreamParser<'a, R> {
         while self.peek()? != b'e' {
             let key = match self.parse_bytes()? {
                 Bencode::Bytes(k) => k,
-                _ => return Err(Error::InvalidDictKey(self.pos))
+                _ => return Err(Error::InvalidDictKey(self.pos)),
             };
             let value = self.parse_value()?;
             map.insert(key, value);
@@ -303,21 +323,56 @@ impl Bencode {
     pub fn as_int(&self) -> Option<i64> {
         match self {
             Bencode::Int(i) => Some(*i),
-            _ => None
+            _ => None,
         }
+    }
+
+    pub fn int(&self) -> Result<i64> {
+        if let Some(n) = self.as_int() {
+            return Ok(n);
+        }
+        Err(Error::Other(String::from("bencode is not int")))
     }
 
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Bencode::Bytes(b) => Some(b.as_slice()),
-            _ => None
+            _ => None,
         }
+    }
+
+    pub fn bytes(&self) -> Result<&[u8]> {
+        if let Some(bytes) = self.as_bytes() {
+            return Ok(bytes);
+        }
+        Err(Error::Other(String::from("bencode is not bytes")))
     }
 
     pub fn as_dict(&self) -> Option<&BTreeMap<Vec<u8>, Bencode>> {
         match self {
             Bencode::Dict(map) => Some(map),
-            _ => None
+            _ => None,
         }
+    }
+
+    pub fn dict(&self) -> Result<&BTreeMap<Vec<u8>, Bencode>> {
+        if let Some(map) = self.as_dict() {
+            return Ok(map);
+        }
+        Err(Error::Other(String::from("bencode is not dict")))
+    }
+
+    pub fn as_list(&self) -> Option<&Vec<Bencode>> {
+        match self {
+            Bencode::List(list) => Some(list),
+            _ => None,
+        }
+    }
+
+    pub fn list(&self) -> Result<&Vec<Bencode>> {
+        if let Some(list) = self.as_list() {
+            return Ok(list);
+        }
+        Err(Error::Other(String::from("bencode is not list")))
     }
 }

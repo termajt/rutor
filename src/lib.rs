@@ -4,3 +4,4 @@ pub mod peer;
 pub mod pool;
 pub mod queue;
 pub mod socketmanager;
+pub mod torrent;
