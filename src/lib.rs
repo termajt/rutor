@@ -1,3 +1,4 @@
+pub mod announce;
 pub mod bencode;
 pub mod bitfield;
 pub mod peer;

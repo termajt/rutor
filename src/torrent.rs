@@ -60,7 +60,7 @@ pub struct TorrentInfo {
     name: String,
     piece_length: u32,
     piece_hashes: Vec<[u8; 20]>,
-    total_size: u64,
+    pub total_size: u64,
     files: Vec<TorrentFile>,
     bitfield: Bitfield,
 }
@@ -152,10 +152,10 @@ impl TorrentInfo {
 
 #[derive(Debug, Clone)]
 pub struct Torrent {
-    announce: Option<String>,
-    announce_list: Vec<Vec<String>>,
-    info: TorrentInfo,
-    info_hash: [u8; 20],
+    pub announce: Option<String>,
+    pub announce_list: Vec<Vec<String>>,
+    pub info: TorrentInfo,
+    pub info_hash: [u8; 20],
 }
 
 impl Torrent {
