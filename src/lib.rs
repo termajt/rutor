@@ -1,6 +1,7 @@
 pub mod announce;
 pub mod bencode;
 pub mod bitfield;
+pub mod client;
 pub mod peer;
 pub mod pool;
 pub mod queue;

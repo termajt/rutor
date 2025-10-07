@@ -58,7 +58,7 @@ pub struct TorrentFile {
 #[derive(Debug, Clone)]
 pub struct TorrentInfo {
     name: String,
-    piece_length: u32,
+    pub piece_length: u32,
     piece_hashes: Vec<[u8; 20]>,
     pub total_size: u64,
     files: Vec<TorrentFile>,
