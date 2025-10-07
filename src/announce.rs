@@ -1,10 +1,12 @@
 use std::fmt::Write;
+use std::net::UdpSocket;
 use std::time::Instant;
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs},
     time::Duration,
 };
 
+use rand::RngCore;
 use reqwest::blocking::Client;
 
 use crate::{
@@ -51,10 +53,13 @@ impl TrackerState {
 
     /// Updates the tracker state from a tracker response, resetting the timer and interval.
     pub fn update_from_response(&mut self, resp: &TrackerResponse) {
-        self.last_announce = Some(Instant::now());
         if let Some(interval) = resp.interval {
             self.next_interval = Duration::from_secs(interval as u64);
         }
+    }
+
+    pub fn announced(&mut self) {
+        self.last_announce = Some(Instant::now());
     }
 }
 
@@ -214,22 +219,78 @@ fn parse_dict_peers(list: &[Bencode]) -> Result<Vec<SocketAddr>, Box<dyn std::er
     Ok(peers)
 }
 
-/// Performs an HTTP announce to a tracker.
+/// Announces the client's presence and download status to a BitTorrent tracker.
 ///
-/// Returns a `TrackerResponse` with interval, peers, and other info.
+/// This function automatically detects whether the tracker URL uses the
+/// `http://` or `udp://` protocol and calls the corresponding announce
+/// implementation (`announce_http` or `announce_udp`).
 ///
-/// # Arguments
+/// # Parameters
 ///
-/// * `tracker_url` - The announce URL of the tracker.
-/// * `info_hash` - 20-byte SHA1 info_hash of the torrent.
-/// * `peer_id` - 20-byte peer ID of the client.
-/// * `port` - Port number the client is listening on.
-/// * `uploaded` - Total bytes uploaded so far.
-/// * `downloaded` - Total bytes downloaded so far.
-/// * `left` - Bytes left to download.
-/// * `event` - Optional event (`started`, `stopped`, `completed`).
-/// * `timeout` - Optional HTTP timeout for the request.
-pub fn announce_http(
+/// * `tracker_url` - The full tracker announce URL (e.g., `"http://tracker.example.com/announce"`
+///   or `"udp://tracker.opentrackr.org:1337/announce"`).
+/// * `info_hash` - The 20-byte SHA-1 hash of the torrent’s info dictionary.
+/// * `peer_id` - The 20-byte unique peer identifier for this client instance.
+/// * `port` - The TCP/UDP port on which this client is listening for incoming peers.
+/// * `uploaded` - Total number of bytes uploaded so far.
+/// * `downloaded` - Total number of bytes downloaded so far.
+/// * `left` - Number of bytes left to download (i.e., remaining payload).
+/// * `event` - Optional tracker event, such as `"started"`, `"stopped"`, or `"completed"`.
+/// * `timeout` - Optional network timeout to apply for tracker communication.
+///
+/// # Returns
+///
+/// On success, returns a [`TrackerResponse`] containing interval, peer list, and
+/// seeder/leecher counts as reported by the tracker.  
+/// On failure, returns an error describing the issue.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The tracker URL has an unsupported protocol (not HTTP or UDP)
+/// - The network operation fails (e.g., timeout, connection error)
+/// - The tracker returns malformed or invalid data
+pub fn announce(
+    tracker_url: &str,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    uploaded: u64,
+    downloaded: u64,
+    left: u64,
+    event: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<TrackerResponse, Box<dyn std::error::Error>> {
+    if tracker_url.starts_with("http://") {
+        announce_http(
+            tracker_url,
+            info_hash,
+            peer_id,
+            port,
+            uploaded,
+            downloaded,
+            left,
+            event,
+            timeout,
+        )
+    } else if tracker_url.starts_with("udp://") {
+        announce_udp(
+            tracker_url,
+            info_hash,
+            peer_id,
+            port,
+            uploaded,
+            downloaded,
+            left,
+            event,
+            timeout,
+        )
+    } else {
+        Err("invalid tracker protocol".into())
+    }
+}
+
+fn announce_http(
     tracker_url: &str,
     info_hash: &[u8; 20],
     peer_id: &[u8; 20],
@@ -256,10 +317,7 @@ pub fn announce_http(
     if let Some(ev) = event {
         url.push_str(format!("&event={}", ev).as_str());
     }
-    let timeout = match timeout {
-        Some(t) => t,
-        _ => Duration::from_secs(30),
-    };
+    let timeout = timeout.unwrap_or(Duration::from_secs(30));
     let client = Client::builder()
         .user_agent("Rutor/0.1")
         .timeout(timeout)
@@ -274,4 +332,117 @@ pub fn announce_http(
     let bencoded = bencode::decode_from_reader(&mut response)?;
     let tracker_response = TrackerResponse::from_bencode(&bencoded)?;
     Ok(tracker_response)
+}
+
+fn announce_udp(
+    tracker_url: &str,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    uploaded: u64,
+    downloaded: u64,
+    left: u64,
+    event: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<TrackerResponse, Box<dyn std::error::Error>> {
+    let timeout = timeout.unwrap_or(Duration::from_secs(15));
+    let addr_str = tracker_url.strip_prefix("udp://").unwrap_or(tracker_url);
+    let host_port = addr_str.split('/').next().unwrap_or(tracker_url);
+    let tracker_addr = host_port
+        .to_socket_addrs()?
+        .next()
+        .ok_or("invalid udp tracker address")?;
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+
+    let mut buf = Vec::with_capacity(16);
+    let conn_id: u64 = 0x41727101980;
+    let action_connect: u32 = 0;
+    let transaction_id: u32 = rand::rng().next_u32();
+
+    buf.extend_from_slice(&conn_id.to_be_bytes());
+    buf.extend_from_slice(&action_connect.to_be_bytes());
+    buf.extend_from_slice(&transaction_id.to_be_bytes());
+    send_all(&mut buf, &socket, tracker_addr, timeout)?;
+
+    let resp = recv_packet(&socket, timeout)?;
+    if resp.len() < 16 {
+        return Err("invalid connect response".into());
+    }
+    let action = u32::from_be_bytes(resp[0..4].try_into()?);
+    let rx_tx_id = u32::from_be_bytes(resp[4..8].try_into()?);
+    if action != 0 || rx_tx_id != transaction_id {
+        return Err("invalid connect response (bad action or transaction id)".into());
+    }
+    let connection_id = u64::from_be_bytes(resp[8..16].try_into()?);
+
+    let action_announce: u32 = 1;
+    let transaction_id = rand::rng().next_u32();
+    let event_code: u32 = match event {
+        Some("completed") => 1,
+        Some("started") => 2,
+        Some("stopped") => 3,
+        _ => 0,
+    };
+
+    let mut req = Vec::with_capacity(98);
+    req.extend_from_slice(&connection_id.to_be_bytes());
+    req.extend_from_slice(&action_announce.to_be_bytes());
+    req.extend_from_slice(&transaction_id.to_be_bytes());
+    req.extend_from_slice(info_hash);
+    req.extend_from_slice(peer_id);
+    req.extend_from_slice(&downloaded.to_be_bytes());
+    req.extend_from_slice(&left.to_be_bytes());
+    req.extend_from_slice(&uploaded.to_be_bytes());
+    req.extend_from_slice(&event_code.to_be_bytes());
+    req.extend_from_slice(&0u32.to_be_bytes());
+    req.extend_from_slice(&rand::rng().next_u32().to_be_bytes());
+    req.extend_from_slice(&(-1i32).to_be_bytes());
+    req.extend_from_slice(&port.to_be_bytes());
+    send_all(&mut req, &socket, tracker_addr, timeout)?;
+
+    let resp = recv_packet(&socket, timeout)?;
+    if resp.len() < 20 {
+        return Err("invalid announce response".into());
+    }
+
+    let action = u32::from_be_bytes(resp[0..4].try_into()?);
+    let rx_tx_id = u32::from_be_bytes(resp[4..8].try_into()?);
+    if action != 1 || rx_tx_id != transaction_id {
+        return Err("invalid announce response (bad action or transaction id)".into());
+    }
+
+    let interval = u32::from_be_bytes(resp[8..12].try_into()?);
+    let leechers = u32::from_be_bytes(resp[12..16].try_into()?);
+    let seeders = u32::from_be_bytes(resp[16..20].try_into()?);
+
+    let peers = parse_compact_peers(&resp[20..])?;
+    Ok(TrackerResponse {
+        interval: Some(interval),
+        min_interval: None,
+        tracker_id: None,
+        complete: Some(seeders),
+        incomplete: Some(leechers),
+        peers: peers,
+    })
+}
+
+fn send_all(
+    data: &mut Vec<u8>,
+    socket: &UdpSocket,
+    addr: SocketAddr,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    socket.set_write_timeout(Some(timeout))?;
+    let _ = socket.send_to(&data, addr)?;
+    Ok(())
+}
+
+fn recv_packet(
+    socket: &UdpSocket,
+    timeout: Duration,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    socket.set_read_timeout(Some(timeout))?;
+    let mut buf = [0u8; 2048];
+    let (n, _) = socket.recv_from(&mut buf)?;
+    Ok(buf[..n].to_vec())
 }

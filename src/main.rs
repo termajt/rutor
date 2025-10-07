@@ -28,8 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         if let Some(tracker) = manager.next_due_tracker() {
             println!("Announcing to {}", tracker.url);
-
-            match announce::announce_http(
+            tracker.announced();
+            match announce::announce(
                 &tracker.url,
                 &torrent.info_hash,
                 &PEER_ID,
