@@ -20,6 +20,10 @@ pub enum Command {
     Send(RawFd, Vec<u8>),
     /// Close the client with the given file descriptor.
     Close(RawFd),
+    // Close the client with the given socket.
+    CloseSocket(Socket),
+    // Add socket.
+    Add(Socket),
 }
 
 /// Represents a socket managed by the `SocketManager`.
@@ -28,9 +32,10 @@ pub enum Socket {
     /// A listening TCP socket.
     Listener(TcpListener),
     /// A connected TCP client socket.
-    Client(TcpStream),
+    Client((TcpStream, SocketAddr)),
 }
 
+#[derive(Debug)]
 struct Connection {
     socket: Socket,
     send_queue: VecDeque<Vec<u8>>,
@@ -46,6 +51,7 @@ impl Connection {
 }
 
 /// Manages multiple TCP connections using `epoll` with edge-triggered mode.
+#[derive(Debug)]
 pub struct SocketManager {
     epoll_fd: RawFd,
     conns: HashMap<RawFd, Connection>,
@@ -70,7 +76,7 @@ impl SocketManager {
 
     fn get_socket_fd(&self, socket: &Socket) -> RawFd {
         match socket {
-            Socket::Client(stream) => stream.as_raw_fd(),
+            Socket::Client((stream, _)) => stream.as_raw_fd(),
             Socket::Listener(listener) => listener.as_raw_fd(),
         }
     }
@@ -133,14 +139,20 @@ impl SocketManager {
         &mut self,
         rx: &Receiver<Command>,
         sender: &Sender<(Vec<u8>, SocketAddr, RawFd)>,
-    ) -> io::Result<()> {
+    ) -> io::Result<Vec<Socket>> {
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
                 Command::Send(fd, data) => self.queue_message(fd, data),
                 Command::Close(fd) => self.remove_socket(fd),
+                Command::Add(socket) => self.add_socket(socket)?,
+                Command::CloseSocket(socket) => match socket {
+                    Socket::Client((s, _)) => self.remove_socket(s.as_raw_fd()),
+                    Socket::Listener(s) => self.remove_socket(s.as_raw_fd()),
+                },
             }
         }
 
+        let mut disconnected_sockets = Vec::new();
         const MAX_EVENTS: usize = 32;
         let mut events = [epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
         let nfds =
@@ -148,7 +160,7 @@ impl SocketManager {
         if nfds < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
-                return Ok(());
+                return Ok(disconnected_sockets);
             }
             return Err(err);
         }
@@ -163,24 +175,22 @@ impl SocketManager {
                         if let Err(e) = self.handle_accept(listener) {
                             eprintln!("listener accept error: {e}");
                             self.remove_socket(fd);
+                            disconnected_sockets.push(conn.socket);
                             continue;
                         }
                     }
-                    Socket::Client(stream) => {
+                    Socket::Client((stream, addr)) => {
                         if (ev.events & EPOLLIN as u32) != 0 {
                             match self.handle_read(stream) {
                                 Ok(data) => {
-                                    if let Err(e) = sender.send((
-                                        data,
-                                        stream.peer_addr().unwrap(),
-                                        stream.as_raw_fd(),
-                                    )) {
+                                    if let Err(e) = sender.send((data, *addr, stream.as_raw_fd())) {
                                         eprintln!("failed to notify data received: {e}");
                                     }
                                 }
                                 Err(e) => {
                                     eprintln!("client read error: {e}");
                                     self.remove_socket(fd);
+                                    disconnected_sockets.push(conn.socket);
                                     continue;
                                 }
                             }
@@ -189,6 +199,7 @@ impl SocketManager {
                             if let Err(e) = self.handle_write(stream, &mut conn.send_queue) {
                                 eprintln!("client write error: {e}");
                                 self.remove_socket(fd);
+                                disconnected_sockets.push(conn.socket);
                                 continue;
                             }
                         }
@@ -201,7 +212,7 @@ impl SocketManager {
             }
         }
 
-        Ok(())
+        Ok(disconnected_sockets)
     }
 
     fn handle_accept(&mut self, listener: &mut TcpListener) -> io::Result<()> {
@@ -209,7 +220,7 @@ impl SocketManager {
             match listener.accept() {
                 Ok((stream, addr)) => {
                     println!("New connection: {addr:?}");
-                    if let Err(e) = self.add_socket(Socket::Client(stream)) {
+                    if let Err(e) = self.add_socket(Socket::Client((stream, addr))) {
                         eprintln!("Failed to add client connection: {e}");
                     }
                 }

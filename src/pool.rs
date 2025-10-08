@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     sync::{Arc, Condvar, Mutex},
     thread,
     time::Duration,
@@ -18,6 +19,16 @@ struct PoolState {
     available: Condvar,
 }
 
+impl fmt::Debug for PoolState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PoolState")
+            .field("jobs", &self.jobs.lock().unwrap().len())
+            .field("workers", &self.workers.lock().unwrap().len())
+            .field("available", &self.available)
+            .finish()
+    }
+}
+
 /// A dynamically-scaling thread pool with an idle timeout.
 ///
 /// The pool will:
@@ -26,6 +37,7 @@ struct PoolState {
 /// - Terminate idle threads after `idle_timeout`.
 ///
 /// When dropped, the pool gracefully stops all workers and waits for them to exit.
+#[derive(Debug)]
 pub struct ThreadPool {
     state: Arc<PoolState>,
     max_workers: usize,

@@ -34,6 +34,7 @@ impl<T> fmt::Display for QueueError<T> {
 
 impl<T> std::error::Error for QueueError<T> where T: fmt::Debug {}
 
+#[derive(Debug)]
 struct InnerState<T> {
     buffer: VecDeque<T>,
     capacity: Option<usize>,
@@ -42,6 +43,7 @@ struct InnerState<T> {
     consumers: usize,
 }
 
+#[derive(Debug)]
 struct Inner<T> {
     state: Mutex<InnerState<T>>,
     not_empty: Condvar,
@@ -68,6 +70,7 @@ impl<T> Inner<T> {
 ///
 /// Cloning a `Sender` increases the number of active producers.
 /// When all senders are dropped, the queue automatically closes.
+#[derive(Debug)]
 pub struct Sender<T> {
     inner: Arc<Inner<T>>,
 }
@@ -76,6 +79,7 @@ pub struct Sender<T> {
 ///
 /// Cloning a `Receiver` increases the number of active consumers.
 /// When all receivers are dropped, senders will see `Disconnected` errors.
+#[derive(Debug)]
 pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
 }
