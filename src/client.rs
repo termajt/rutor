@@ -94,14 +94,20 @@ impl TorrentClient {
     ///
     /// Initializes shared state, thread pool, and generates a unique peer ID.
     pub fn new(torrent: Torrent, port: u16) -> Result<Self, Box<dyn std::error::Error>> {
+        let torrent = Arc::new(torrent);
         let total_size = torrent.info.total_size;
         let peer_id = generate_peer_id();
         let tpool = Arc::new(ThreadPool::new());
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_condvar = Arc::new(Condvar::new());
-        let peer_manager = Arc::new(PeerManager::new(50, tpool.clone(), shutdown.clone())?);
+        let peer_manager = Arc::new(PeerManager::new(
+            50,
+            tpool.clone(),
+            shutdown.clone(),
+            torrent.clone(),
+        )?);
         Ok(Self {
-            torrent: Arc::new(torrent),
+            torrent: torrent,
             state: Arc::new(Mutex::new(TorrentState::new(total_size, port))),
             tpool: tpool,
             peer_id: peer_id,
@@ -173,15 +179,14 @@ impl TorrentClient {
         let peer_manager = self.peer_manager.clone();
         self.tpool.execute(move || {
             while !shutdown.load(Ordering::Relaxed) {
-                while let Some((data, addr, _fd)) = peer_manager.next_peer_message() {
-                    println!("recv {} bytes from addr {addr}", data.len());
-                }
-
                 if let Err(e) = peer_manager.handle_connections() {
                     eprintln!("socket manager error: {e}");
                 }
-                let rx = peer_manager.connect_peers(info_hash, peer_id);
-                while let Ok((addr, status)) = rx.try_recv() {
+                peer_manager.connect_peers(info_hash, peer_id);
+                while let Ok((addr, status)) = peer_manager
+                    .connect_rx
+                    .recv_timeout(Duration::from_millis(500))
+                {
                     match status {
                         PeerStatus::Connected => {
                             peer_manager.mark_connected(addr);
@@ -202,6 +207,26 @@ impl TorrentClient {
                 state = result.0;
                 state.peers = peer_manager.peer_count();
                 state.connected_peers = peer_manager.connected_peers();
+            }
+        });
+        let shutdown = self.shutdown.clone();
+        let peer_manager = self.peer_manager.clone();
+        self.tpool.execute(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                peer_manager.run_handle_data();
+                peer_manager.run_parse_messages();
+            }
+        });
+        let shutdown = self.shutdown.clone();
+        let peer_manager = self.peer_manager.clone();
+        self.tpool.execute(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                if let Ok((addr, message)) = peer_manager
+                    .peer_msg_rx
+                    .recv_timeout(Duration::from_millis(500))
+                {
+                    peer_manager.handle_message(addr, message);
+                }
             }
         });
     }

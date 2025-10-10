@@ -89,4 +89,25 @@ impl Bitfield {
     pub fn as_bytes(&self) -> &[u8] {
         &self.bits
     }
+
+    pub fn len(&self) -> usize {
+        self.bits.len()
+    }
+
+    /// Merges another `Bitfield` into this one, setting bits that are set in either.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the two bitfields are of different lengths.
+    pub fn merge(&mut self, other: &Bitfield) {
+        assert_eq!(
+            self.bits.len(),
+            other.bits.len(),
+            "bitfields must be the same length"
+        );
+
+        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *a |= *b;
+        }
+    }
 }

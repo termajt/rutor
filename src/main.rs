@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "downloaded (bytes): {}, uploaded (bytes): {}, left (bytes): {}, peers (C/A): {}/{}",
             state.downloaded, state.uploaded, state.left, state.connected_peers, state.peers
         );
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(3600));
     }
     client.stop();
     Ok(())

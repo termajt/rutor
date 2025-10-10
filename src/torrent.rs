@@ -59,7 +59,7 @@ pub struct TorrentFile {
 pub struct TorrentInfo {
     name: String,
     pub piece_length: u32,
-    piece_hashes: Vec<[u8; 20]>,
+    pub piece_hashes: Vec<[u8; 20]>,
     pub total_size: u64,
     files: Vec<TorrentFile>,
     bitfield: Bitfield,
