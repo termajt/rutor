@@ -254,7 +254,6 @@ impl SocketManager {
         loop {
             match listener.accept() {
                 Ok((stream, addr)) => {
-                    println!("New connection: {addr:?}");
                     if let Err(e) = self.add_socket(addr, Socket::Client((stream, addr)), 40) {
                         eprintln!("Failed to add client connection: {e}");
                     }

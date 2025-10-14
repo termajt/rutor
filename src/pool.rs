@@ -204,11 +204,6 @@ fn worker_loop(
                 }
 
                 if timeout_result.timed_out() {
-                    println!(
-                        "Worker {:?} idle for {:?} - shutting down",
-                        thread::current().id(),
-                        timeout
-                    );
                     {
                         let mut alive = alive.lock().unwrap();
                         *alive = false;
@@ -218,7 +213,6 @@ fn worker_loop(
             }
         };
         if let Some(job) = job {
-            println!("Worker {:?} executing job...", thread::current().id());
             job();
             state.available.notify_one();
         }

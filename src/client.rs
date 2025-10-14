@@ -269,7 +269,6 @@ impl TorrentClient {
                                 .min()
                                 .unwrap_or(Duration::from_secs(30));
                             drop(manager);
-                            println!("Sleeping {:?} until next announce...", next_time);
                             let guard = announce_manager.lock().unwrap();
                             let _ = condvar.wait_timeout(guard, next_time).unwrap();
                             continue;
