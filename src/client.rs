@@ -65,15 +65,6 @@ impl TorrentState {
             connected_peers: 0,
         }
     }
-
-    /// Atomically updates transfer statistics, adding downloaded and uploaded byte counts.
-    ///
-    /// This method saturates to prevent numeric overflow.
-    pub fn inc_update_stats(&mut self, downloaded: u64, uploaded: u64) {
-        self.downloaded = self.downloaded.saturating_add(downloaded);
-        self.uploaded = self.uploaded.saturating_add(uploaded);
-        self.left = self.total_size.saturating_sub(self.downloaded);
-    }
 }
 
 /// Represents a running torrent client instance.

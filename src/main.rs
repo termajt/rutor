@@ -3,19 +3,148 @@ use rutor::torrent;
 use std::env;
 use std::fs::File;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut size = bytes as f64;
-    let mut unit_index = 0;
+struct ProgressTracker {
+    name: String,
+    total_size: u64,
+    prev_downloaded: u64,
+    prev_instant: Instant,
+    bar_width: usize,
+    speeds: Vec<f64>,
+    max_samples: usize,
+    eta: f64,
+    avg_speed: f64,
+    connected_peers: usize,
+    all_peers: usize,
+}
 
-    while size >= 1024.0 && unit_index < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit_index += 1;
+impl ProgressTracker {
+    fn new(name: &str, total_size: u64, bar_width: usize, max_samples: usize) -> Self {
+        Self {
+            name: name.to_string(),
+            total_size: total_size,
+            prev_downloaded: 0,
+            prev_instant: Instant::now(),
+            bar_width: bar_width,
+            speeds: Vec::with_capacity(max_samples),
+            max_samples: max_samples,
+            eta: f64::INFINITY,
+            avg_speed: 0.0,
+            connected_peers: 0,
+            all_peers: 0,
+        }
     }
 
-    format!("{:.2} {}", size, UNITS[unit_index])
+    fn human_bytes(&self, bytes: u64) -> String {
+        const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+        let mut size = bytes as f64;
+        let mut unit_index = 0;
+
+        while size >= 1024.0 && unit_index < UNITS.len() - 1 {
+            size /= 1024.0;
+            unit_index += 1;
+        }
+
+        format!("{:.2} {}", size, UNITS[unit_index])
+    }
+
+    fn format_bar(&self, downloaded: u64) -> String {
+        let progress = downloaded as f64 / self.total_size as f64;
+        let filled_blocks = (progress * self.bar_width as f64).floor() as usize;
+        let remainder = progress * self.bar_width as f64 - filled_blocks as f64;
+
+        let partial_block = if remainder >= 0.75 {
+            "▓"
+        } else if remainder >= 0.5 {
+            "▒"
+        } else if remainder >= 0.25 {
+            "░"
+        } else {
+            ""
+        };
+
+        let empty_blocks =
+            self.bar_width - filled_blocks - if partial_block.is_empty() { 0 } else { 1 };
+
+        format!(
+            "[{}{}{}] {:>3}%",
+            "█".repeat(filled_blocks),
+            partial_block,
+            "░".repeat(empty_blocks),
+            (progress * 100.0).round() as usize
+        )
+    }
+
+    fn format_eta(&self, seconds: f64) -> String {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return "--:--:--".to_string();
+        }
+        let hours = (seconds / 3600.0).floor() as u64;
+        let minutes = ((seconds % 3600.0) / 60.0).floor() as u64;
+        let secs = (seconds % 60.0).floor() as u64;
+        format!("{:02}:{:02}:{:02}", hours, minutes, secs)
+    }
+
+    fn update(&mut self, downloaded: u64, connected_peers: usize, all_peers: usize) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.prev_instant).as_secs_f64();
+        let instant_speeed = if elapsed > 0.0 {
+            (downloaded - self.prev_downloaded) as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        self.speeds.push(instant_speeed);
+        if self.speeds.len() > self.max_samples {
+            self.speeds.remove(0);
+        }
+        self.avg_speed = self.speeds.iter().sum::<f64>() / self.speeds.len() as f64;
+
+        let remaining = self.total_size.saturating_sub(downloaded) as f64;
+        self.eta = if self.avg_speed > 0.0 {
+            remaining / self.avg_speed
+        } else {
+            f64::INFINITY
+        };
+        self.prev_downloaded = downloaded;
+        self.prev_instant = now;
+        self.connected_peers = connected_peers;
+        self.all_peers = all_peers;
+    }
+
+    fn display(&self, first_draw: bool) {
+        if !first_draw {
+            for _ in 0..4 {
+                print!("\r\x1B[1A\x1b[2K");
+            }
+        }
+
+        println!("Name: {}", self.name);
+        println!(
+            "Downloaded: {} / {} at {}/s, ETA: {}",
+            self.human_bytes(self.prev_downloaded),
+            self.human_bytes(self.total_size),
+            self.human_bytes(self.avg_speed as u64),
+            self.format_eta(self.eta)
+        );
+        println!(
+            "Peers: {} (C) / {} (A)",
+            self.connected_peers, self.all_peers
+        );
+        println!("{}", self.format_bar(self.prev_downloaded));
+    }
+
+    fn update_and_display(
+        &mut self,
+        downloaded: u64,
+        connected_peers: usize,
+        all_peers: usize,
+        first_draw: bool,
+    ) {
+        self.update(downloaded, connected_peers, all_peers);
+        self.display(first_draw);
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,35 +165,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         torrent::Torrent::from_file(&file)?
     };
     let name = torrent.info.name.clone();
+    let total_size = torrent.info.total_size;
     let client = TorrentClient::new(torrent, 6881)?;
     client.start()?;
+    let mut first_draw = true;
+    let mut progress_tracker = ProgressTracker::new(&name, total_size, 40, 10);
     while !client.is_complete() {
         let state = client.get_state();
-        println!("{}", name);
-        println!(
-            "downloaded: {}, uploaded (bytes): {}, left: {}, peers (C/A): {}/{}, pieces: {}/{}",
-            human_bytes(state.downloaded),
-            human_bytes(state.uploaded),
-            human_bytes(state.left),
+        progress_tracker.update_and_display(
+            state.downloaded,
             state.connected_peers,
             state.peers,
-            client.pieces_verified(),
-            client.total_pieces()
+            first_draw,
         );
+        first_draw = false;
         std::thread::sleep(Duration::from_secs(1));
     }
+    client.stop();
     let state = client.get_state();
-    println!("{}", name);
-    println!(
-        "downloaded: {}, uploaded (bytes): {}, left: {}, peers (C/A): {}/{}, pieces: {}/{}",
-        human_bytes(state.downloaded),
-        human_bytes(state.uploaded),
-        human_bytes(state.left),
+    progress_tracker.update_and_display(
+        state.downloaded,
         state.connected_peers,
         state.peers,
-        client.pieces_verified(),
-        client.total_pieces()
+        first_draw,
     );
-    client.stop();
+    println!("\nDownload complete!");
     Ok(())
 }
