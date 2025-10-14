@@ -781,9 +781,13 @@ impl PeerManager {
                 }
                 PeerEvent::SocketDisconnect { addr } => {
                     self.mark_disconnected(addr);
+                    let info_hash = self.torrent.info_hash;
+                    self.attempt_connect_peers(info_hash, peer_id);
                 }
                 PeerEvent::ConnectFailure { addr } => {
                     self.mark_failed(addr);
+                    let info_hash = self.torrent.info_hash;
+                    self.attempt_connect_peers(info_hash, peer_id);
                 }
                 PeerEvent::NewPeers { peers } => {
                     self.add_peers(peers);
