@@ -1,14 +1,12 @@
 use sha1::{Digest, Sha1};
 use std::{
     fmt,
-    fs::File,
-    io::{BufReader, Read},
+    fs::{File, OpenOptions},
+    io::{BufReader, Read, Seek, SeekFrom, Write},
+    path::Path,
 };
 
-use crate::{
-    bencode::{self, Bencode},
-    bitfield::Bitfield,
-};
+use crate::bencode::{self, Bencode};
 
 #[derive(Debug)]
 pub enum Error {
@@ -49,20 +47,26 @@ impl std::error::Error for Error {
     }
 }
 
+#[derive(Debug)]
+pub struct FileSlice {
+    pub file_index: usize,
+    pub offset_in_file: u64,
+    pub length: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TorrentFile {
     length: u64,
     path: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TorrentInfo {
-    name: String,
+    pub name: String,
     pub piece_length: u32,
     pub piece_hashes: Vec<[u8; 20]>,
     pub total_size: u64,
     files: Vec<TorrentFile>,
-    bitfield: Bitfield,
 }
 
 impl TorrentInfo {
@@ -138,19 +142,79 @@ impl TorrentInfo {
                 "neither 'length' nor 'files' present in info dict".into(),
             ));
         }
-        let bitfield = Bitfield::new(piece_hashes.len());
         Ok(TorrentInfo {
             name: name,
             piece_length: piece_length,
             piece_hashes: piece_hashes,
             total_size: total_size,
             files: files,
-            bitfield: bitfield,
         })
+    }
+
+    pub fn piece_file_slices(&self, piece_index: usize) -> Vec<FileSlice> {
+        let piece_length = self.piece_length as u64;
+        let piece_start = piece_index as u64 * piece_length;
+        let piece_end = ((piece_index + 1) as u64 * piece_length).min(self.total_size);
+
+        let mut slices = Vec::new();
+        let mut remaining = piece_end - piece_start;
+        let mut global_offset = 0;
+        for (i, file) in self.files.iter().enumerate() {
+            let file_end = global_offset + file.length;
+            if file_end <= piece_start {
+                global_offset = file_end;
+                continue;
+            }
+
+            if global_offset >= piece_end {
+                break;
+            }
+
+            let start_in_file = piece_start.saturating_sub(global_offset);
+            let length = (file_end.min(piece_end) - (global_offset + start_in_file)).min(remaining);
+            slices.push(FileSlice {
+                file_index: i,
+                offset_in_file: start_in_file,
+                length: length,
+            });
+            remaining -= length;
+            global_offset = file_end;
+            if remaining == 0 {
+                break;
+            }
+        }
+        slices
+    }
+
+    pub fn write_data_to_disk(
+        &self,
+        piece_index: usize,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut data_offset = 0;
+        for slice in self.piece_file_slices(piece_index) {
+            let file = &self.files[slice.file_index];
+            let path_str = file.path.join(&std::path::MAIN_SEPARATOR.to_string());
+            let path = Path::new(&path_str);
+
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
+            let mut f = OpenOptions::new().write(true).create(true).open(path)?;
+
+            f.seek(SeekFrom::Start(slice.offset_in_file))?;
+
+            let end_offset = data_offset + slice.length as usize;
+            f.write_all(&data[data_offset..end_offset])?;
+            data_offset = end_offset;
+        }
+
+        Ok(())
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Torrent {
     pub announce: Option<String>,
     pub announce_list: Vec<Vec<String>>,
@@ -211,6 +275,14 @@ impl Torrent {
     pub fn from_reader<R: Read>(reader: R) -> Result<Self, Error> {
         let bencode = bencode::decode_from_reader(reader)?;
         Torrent::from_bencode(bencode)
+    }
+
+    pub fn write_to_disk(
+        &self,
+        piece_index: usize,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.info.write_data_to_disk(piece_index, data)
     }
 }
 

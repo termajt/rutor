@@ -106,8 +106,16 @@ impl Bitfield {
             "bitfields must be the same length"
         );
 
-        for (a, b) in self.bits.iter_mut().zip(other.bits.iter()) {
-            *a |= *b;
+        for (i, byte) in other.bits.iter().enumerate() {
+            self.bits[i] |= byte;
         }
+    }
+
+    pub fn count_ones(&self) -> usize {
+        self.bits.iter().map(|b| b.count_ones() as usize).sum()
+    }
+
+    pub fn count_zeros(&self) -> usize {
+        self.bits.iter().map(|b| b.count_zeros() as usize).sum()
     }
 }

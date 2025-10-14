@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -9,10 +9,14 @@ use std::{
 use rand::{Rng, distr::Alphanumeric};
 
 use crate::{
-    announce::{self, AnnounceManager, TrackerResponse},
-    peer::{PeerManager, PeerStatus},
+    announce::{self, AnnounceManager},
+    consts::{self, ClientEvent, PeerEvent, PieceEvent},
+    peer::PeerManager,
+    piece::PieceManager,
     pool::ThreadPool,
-    queue::{Queue, Receiver, Sender},
+    pubsub::PubSub,
+    queue::{Queue, Receiver},
+    socketmanager::{Command, SocketManager},
     torrent::Torrent,
 };
 
@@ -87,6 +91,13 @@ pub struct TorrentClient {
     shutdown: Arc<AtomicBool>,
     shutdown_condvar: Arc<Condvar>,
     peer_manager: Arc<PeerManager>,
+    piece_manager: Arc<RwLock<PieceManager>>,
+    announce_manager: Arc<Mutex<AnnounceManager>>,
+    socket_manager: Arc<Mutex<SocketManager>>,
+    client_event: Arc<PubSub<ClientEvent>>,
+    peer_event: Arc<PubSub<PeerEvent>>,
+    socket_rx: Arc<Receiver<Command>>,
+    piece_event: Arc<PubSub<PieceEvent>>,
 }
 
 impl TorrentClient {
@@ -100,12 +111,28 @@ impl TorrentClient {
         let tpool = Arc::new(ThreadPool::new());
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_condvar = Arc::new(Condvar::new());
+        let (socket_tx, socket_rx) = Queue::new(None);
+        let (socket_tx, socket_rx) = (Arc::new(socket_tx), Arc::new(socket_rx));
+        let client_event = Arc::new(PubSub::new());
+        let peer_event = Arc::new(PubSub::new());
+        let piece_event = Arc::new(PubSub::new());
         let peer_manager = Arc::new(PeerManager::new(
             50,
             tpool.clone(),
-            shutdown.clone(),
             torrent.clone(),
+            peer_event.clone(),
+            piece_event.clone(),
+            client_event.clone(),
+            socket_tx.clone(),
         )?);
+        let piece_manager = Arc::new(RwLock::new(PieceManager::new(
+            torrent.clone(),
+            peer_manager.clone(),
+            peer_event.clone(),
+            client_event.clone(),
+        )));
+        let announce_manager = Arc::new(Mutex::new(AnnounceManager::new(&torrent)));
+        let socket_manager = Arc::new(Mutex::new(SocketManager::new()?));
         Ok(Self {
             torrent: torrent,
             state: Arc::new(Mutex::new(TorrentState::new(total_size, port))),
@@ -115,6 +142,13 @@ impl TorrentClient {
             shutdown: shutdown,
             shutdown_condvar: shutdown_condvar,
             peer_manager: peer_manager,
+            piece_manager: piece_manager,
+            announce_manager: announce_manager,
+            socket_manager: socket_manager,
+            client_event: client_event,
+            peer_event: peer_event,
+            socket_rx: socket_rx,
+            piece_event: piece_event,
         })
     }
 
@@ -127,105 +161,144 @@ impl TorrentClient {
             }
             st.started_at = Some(Instant::now());
         }
-        let peer_rx = self.start_announce_thread();
-        self.start_peer_manager_thread(peer_rx);
+        self.start_announce_thread();
+        self.start_poll_thread();
+        let state = self.state.clone();
+        let peer_manager = self.peer_manager.clone();
+        let client_event_rx = self.client_event.subscribe(consts::TOPIC_CLIENT_EVENT);
+        self.tpool.execute(move || {
+            while let Ok(ev) = client_event_rx.recv() {
+                match &*ev {
+                    ClientEvent::BytesDownloaded { data_size } => {
+                        let mut state = state.lock().unwrap();
+                        state.downloaded += *data_size as u64;
+                        state.left = state.total_size.saturating_sub(state.downloaded);
+                    }
+                    ClientEvent::PieceVerificationFailure {
+                        piece_index: _,
+                        data_size,
+                    } => {
+                        let mut state = state.lock().unwrap();
+                        state.downloaded = state.downloaded.saturating_sub(*data_size as u64);
+                        state.left = state.total_size.saturating_sub(state.downloaded);
+                    }
+                    ClientEvent::PeersChanged => {
+                        let mut state = state.lock().unwrap();
+                        state.connected_peers = peer_manager.connected_peers();
+                        state.peers = peer_manager.peer_count();
+                    }
+                }
+            }
+        });
         Ok(())
     }
 
-    fn start_announce_thread(&self) -> Receiver<TrackerResponse> {
-        let info_hash = self.torrent.info_hash;
-        let peer_id = self.peer_id;
-        let state = self.state.clone();
-        let torrent = self.torrent.clone();
-        let shutdown_condvar = self.shutdown_condvar.clone();
+    fn start_poll_thread(&self) {
+        let socket_manager = self.socket_manager.clone();
         let shutdown = self.shutdown.clone();
-        let (tx, rx) = Queue::new(None);
+        let peer_event_tx = self.peer_event.clone();
+        let (data_tx, data_rx) = Queue::new(None);
+        let socket_rx = self.socket_rx.clone();
         self.tpool.execute(move || {
-            announce_thread(
-                torrent,
-                &info_hash,
-                &peer_id,
-                state,
-                shutdown_condvar,
-                shutdown,
-                tx,
-            );
+            while !shutdown.load(Ordering::Relaxed) {
+                let mut socket_manager = socket_manager.lock().unwrap();
+                match socket_manager.run_once(&socket_rx, &data_tx) {
+                    Ok(disconnects) => {
+                        for addr in disconnects {
+                            peer_event_tx.publish(
+                                consts::TOPIC_PEER_EVENT,
+                                PeerEvent::SocketDisconnect { addr: addr },
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("socket manager run_once failure: {e}");
+                    }
+                }
+            }
         });
-        rx
+
+        let peer_manager = self.peer_manager.clone();
+        let peer_id = self.peer_id;
+        self.tpool.execute(move || {
+            peer_manager.run(peer_id);
+        });
+
+        let peer_event_tx = self.peer_event.clone();
+        self.tpool.execute(move || {
+            while let Ok((data, addr)) = data_rx.recv() {
+                peer_event_tx.publish(
+                    consts::TOPIC_PEER_EVENT,
+                    PeerEvent::SocketData {
+                        addr: addr,
+                        data: data,
+                    },
+                );
+            }
+        });
+
+        let piece_manager = self.piece_manager.clone();
+        let rx = self.piece_event.subscribe(consts::TOPIC_PIECE_EVENT);
+        self.tpool.execute(move || {
+            while let Ok(ev) = rx.recv() {
+                let mut piece_manager = piece_manager.write().unwrap();
+                piece_manager.handle_event(ev);
+            }
+        });
     }
 
-    fn start_peer_manager_thread(&self, peer_rx: Receiver<TrackerResponse>) {
+    fn start_announce_thread(&self) {
         let info_hash = self.torrent.info_hash;
         let peer_id = self.peer_id;
-        let shutdown = self.shutdown.clone();
         let state = self.state.clone();
-        let peer_manager = self.peer_manager.clone();
-        self.tpool.execute(move || {
-            while !shutdown.load(Ordering::Relaxed) {
-                match peer_rx.recv() {
-                    Ok(response) => {
-                        peer_manager.add_peers(&response.peers);
-                        let mut state = state.lock().unwrap();
-                        state.peers = peer_manager.peer_count();
-                        state.connected_peers = peer_manager.connected_peers();
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
         let shutdown = self.shutdown.clone();
-        let shutdown_condvar = self.shutdown_condvar.clone();
-        let state = self.state.clone();
-        let peer_manager = self.peer_manager.clone();
+        let announce_manager = self.announce_manager.clone();
+        let condvar = self.shutdown_condvar.clone();
+        let peer_event_tx = self.peer_event.clone();
         self.tpool.execute(move || {
             while !shutdown.load(Ordering::Relaxed) {
-                if let Err(e) = peer_manager.handle_connections() {
-                    eprintln!("socket manager error: {e}");
-                }
-                peer_manager.connect_peers(info_hash, peer_id);
-                while let Ok((addr, status)) = peer_manager
-                    .connect_rx
-                    .recv_timeout(Duration::from_millis(500))
-                {
-                    match status {
-                        PeerStatus::Connected => {
-                            peer_manager.mark_connected(addr);
+                let mut manager = announce_manager.lock().unwrap();
+                let tracker = {
+                    match manager.next_due_tracker() {
+                        Some(tracker) => tracker,
+                        None => {
+                            let next_time = manager
+                                .tiers
+                                .iter()
+                                .flat_map(|tier| tier.iter().map(|t| t.time_until_next()))
+                                .min()
+                                .unwrap_or(Duration::from_secs(30));
+                            drop(manager);
+                            println!("Sleeping {:?} until next announce...", next_time);
+                            let guard = announce_manager.lock().unwrap();
+                            let _ = condvar.wait_timeout(guard, next_time).unwrap();
+                            continue;
                         }
-                        PeerStatus::Failed => {
-                            peer_manager.mark_failed(addr);
-                        }
-                        _ => {}
                     }
-                    let mut state = state.lock().unwrap();
-                    state.peers = peer_manager.peer_count();
-                    state.connected_peers = peer_manager.connected_peers();
-                }
-                let mut state = state.lock().unwrap();
-                let result = shutdown_condvar
-                    .wait_timeout(state, Duration::from_millis(100))
-                    .unwrap();
-                state = result.0;
-                state.peers = peer_manager.peer_count();
-                state.connected_peers = peer_manager.connected_peers();
-            }
-        });
-        let shutdown = self.shutdown.clone();
-        let peer_manager = self.peer_manager.clone();
-        self.tpool.execute(move || {
-            while !shutdown.load(Ordering::Relaxed) {
-                peer_manager.run_handle_data();
-                peer_manager.run_parse_messages();
-            }
-        });
-        let shutdown = self.shutdown.clone();
-        let peer_manager = self.peer_manager.clone();
-        self.tpool.execute(move || {
-            while !shutdown.load(Ordering::Relaxed) {
-                if let Ok((addr, message)) = peer_manager
-                    .peer_msg_rx
-                    .recv_timeout(Duration::from_millis(500))
-                {
-                    peer_manager.handle_message(addr, message);
+                };
+                tracker.announced();
+                let (uploaded, downloaded, left) = {
+                    let state = state.lock().unwrap();
+                    (state.uploaded, state.downloaded, state.left)
+                };
+                if let Ok(response) = announce::announce(
+                    &tracker.url,
+                    &info_hash,
+                    &peer_id,
+                    6881,
+                    uploaded,
+                    downloaded,
+                    left,
+                    None,
+                    None,
+                ) {
+                    tracker.update_from_response(&response);
+                    peer_event_tx.publish(
+                        consts::TOPIC_PEER_EVENT,
+                        PeerEvent::NewPeers {
+                            peers: response.peers,
+                        },
+                    );
                 }
             }
         });
@@ -243,8 +316,8 @@ impl TorrentClient {
     }
 
     pub fn is_complete(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        state.left == 0
+        let piece_manager = self.piece_manager.read().unwrap();
+        piece_manager.is_complete()
     }
 
     /// Stops the torrent client and notifies all waiting threads.
@@ -253,67 +326,25 @@ impl TorrentClient {
     /// waiting for completion.
     pub fn stop(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
-        self.peer_manager.stop();
         self.shutdown_condvar.notify_all();
     }
 
     pub fn get_state(&self) -> TorrentState {
         self.state.lock().unwrap().clone()
     }
-}
 
-fn announce_thread(
-    torrent: Arc<Torrent>,
-    info_hash: &[u8; 20],
-    peer_id: &[u8; 20],
-    state: Arc<Mutex<TorrentState>>,
-    condvar: Arc<Condvar>,
-    shutdown: Arc<AtomicBool>,
-    response_sender: Sender<TrackerResponse>,
-) {
-    let mut manager = AnnounceManager::new(&torrent);
-    while !shutdown.load(Ordering::Relaxed) {
-        let (uploaded, downloaded, left) = {
-            let state = state.lock().unwrap();
-            (state.uploaded, state.downloaded, state.left)
-        };
-        if let Some(tracker) = manager.next_due_tracker() {
-            println!("Announcing to {}", tracker.url);
-            tracker.announced();
-            match announce::announce(
-                &tracker.url,
-                info_hash,
-                peer_id,
-                6881,
-                uploaded,
-                downloaded,
-                left,
-                None,
-                None,
-            ) {
-                Ok(resp) => {
-                    println!("Got {} peers from {}", resp.peers.len(), tracker.url);
-                    tracker.update_from_response(&resp);
-                    if let Err(e) = response_sender.send(resp) {
-                        eprintln!("failed to send tracker response: {e}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Tracker {} failed: {e}", tracker.url);
-                }
-            }
-        } else {
-            let next_time = manager
-                .tiers
-                .iter()
-                .flat_map(|tier| tier.iter().map(|t| t.time_until_next()))
-                .min()
-                .unwrap_or(Duration::from_secs(30));
-            println!("Sleeping {:?} until next announce...", next_time);
+    pub fn pieces_left(&self) -> usize {
+        let piece_manager = self.piece_manager.read().unwrap();
+        piece_manager.pieces_left()
+    }
 
-            let guard = state.lock().unwrap();
-            let (_unused, _unused1) = condvar.wait_timeout(guard, next_time).unwrap();
-        }
+    pub fn total_pieces(&self) -> usize {
+        self.torrent.info.piece_hashes.len()
+    }
+
+    pub fn pieces_verified(&self) -> usize {
+        let piece_manager = self.piece_manager.read().unwrap();
+        piece_manager.pieces_verified()
     }
 }
 

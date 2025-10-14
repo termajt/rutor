@@ -17,13 +17,13 @@ use crate::queue::{Receiver, Sender};
 #[derive(Debug)]
 pub enum Command {
     /// Send data to the client with the given file descriptor.
-    Send(RawFd, Vec<u8>),
+    Send(SocketAddr, Vec<u8>, bool),
     /// Close the client with the given file descriptor.
-    Close(RawFd),
+    Close(SocketAddr),
     // Close the client with the given socket.
-    CloseSocket(Socket),
+    CloseSocket((Socket, SocketAddr)),
     // Add socket.
-    Add(Socket),
+    Add((Socket, SocketAddr, usize)),
 }
 
 /// Represents a socket managed by the `SocketManager`.
@@ -35,17 +35,28 @@ pub enum Socket {
     Client((TcpStream, SocketAddr)),
 }
 
+impl Socket {
+    pub fn get_raw_fd(&self) -> RawFd {
+        match self {
+            Socket::Listener(tcp_listener) => tcp_listener.as_raw_fd(),
+            Socket::Client((tcp_stream, _)) => tcp_stream.as_raw_fd(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Connection {
     socket: Socket,
     send_queue: VecDeque<Vec<u8>>,
+    max_send_queue_size: usize,
 }
 
 impl Connection {
-    fn new(socket: Socket) -> Self {
+    fn new(socket: Socket, max_send_queue_size: usize) -> Self {
         Connection {
             socket: socket,
             send_queue: VecDeque::new(),
+            max_send_queue_size: max_send_queue_size,
         }
     }
 }
@@ -54,7 +65,8 @@ impl Connection {
 #[derive(Debug)]
 pub struct SocketManager {
     epoll_fd: RawFd,
-    conns: HashMap<RawFd, Connection>,
+    conns: HashMap<SocketAddr, Connection>,
+    fd_addrs: HashMap<RawFd, SocketAddr>,
 }
 
 impl SocketManager {
@@ -71,14 +83,8 @@ impl SocketManager {
         Ok(SocketManager {
             epoll_fd: epfd,
             conns: HashMap::new(),
+            fd_addrs: HashMap::new(),
         })
-    }
-
-    fn get_socket_fd(&self, socket: &Socket) -> RawFd {
-        match socket {
-            Socket::Client((stream, _)) => stream.as_raw_fd(),
-            Socket::Listener(listener) => listener.as_raw_fd(),
-        }
     }
 
     /// Adds a new socket (listener or client) to the `SocketManager` and epoll set.
@@ -86,8 +92,13 @@ impl SocketManager {
     /// # Errors
     ///
     /// Returns an `io::Error` if `epoll_ctl` fails.
-    pub fn add_socket(&mut self, socket: Socket) -> io::Result<()> {
-        let fd = self.get_socket_fd(&socket);
+    fn add_socket(
+        &mut self,
+        addr: SocketAddr,
+        socket: Socket,
+        max_send_queue_size: usize,
+    ) -> io::Result<()> {
+        let fd = socket.get_raw_fd();
         let mut ev = epoll_event {
             events: (EPOLLIN | EPOLLET) as u32,
             u64: fd as u64,
@@ -99,20 +110,34 @@ impl SocketManager {
         unsafe {
             fcntl(fd, F_SETFL, O_NONBLOCK);
         }
-        self.conns.insert(fd, Connection::new(socket));
+        self.conns
+            .insert(addr, Connection::new(socket, max_send_queue_size));
+        self.fd_addrs.insert(fd, addr);
         Ok(())
     }
 
-    fn remove_socket(&mut self, fd: RawFd) {
-        // best-effort: remove from epoll (ignore errors)
-        let _ = unsafe { epoll_ctl(self.epoll_fd, EPOLL_CTL_DEL, fd, ptr::null_mut()) };
-        self.conns.remove(&fd);
+    fn remove_socket(&mut self, addr: SocketAddr) {
+        if let Some(conn) = self.conns.remove(&addr) {
+            self.remove_fd(conn.socket.get_raw_fd());
+        }
     }
 
-    fn queue_message(&mut self, fd: RawFd, data: Vec<u8>) {
-        if let Some(conn) = self.conns.get_mut(&fd) {
-            conn.send_queue.push_back(data);
+    fn remove_fd(&mut self, fd: RawFd) {
+        // best-effort: remove from epoll (ignore errors)
+        let _ = unsafe { epoll_ctl(self.epoll_fd, EPOLL_CTL_DEL, fd, ptr::null_mut()) };
+        self.fd_addrs.remove(&fd);
+    }
 
+    fn queue_message(&mut self, addr: SocketAddr, data: Vec<u8>, is_critical: bool) {
+        if let Some(conn) = self.conns.get_mut(&addr) {
+            if conn.send_queue.len() >= conn.max_send_queue_size {
+                if is_critical {
+                    return;
+                }
+                conn.send_queue.pop_front();
+            }
+            conn.send_queue.push_back(data);
+            let fd = conn.socket.get_raw_fd();
             let mut ev = epoll_event {
                 events: (EPOLLIN | EPOLLOUT | EPOLLET) as u32,
                 u64: fd as u64,
@@ -138,17 +163,22 @@ impl SocketManager {
     pub fn run_once(
         &mut self,
         rx: &Receiver<Command>,
-        sender: &Sender<(Vec<u8>, SocketAddr, RawFd)>,
-    ) -> io::Result<Vec<Socket>> {
+        sender: &Sender<(Vec<u8>, SocketAddr)>,
+    ) -> io::Result<Vec<SocketAddr>> {
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
-                Command::Send(fd, data) => self.queue_message(fd, data),
-                Command::Close(fd) => self.remove_socket(fd),
-                Command::Add(socket) => self.add_socket(socket)?,
-                Command::CloseSocket(socket) => match socket {
-                    Socket::Client((s, _)) => self.remove_socket(s.as_raw_fd()),
-                    Socket::Listener(s) => self.remove_socket(s.as_raw_fd()),
-                },
+                Command::Send(addr, data, is_critical) => {
+                    self.queue_message(addr, data, is_critical);
+                }
+                Command::Close(addr) => {
+                    self.remove_socket(addr);
+                }
+                Command::Add((socket, addr, max_send_queue_size)) => {
+                    self.add_socket(addr, socket, max_send_queue_size)?;
+                }
+                Command::CloseSocket((_socket, addr)) => {
+                    self.remove_socket(addr);
+                }
             }
         }
 
@@ -168,48 +198,53 @@ impl SocketManager {
         for i in 0..(nfds as usize) {
             let ev = events[i];
             let fd = ev.u64 as RawFd;
+            let Some(addr) = self.fd_addrs.remove(&fd) else {
+                self.remove_fd(fd);
+                continue;
+            };
+            let Some(mut conn) = self.conns.remove(&addr) else {
+                self.remove_socket(addr);
+                continue;
+            };
 
-            if let Some(mut conn) = self.conns.remove(&fd) {
-                match &mut conn.socket {
-                    Socket::Listener(listener) => {
-                        if let Err(e) = self.handle_accept(listener) {
-                            eprintln!("listener accept error: {e}");
-                            self.remove_socket(fd);
-                            disconnected_sockets.push(conn.socket);
-                            continue;
-                        }
+            match &mut conn.socket {
+                Socket::Listener(listener) => {
+                    if let Err(e) = self.handle_accept(listener) {
+                        eprintln!("listener accept error: {e}");
+                        self.remove_socket(addr);
+                        disconnected_sockets.push(addr);
+                        continue;
                     }
-                    Socket::Client((stream, addr)) => {
-                        if (ev.events & EPOLLIN as u32) != 0 {
-                            match self.handle_read(stream) {
-                                Ok(data) => {
-                                    if let Err(e) = sender.send((data, *addr, stream.as_raw_fd())) {
-                                        eprintln!("failed to notify data received: {e}");
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("client read error: {e}");
-                                    self.remove_socket(fd);
-                                    disconnected_sockets.push(conn.socket);
-                                    continue;
+                }
+                Socket::Client((stream, addr)) => {
+                    if (ev.events & EPOLLIN as u32) != 0 {
+                        match self.handle_read(stream) {
+                            Ok(data) => {
+                                if let Err(e) = sender.send((data, *addr)) {
+                                    eprintln!("failed to notify data received: {e}");
                                 }
                             }
-                        }
-                        if (ev.events & EPOLLOUT as u32) != 0 {
-                            if let Err(e) = self.handle_write(stream, &mut conn.send_queue) {
-                                eprintln!("client write error: {e}");
-                                self.remove_socket(fd);
-                                disconnected_sockets.push(conn.socket);
+                            Err(e) => {
+                                eprintln!("client read error: {e}");
+                                self.remove_socket(*addr);
+                                disconnected_sockets.push(*addr);
                                 continue;
                             }
                         }
                     }
+                    if (ev.events & EPOLLOUT as u32) != 0 {
+                        if let Err(e) = self.handle_write(stream, &mut conn.send_queue) {
+                            eprintln!("client write error: {e}");
+                            self.remove_socket(*addr);
+                            disconnected_sockets.push(*addr);
+                            continue;
+                        }
+                    }
                 }
-
-                self.conns.insert(fd, conn);
-            } else {
-                self.remove_socket(fd);
             }
+
+            self.conns.insert(addr, conn);
+            self.fd_addrs.insert(fd, addr);
         }
 
         Ok(disconnected_sockets)
@@ -220,7 +255,7 @@ impl SocketManager {
             match listener.accept() {
                 Ok((stream, addr)) => {
                     println!("New connection: {addr:?}");
-                    if let Err(e) = self.add_socket(Socket::Client((stream, addr))) {
+                    if let Err(e) = self.add_socket(addr, Socket::Client((stream, addr)), 40) {
                         eprintln!("Failed to add client connection: {e}");
                     }
                 }
@@ -231,7 +266,7 @@ impl SocketManager {
         Ok(())
     }
 
-    fn handle_read(&mut self, stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+    fn handle_read(&self, stream: &mut TcpStream) -> io::Result<Vec<u8>> {
         let mut buf = [0u8; 4096];
         let mut result = Vec::new();
         loop {
@@ -255,7 +290,7 @@ impl SocketManager {
     }
 
     fn handle_write(
-        &mut self,
+        &self,
         stream: &mut TcpStream,
         send_queue: &mut VecDeque<Vec<u8>>,
     ) -> io::Result<()> {
