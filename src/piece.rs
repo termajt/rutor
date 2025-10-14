@@ -227,11 +227,9 @@ impl PieceManager {
             return cached.clone();
         }
         let mut counts = vec![0; self.total_pieces()];
-        let connected = self.peer_manager.connected.lock().unwrap();
+        let connected = self.peer_manager.connected.read().unwrap();
         for pc in connected.values() {
-            let bitfield = pc.bitfield.lock().unwrap();
-
-            for (i, byte) in bitfield.as_bytes().iter().enumerate() {
+            for (i, byte) in pc.bitfield.as_bytes().iter().enumerate() {
                 for bit_offset in 0..8 {
                     let index = i * 8 + bit_offset;
                     if index >= self.total_pieces() {

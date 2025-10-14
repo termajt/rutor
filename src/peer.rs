@@ -4,7 +4,7 @@ use std::{
     hash::Hash,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
 
@@ -335,12 +335,12 @@ impl PeerStats {
 pub struct PeerConnection {
     addr: SocketAddr,
     peer_id: [u8; 20],
-    buffer: Mutex<Vec<u8>>,
-    pub bitfield: Mutex<Bitfield>,
-    choked: Mutex<bool>,
-    interested: Mutex<bool>,
-    remote_interested: Mutex<bool>,
-    stats: Mutex<PeerStats>,
+    buffer: Vec<u8>,
+    pub bitfield: Bitfield,
+    choked: bool,
+    interested: bool,
+    remote_interested: bool,
+    stats: PeerStats,
 }
 
 impl PeerConnection {
@@ -350,93 +350,75 @@ impl PeerConnection {
         Self {
             addr: addr,
             peer_id: peer_id,
-            buffer: Mutex::new(Vec::new()),
-            bitfield: Mutex::new(Bitfield::new(total_pieces)),
-            choked: Mutex::new(true),
-            interested: Mutex::new(false),
-            remote_interested: Mutex::new(false),
-            stats: Mutex::new(PeerStats {
+            buffer: Vec::new(),
+            bitfield: Bitfield::new(total_pieces),
+            choked: true,
+            interested: false,
+            remote_interested: false,
+            stats: PeerStats {
                 bytes_downloaded: 0,
                 last_update: Instant::now(),
                 speed: 0.0,
-            }),
+            },
         }
     }
 
-    fn handle_message(&self, msg: &PeerMessage) {
+    fn handle_message(&mut self, msg: &PeerMessage) {
         match msg {
             PeerMessage::Choke => {
-                let mut choked = self.choked.lock().unwrap();
-                *choked = true;
+                self.choked = true;
             }
             PeerMessage::Unchoke => {
-                let mut choked = self.choked.lock().unwrap();
-                *choked = false;
+                self.choked = false;
             }
             PeerMessage::Interested => {
-                let mut interested = self.interested.lock().unwrap();
-                *interested = true;
+                self.interested = true;
             }
             PeerMessage::NotInterested => {
-                let mut interested = self.interested.lock().unwrap();
-                *interested = false;
+                self.interested = false;
             }
             PeerMessage::Have(index) => {
-                let mut bitfield = self.bitfield.lock().unwrap();
-                bitfield.set(*index as usize, true);
+                self.bitfield.set(*index as usize, true);
             }
             PeerMessage::Bitfield(new_bitfield) => {
-                let mut bitfield = self.bitfield.lock().unwrap();
-                bitfield.merge(new_bitfield);
+                self.bitfield.merge(new_bitfield);
             }
             PeerMessage::Piece((_, _, data)) => {
-                let mut stats = self.stats.lock().unwrap();
-                stats.update(data.len());
+                self.stats.update(data.len());
             }
             _ => return,
         }
     }
 
-    fn on_recv(&self, data: &[u8]) {
-        let mut buffer = self.buffer.lock().unwrap();
-        buffer.extend_from_slice(data);
+    fn on_recv(&mut self, data: &[u8]) {
+        self.buffer.extend_from_slice(data);
     }
 
-    fn parse_messages(&self, total_pieces: usize) -> Option<PeerMessage> {
-        let mut buffer = self.buffer.lock().unwrap();
-        if buffer.len() == 0 {
+    fn parse_messages(&mut self, total_pieces: usize) -> Option<PeerMessage> {
+        if self.buffer.len() == 0 {
             return None;
         }
-        if let Ok(v) = PeerMessage::parse(&mut buffer, total_pieces) {
+        if let Ok(v) = PeerMessage::parse(&mut self.buffer, total_pieces) {
             v
         } else {
             None
         }
     }
 
-    pub fn is_choked(&self) -> bool {
-        let choked = self.choked.lock().unwrap();
-        *choked
+    fn is_choked(&self) -> bool {
+        self.choked
     }
 
-    pub fn is_interested(&self) -> bool {
-        let interested = self.interested.lock().unwrap();
-        *interested
+    fn is_remote_interested(&self) -> bool {
+        self.remote_interested
     }
 
-    pub fn is_remote_interested(&self) -> bool {
-        let remote_interested = self.remote_interested.lock().unwrap();
-        *remote_interested
-    }
-
-    pub fn set_remote_interested(&self, value: bool) {
-        let mut remote_interested = self.remote_interested.lock().unwrap();
-        *remote_interested = value;
+    pub fn set_remote_interested(&mut self, value: bool) {
+        self.remote_interested = value;
     }
 
     pub fn get_download_speed(&self) -> f64 {
-        let stats = self.stats.lock().unwrap();
-        stats.current_speed()
+        self.stats.current_speed()
     }
 }
 
@@ -469,8 +451,8 @@ pub struct PeerManager {
     piece_event_tx: Arc<PubSub<PieceEvent>>,
     client_event_tx: Arc<PubSub<ClientEvent>>,
     socket_tx: Arc<Sender<Command>>,
-    peers: Arc<Mutex<HashMap<SocketAddr, PeerInfo>>>,
-    pub connected: Arc<Mutex<HashMap<SocketAddr, PeerConnection>>>,
+    peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
+    pub connected: Arc<RwLock<HashMap<SocketAddr, PeerConnection>>>,
     max_connections: Arc<usize>,
     pending_connections: Arc<Mutex<usize>>,
 }
@@ -497,8 +479,8 @@ impl PeerManager {
             piece_event_tx: piece_event_tx,
             client_event_tx: client_event_tx,
             socket_tx: socket_tx,
-            peers: Arc::new(Mutex::new(HashMap::new())),
-            connected: Arc::new(Mutex::new(HashMap::new())),
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            connected: Arc::new(RwLock::new(HashMap::new())),
             max_connections: Arc::new(max_connections),
             pending_connections: Arc::new(Mutex::new(0)),
         })
@@ -506,7 +488,7 @@ impl PeerManager {
 
     pub fn get_download_speeds(&self) -> HashMap<SocketAddr, f64> {
         let mut map = HashMap::new();
-        let connected = self.connected.lock().unwrap();
+        let connected = self.connected.read().unwrap();
         for (addr, pconn) in connected.iter() {
             map.insert(*addr, pconn.get_download_speed());
         }
@@ -514,7 +496,7 @@ impl PeerManager {
     }
 
     pub fn get_download_speed(&self, addr: &SocketAddr) -> Option<f64> {
-        let connected = self.connected.lock().unwrap();
+        let connected = self.connected.read().unwrap();
         if let Some(pconn) = connected.get(addr) {
             Some(pconn.get_download_speed())
         } else {
@@ -523,8 +505,8 @@ impl PeerManager {
     }
 
     fn data_received(&self, addr: &SocketAddr, data: &[u8]) {
-        let connected = self.connected.lock().unwrap();
-        if let Some(pc) = connected.get(addr) {
+        let mut connected = self.connected.write().unwrap();
+        if let Some(pc) = connected.get_mut(addr) {
             pc.on_recv(data);
         }
         drop(connected);
@@ -533,8 +515,8 @@ impl PeerManager {
 
     fn parse_handle_messages(&self) {
         let total_pieces = self.torrent.info.piece_hashes.len();
-        let connected = self.connected.lock().unwrap();
-        for pc in connected.values() {
+        let mut connected = self.connected.write().unwrap();
+        for pc in connected.values_mut() {
             while let Some(message) = pc.parse_messages(total_pieces) {
                 pc.handle_message(&message);
                 match message {
@@ -570,7 +552,7 @@ impl PeerManager {
     }
 
     fn add_peers(&self, new_peers: &[SocketAddr]) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.write().unwrap();
         for addr in new_peers {
             if peers.contains_key(addr) {
                 continue;
@@ -583,12 +565,12 @@ impl PeerManager {
 
     /// Selects the next available peer to attempt a connection.
     fn next_peer_to_connect(&self) -> Option<PeerInfo> {
-        let connected = self.connected.lock().unwrap();
+        let connected = self.connected.read().unwrap();
         if connected.len() >= *self.max_connections {
             return None;
         }
         drop(connected);
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.write().unwrap();
         peers
             .values_mut()
             .find(|p| match p.status {
@@ -604,14 +586,14 @@ impl PeerManager {
 
     /// Marks a peer as successfully connected and initializes a `PeerConnection`.
     fn mark_connected(&self, addr: &SocketAddr, peer_id: &[u8], total_pieces: usize) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.write().unwrap();
         if let Some(p) = peers.get_mut(&addr) {
             p.status = PeerStatus::Connected;
             p.last_seen = Instant::now();
             p.failures = 0;
         }
         drop(peers);
-        let mut connected = self.connected.lock().unwrap();
+        let mut connected = self.connected.write().unwrap();
         if !connected.contains_key(&addr) {
             connected.insert(
                 *addr,
@@ -625,7 +607,7 @@ impl PeerManager {
 
     /// Marks a peer as having failed to connect, possibly removing it if it failed repeatedly.
     fn mark_failed(&self, addr: &SocketAddr) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.write().unwrap();
         if let Some(p) = peers.get_mut(&addr) {
             p.status = PeerStatus::Failed;
             p.failures += 1;
@@ -635,7 +617,7 @@ impl PeerManager {
         }
         drop(peers);
 
-        let mut connected = self.connected.lock().unwrap();
+        let mut connected = self.connected.write().unwrap();
         connected.remove(&addr);
         drop(connected);
         self.send_peers_changed();
@@ -643,11 +625,11 @@ impl PeerManager {
 
     /// Removes a peer that has been disconnected.
     fn mark_disconnected(&self, addr: &SocketAddr) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.write().unwrap();
         peers.remove(addr);
         drop(peers);
 
-        let mut connected = self.connected.lock().unwrap();
+        let mut connected = self.connected.write().unwrap();
         connected.remove(addr);
         drop(connected);
         self.send_peers_changed();
@@ -660,13 +642,13 @@ impl PeerManager {
 
     /// Returns the number of currently connected peers.
     pub fn connected_peers(&self) -> usize {
-        let connected = self.connected.lock().unwrap();
+        let connected = self.connected.read().unwrap();
         connected.len()
     }
 
     /// Returns the total number of known peers.
     pub fn peer_count(&self) -> usize {
-        let peers = self.peers.lock().unwrap();
+        let peers = self.peers.read().unwrap();
         peers.len()
     }
 
@@ -678,7 +660,7 @@ impl PeerManager {
 
     fn attempt_connect_peers(&self, info_hash: [u8; 20], peer_id: [u8; 20]) {
         {
-            let connected = self.connected.lock().unwrap();
+            let connected = self.connected.read().unwrap();
             let pending_connections = self.pending_connections.lock().unwrap();
             let max_connections = *self.max_connections;
             if connected.len() >= max_connections || *pending_connections >= max_connections {
@@ -687,7 +669,7 @@ impl PeerManager {
         }
         while let Some(p) = self.next_peer_to_connect() {
             {
-                let connected = self.connected.lock().unwrap();
+                let connected = self.connected.read().unwrap();
                 if connected.contains_key(&p.addr) {
                     continue;
                 }
@@ -730,12 +712,11 @@ impl PeerManager {
     }
 
     pub fn peers_with_piece(&self, index: usize) -> Vec<SocketAddr> {
-        let connected = self.connected.lock().unwrap();
+        let connected = self.connected.read().unwrap();
         connected
             .iter()
             .filter_map(|(addr, pc)| {
-                let bitfield = pc.bitfield.lock().unwrap();
-                if bitfield.get(index) {
+                if pc.bitfield.get(index) {
                     Some(*addr)
                 } else {
                     None
@@ -745,7 +726,7 @@ impl PeerManager {
     }
 
     pub fn is_choked(&self, addr: &SocketAddr) -> bool {
-        let connected = self.connected.lock().unwrap();
+        let connected = self.connected.read().unwrap();
         if let Some(pc) = connected.get(addr) {
             return pc.is_choked();
         }
@@ -753,8 +734,8 @@ impl PeerManager {
     }
 
     fn maybe_interest_peer(&self, addr: &SocketAddr) {
-        let connected = self.connected.lock().unwrap();
-        if let Some(pc) = connected.get(&addr) {
+        let mut connected = self.connected.write().unwrap();
+        if let Some(pc) = connected.get_mut(&addr) {
             if !pc.is_remote_interested() {
                 pc.set_remote_interested(true);
                 self.peer_event_tx.publish(
@@ -784,13 +765,13 @@ impl PeerManager {
         while let Ok(ev) = self.peer_event_rx.recv() {
             match &*ev {
                 PeerEvent::SendToAll { message } => {
-                    let connected = self.connected.lock().unwrap();
+                    let connected = self.connected.read().unwrap();
                     for pcon in connected.values() {
                         self.send_message_to_socket(pcon, message);
                     }
                 }
                 PeerEvent::Send { addr, message } => {
-                    let connected = self.connected.lock().unwrap();
+                    let connected = self.connected.read().unwrap();
                     if let Some(pcon) = connected.get(addr) {
                         self.send_message_to_socket(pcon, message);
                     }
