@@ -21,7 +21,7 @@ Replace `<torrent-file>` with the path to the `.torrent` file you want to downlo
 After building the project, you can run the compiled binary:
 
 ```bash
-./ruton <torrent-file>
+./rutor <torrent-file>
 ```
 
 This will start downloading the torrent and display a progress bar with download statistics.
