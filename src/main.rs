@@ -67,11 +67,18 @@ impl ProgressTracker {
         let empty_blocks =
             self.bar_width - filled_blocks - if partial_block.is_empty() { 0 } else { 1 };
 
+        let reset = "\x1b[0m";
+        let green_bg = "\x1b[42m";
+        let white_gray_bg = "\x1b[47m";
+
         format!(
-            "[{}{}{}] {:>3}%",
-            "█".repeat(filled_blocks),
+            "[{}{}{}{}{}{}] {:>3}%",
+            green_bg,
+            " ".repeat(filled_blocks),
+            white_gray_bg,
             partial_block,
             "░".repeat(empty_blocks),
+            reset,
             (progress * 100.0).round() as usize
         )
     }
@@ -120,17 +127,30 @@ impl ProgressTracker {
             }
         }
 
-        println!("Name: {}", self.name);
+        let cyan = "\x1b[36m";
+        let green = "\x1b[32m";
+        let yellow = "\x1b[33m";
+        let magenta = "\x1b[35m";
+        let blue = "\x1b[34m";
+        let reset = "\x1b[0m";
+
+        println!("{}Name:{} {}", cyan, reset, self.name);
         println!(
-            "Downloaded: {} / {} at {}/s, ETA: {}",
+            "{}Downloaded:{} {} / {} at {}{}/s{}, ETA: {}{}{}",
+            green,
+            reset,
             self.human_bytes(self.prev_downloaded),
             self.human_bytes(self.total_size),
+            yellow,
             self.human_bytes(self.avg_speed as u64),
-            self.format_eta(self.eta)
+            reset,
+            magenta,
+            self.format_eta(self.eta),
+            reset
         );
         println!(
-            "Peers: {} (C) / {} (A)",
-            self.connected_peers, self.all_peers
+            "{}Peers:{} {} (C) / {} (A)",
+            blue, reset, self.connected_peers, self.all_peers
         );
         println!("{}", self.format_bar(self.prev_downloaded));
     }
