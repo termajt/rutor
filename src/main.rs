@@ -18,10 +18,18 @@ struct ProgressTracker {
     avg_speed: f64,
     connected_peers: usize,
     all_peers: usize,
+    pieces_verified: usize,
+    total_pieces: usize,
 }
 
 impl ProgressTracker {
-    fn new(name: &str, total_size: u64, bar_width: usize, max_samples: usize) -> Self {
+    fn new(
+        name: &str,
+        total_size: u64,
+        bar_width: usize,
+        max_samples: usize,
+        total_pieces: usize,
+    ) -> Self {
         Self {
             name: name.to_string(),
             total_size: total_size,
@@ -34,6 +42,8 @@ impl ProgressTracker {
             avg_speed: 0.0,
             connected_peers: 0,
             all_peers: 0,
+            pieces_verified: 0,
+            total_pieces: total_pieces,
         }
     }
 
@@ -94,7 +104,7 @@ impl ProgressTracker {
         format!("{:02}:{:02}:{:02}", hours, minutes, secs)
     }
 
-    fn update(&mut self, state: &TorrentState) {
+    fn update(&mut self, state: &TorrentState, pieces_verified: usize) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.prev_instant).as_secs_f64();
         let instant_speeed = if elapsed > 0.0 {
@@ -119,11 +129,12 @@ impl ProgressTracker {
         self.prev_instant = now;
         self.connected_peers = state.connected_peers;
         self.all_peers = state.peers;
+        self.pieces_verified = pieces_verified;
     }
 
     fn display(&self, first_draw: bool) {
         if !first_draw {
-            for _ in 0..4 {
+            for _ in 0..5 {
                 print!("\r\x1B[1A\x1b[2K");
             }
         }
@@ -133,6 +144,7 @@ impl ProgressTracker {
         let yellow = "\x1b[33m";
         let magenta = "\x1b[35m";
         let blue = "\x1b[34m";
+        let white = "\x1b[97m";
         let reset = "\x1b[0m";
 
         println!("{}Name:{} {}", cyan, reset, self.name);
@@ -153,11 +165,20 @@ impl ProgressTracker {
             "{}Peers:{} {} (C) / {} (A)",
             blue, reset, self.connected_peers, self.all_peers
         );
+        println!(
+            "{}Pieces:{} {} / {}",
+            white, reset, self.pieces_verified, self.total_pieces
+        );
         println!("{}", self.format_bar(self.prev_downloaded));
     }
 
-    fn update_and_display(&mut self, state: &TorrentState, first_draw: bool) {
-        self.update(state);
+    fn update_and_display(
+        &mut self,
+        state: &TorrentState,
+        pieces_verified: usize,
+        first_draw: bool,
+    ) {
+        self.update(state, pieces_verified);
         self.display(first_draw);
     }
 }
@@ -184,16 +205,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = TorrentClient::new(torrent)?;
     client.start()?;
     let mut first_draw = true;
-    let mut progress_tracker = ProgressTracker::new(&name, total_size, 40, 10);
+    let mut progress_tracker =
+        ProgressTracker::new(&name, total_size, 40, 10, client.total_pieces());
     while !client.is_complete() {
         let state = client.get_state();
-        progress_tracker.update_and_display(&state, first_draw);
+        progress_tracker.update_and_display(&state, client.pieces_verified(), first_draw);
         first_draw = false;
         std::thread::sleep(Duration::from_secs(1));
     }
     client.stop();
     let state = client.get_state();
-    progress_tracker.update_and_display(&state, first_draw);
+    progress_tracker.update_and_display(&state, client.pieces_verified(), first_draw);
     println!("\nDownload complete!");
     Ok(())
 }

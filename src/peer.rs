@@ -616,6 +616,7 @@ impl PeerManager {
         }
         drop(connected);
         self.send_peers_changed();
+        self.maybe_send_bitfield(addr);
         self.maybe_interest_peer(addr);
     }
 
@@ -758,6 +759,21 @@ impl PeerManager {
                     PeerEvent::Send {
                         addr: pc.addr,
                         message: PeerMessage::Interested,
+                    },
+                );
+            }
+        }
+    }
+
+    fn maybe_send_bitfield(&self, addr: &SocketAddr) {
+        let connected = self.connected.read().unwrap();
+        if let Some(pc) = connected.get(addr) {
+            if self.torrent.info.has_any_pieces() {
+                let _ = self.peer_event_tx.publish(
+                    consts::TOPIC_PEER_EVENT,
+                    PeerEvent::Send {
+                        addr: pc.addr,
+                        message: PeerMessage::Bitfield(self.torrent.info.bitfield()),
                     },
                 );
             }

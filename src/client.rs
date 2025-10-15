@@ -307,8 +307,7 @@ impl TorrentClient {
         if self.shutdown.load(Ordering::Relaxed) {
             return true;
         }
-        let piece_manager = self.piece_manager.read().unwrap();
-        piece_manager.is_complete()
+        self.torrent.info.is_complete()
     }
 
     /// Stops the torrent client and notifies all waiting threads.
@@ -331,8 +330,7 @@ impl TorrentClient {
     }
 
     pub fn pieces_left(&self) -> usize {
-        let piece_manager = self.piece_manager.read().unwrap();
-        piece_manager.pieces_left()
+        self.torrent.info.pieces_left()
     }
 
     pub fn total_pieces(&self) -> usize {
@@ -340,8 +338,7 @@ impl TorrentClient {
     }
 
     pub fn pieces_verified(&self) -> usize {
-        let piece_manager = self.piece_manager.read().unwrap();
-        piece_manager.pieces_verified()
+        self.torrent.info.pieces_verified()
     }
 }
 

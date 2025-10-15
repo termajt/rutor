@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
     usize,
 };
@@ -10,7 +10,6 @@ use rand::seq::IndexedRandom;
 use sha1::{Digest, Sha1};
 
 use crate::{
-    bitfield::Bitfield,
     consts::{self, ClientEvent, PeerEvent, PieceEvent},
     peer::{PeerManager, PeerMessage},
     pubsub::PubSub,
@@ -78,7 +77,6 @@ struct Piece {
 
 #[derive(Debug)]
 pub struct PieceManager {
-    bitfield: Mutex<Bitfield>,
     pieces: Vec<Piece>,
     torrent: Arc<Torrent>,
     piece_availability_cache: Option<Vec<usize>>,
@@ -122,7 +120,6 @@ impl PieceManager {
         }
         let blocks_per_piece = piece_length as usize / BLOCK_SIZE;
         PieceManager {
-            bitfield: Mutex::new(Bitfield::new(total_pieces)),
             pieces: pieces,
             torrent: torrent,
             piece_availability_cache: None,
@@ -186,10 +183,7 @@ impl PieceManager {
 
             if result[..] == expected_hash {
                 piece.state = PieceState::Verified;
-                {
-                    let mut bitfield = self.bitfield.lock().unwrap();
-                    bitfield.set(piece.index, true);
-                }
+                self.torrent.info.set_bitfield_index(piece.index);
                 if let Err(e) = self.torrent.write_to_disk(piece.index, pdata) {
                     eprintln!("❌ Piece {} could not be written to disk: {e}", piece.index);
                 }
@@ -212,21 +206,6 @@ impl PieceManager {
             }
             piece.data = None;
         }
-    }
-
-    pub fn is_complete(&self) -> bool {
-        let bitfield = self.bitfield.lock().unwrap();
-        bitfield.count_ones() == self.total_pieces()
-    }
-
-    pub fn pieces_left(&self) -> usize {
-        let bitfield = self.bitfield.lock().unwrap();
-        bitfield.count_zeros()
-    }
-
-    pub fn pieces_verified(&self) -> usize {
-        let bitfield = self.bitfield.lock().unwrap();
-        bitfield.count_ones()
     }
 
     fn piece_availability(&mut self) -> Vec<usize> {

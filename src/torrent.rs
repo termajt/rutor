@@ -4,9 +4,13 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufReader, Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::RwLock,
 };
 
-use crate::bencode::{self, Bencode};
+use crate::{
+    bencode::{self, Bencode},
+    bitfield::Bitfield,
+};
 
 #[derive(Debug)]
 pub enum Error {
@@ -67,6 +71,7 @@ pub struct TorrentInfo {
     pub piece_hashes: Vec<[u8; 20]>,
     pub total_size: u64,
     files: Vec<TorrentFile>,
+    bitfield: RwLock<Bitfield>,
 }
 
 impl TorrentInfo {
@@ -142,12 +147,14 @@ impl TorrentInfo {
                 "neither 'length' nor 'files' present in info dict".into(),
             ));
         }
+        let total_pieces = piece_hashes.len();
         Ok(TorrentInfo {
             name: name,
             piece_length: piece_length,
             piece_hashes: piece_hashes,
             total_size: total_size,
             files: files,
+            bitfield: RwLock::new(Bitfield::new(total_pieces)),
         })
     }
 
@@ -211,6 +218,36 @@ impl TorrentInfo {
         }
 
         Ok(())
+    }
+
+    pub fn has_any_pieces(&self) -> bool {
+        let bitfield = self.bitfield.read().unwrap();
+        bitfield.has_any()
+    }
+
+    pub fn set_bitfield_index(&self, index: usize) {
+        let mut bitfield = self.bitfield.write().unwrap();
+        bitfield.set(index, true);
+    }
+
+    pub fn bitfield(&self) -> Bitfield {
+        let bitfield = self.bitfield.read().unwrap();
+        bitfield.clone()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        let bitfield = self.bitfield.read().unwrap();
+        bitfield.count_ones() == self.piece_hashes.len()
+    }
+
+    pub fn pieces_left(&self) -> usize {
+        let bitfield = self.bitfield.read().unwrap();
+        bitfield.count_zeros()
+    }
+
+    pub fn pieces_verified(&self) -> usize {
+        let bitfield = self.bitfield.read().unwrap();
+        bitfield.count_ones()
     }
 }
 

@@ -118,4 +118,8 @@ impl Bitfield {
     pub fn count_zeros(&self) -> usize {
         self.bits.iter().map(|b| b.count_zeros() as usize).sum()
     }
+
+    pub fn has_any(&self) -> bool {
+        self.bits.iter().any(|b| b.count_ones() > 0)
+    }
 }
