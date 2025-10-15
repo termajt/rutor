@@ -29,7 +29,7 @@ impl ProgressTracker {
             all_peers: 0,
             pieces_verified: 0,
             total_pieces: total_pieces,
-            speed: ByteSpeed::new(Duration::from_secs(1)),
+            speed: ByteSpeed::new(Duration::from_secs(7), Duration::from_secs(1)),
         }
     }
 

@@ -6,21 +6,21 @@ pub struct ByteSpeed {
     pub avg: f64,
     smoothing: f64,
     bytes: usize,
-    min_interval: Duration,
+    update_interval: Duration,
 }
 
 impl ByteSpeed {
-    pub fn new(min_interval: Duration) -> Self {
-        Self::with_smoothing(0.3, min_interval)
-    }
-
-    pub fn with_smoothing(smoothing_factor: f64, min_interval: Duration) -> Self {
+    pub fn new(lookback: Duration, update_interval: Duration) -> Self {
+        let dt = update_interval.as_secs_f64();
+        let t = lookback.as_secs_f64();
+        let n = t / dt;
+        let alpha = 2.0 / (n + 1.0);
         Self {
             last_update: Instant::now(),
             avg: 0.0,
-            smoothing: smoothing_factor,
+            smoothing: alpha,
             bytes: 0,
-            min_interval: min_interval,
+            update_interval: update_interval,
         }
     }
 
@@ -28,7 +28,7 @@ impl ByteSpeed {
         self.bytes += bytes;
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update);
-        if elapsed >= self.min_interval {
+        if elapsed >= self.update_interval {
             let instant_speed = (self.bytes as f64) / elapsed.as_secs_f64();
 
             if self.avg == 0.0 {

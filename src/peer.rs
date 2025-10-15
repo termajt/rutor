@@ -331,7 +331,7 @@ impl PeerConnection {
             choked: true,
             interested: false,
             remote_interested: false,
-            speed: ByteSpeed::new(Duration::from_millis(500)),
+            speed: ByteSpeed::new(Duration::from_secs(4), Duration::from_millis(500)),
         }
     }
 
