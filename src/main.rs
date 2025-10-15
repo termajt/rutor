@@ -11,7 +11,6 @@ struct ProgressTracker {
     total_size: u64,
     prev_downloaded: u64,
     prev_instant: Instant,
-    bar_width: usize,
     speeds: VecDeque<f64>,
     max_samples: usize,
     eta: f64,
@@ -23,19 +22,12 @@ struct ProgressTracker {
 }
 
 impl ProgressTracker {
-    fn new(
-        name: &str,
-        total_size: u64,
-        bar_width: usize,
-        max_samples: usize,
-        total_pieces: usize,
-    ) -> Self {
+    fn new(name: &str, total_size: u64, max_samples: usize, total_pieces: usize) -> Self {
         Self {
             name: name.to_string(),
             total_size: total_size,
             prev_downloaded: 0,
             prev_instant: Instant::now(),
-            bar_width: bar_width,
             speeds: VecDeque::with_capacity(max_samples),
             max_samples: max_samples,
             eta: f64::INFINITY,
@@ -62,34 +54,39 @@ impl ProgressTracker {
 
     fn format_bar(&self, downloaded: u64) -> String {
         let progress = downloaded as f64 / self.total_size as f64;
-        let filled_blocks = (progress * self.bar_width as f64).floor() as usize;
-        let remainder = progress * self.bar_width as f64 - filled_blocks as f64;
+        let bar_width = get_bar_width();
+        let filled_blocks = (progress * bar_width as f64).floor() as usize;
+        let remainder = progress * bar_width as f64 - filled_blocks as f64;
 
-        let partial_block = if remainder >= 0.75 {
-            "▓"
-        } else if remainder >= 0.5 {
-            "▒"
-        } else if remainder >= 0.25 {
-            "░"
+        let partial_block = if remainder >= 0.875 {
+            "●" // full
+        } else if remainder >= 0.625 {
+            "◕" // mostly filled
+        } else if remainder >= 0.375 {
+            "◑" // half filled
+        } else if remainder >= 0.125 {
+            "◔" // slightly filled
         } else {
-            ""
+            "" // empty
         };
 
-        let empty_blocks =
-            self.bar_width - filled_blocks - if partial_block.is_empty() { 0 } else { 1 };
+        let empty_blocks = bar_width - filled_blocks - if partial_block.is_empty() { 0 } else { 1 };
 
+        let green = "\x1b[32m"; // filled
+        let yellow = "\x1b[33m"; // partial
+        let gray = "\x1b[37m"; // empty
         let reset = "\x1b[0m";
-        let green_bg = "\x1b[42m";
-        let white_gray_bg = "\x1b[100m";
 
+        let filled_str = format!("{}{}{}", green, "●".repeat(filled_blocks), reset);
+        let partial_str = format!("{}{}{}", yellow, partial_block, reset);
+        let empty_str = format!("{}{}{}", gray, "○".repeat(empty_blocks), reset);
+
+        // Rounded/circular brackets
         format!(
-            "[{}{}{}{}{}{}] {:>3}%",
-            green_bg,
-            " ".repeat(filled_blocks),
-            white_gray_bg,
-            partial_block,
-            "░".repeat(empty_blocks),
-            reset,
+            "[{}{}{}] {:>3}%",
+            filled_str,
+            partial_str,
+            empty_str,
             (progress * 100.0).round() as usize
         )
     }
@@ -183,6 +180,24 @@ impl ProgressTracker {
     }
 }
 
+fn get_terminal_width() -> usize {
+    use libc::{STDOUT_FILENO, TIOCGWINSZ, ioctl, winsize};
+    use std::mem::zeroed;
+
+    unsafe {
+        let mut ws: winsize = zeroed();
+        if ioctl(STDOUT_FILENO, TIOCGWINSZ, &mut ws) == 0 {
+            ws.ws_col as usize
+        } else {
+            40
+        }
+    }
+}
+
+fn get_bar_width() -> usize {
+    get_terminal_width() / 2
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<String>>();
     let program = Path::new(&args[0])
@@ -205,8 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = TorrentClient::new(torrent)?;
     client.start()?;
     let mut first_draw = true;
-    let mut progress_tracker =
-        ProgressTracker::new(&name, total_size, 40, 10, client.total_pieces());
+    let mut progress_tracker = ProgressTracker::new(&name, total_size, 10, client.total_pieces());
     while !client.is_complete() {
         let state = client.get_state();
         progress_tracker.update_and_display(&state, client.pieces_verified(), first_draw);
