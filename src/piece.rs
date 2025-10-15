@@ -69,18 +69,19 @@ pub enum PieceState {
 }
 
 #[derive(Debug)]
-pub struct PieceData {
-    pub buffer: Vec<u8>,
+struct Piece {
+    index: usize,
+    state: PieceState,
+    blocks: Vec<BlockInfo>,
+    data: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
 pub struct PieceManager {
     bitfield: Mutex<Bitfield>,
-    pieces: Vec<PieceState>,
+    pieces: Vec<Piece>,
     torrent: Arc<Torrent>,
     piece_availability_cache: Option<Vec<usize>>,
-    piece_states: Vec<Vec<BlockInfo>>,
-    piece_data: Vec<Option<PieceData>>,
     peer_manager: Arc<PeerManager>,
     peer_event_tx: Arc<PubSub<PeerEvent>>,
     client_event_tx: Arc<PubSub<ClientEvent>>,
@@ -98,8 +99,7 @@ impl PieceManager {
         let total_pieces = torrent.info.piece_hashes.len();
         let total_size = torrent.info.total_size;
         let piece_length = torrent.info.piece_length;
-        let mut piece_states = Vec::new();
-        //let message_rx = command_tx.subscribe(consts::TOPIC_TORRENT_COMMAND);
+        let mut pieces = Vec::new();
         for piece_index in 0..total_pieces {
             let piece_size = if piece_index == total_pieces - 1 {
                 (total_size as u32) - (piece_index as u32 * piece_length)
@@ -113,16 +113,19 @@ impl PieceManager {
                 blocks.push(BlockInfo::new(piece_index as u32, begin, len));
                 begin += len;
             }
-            piece_states.push(blocks);
+            pieces.push(Piece {
+                index: piece_index,
+                state: PieceState::Missing,
+                blocks: blocks,
+                data: None,
+            });
         }
         let blocks_per_piece = piece_length as usize / BLOCK_SIZE;
         PieceManager {
             bitfield: Mutex::new(Bitfield::new(total_pieces)),
-            pieces: vec![PieceState::Missing; total_pieces],
+            pieces: pieces,
             torrent: torrent,
             piece_availability_cache: None,
-            piece_states: piece_states,
-            piece_data: (0..total_pieces).map(|_| None).collect(),
             peer_manager: peer_manager,
             peer_event_tx: peer_event_tx,
             client_event_tx: client_event_tx,
@@ -135,8 +138,9 @@ impl PieceManager {
     }
 
     fn mark_block_received(&mut self, index: u32, begin: u32, data: &[u8]) {
-        if let Some(blocks) = self.piece_states.get_mut(index as usize) {
-            if let Some(block) = blocks.iter_mut().find(|b| b.begin == begin) {
+        let mut complete = false;
+        if let Some(piece) = self.pieces.get_mut(index as usize) {
+            if let Some(block) = piece.blocks.iter_mut().find(|b| b.begin == begin) {
                 if block.state == BlockState::Received {
                     return;
                 }
@@ -155,55 +159,58 @@ impl PieceManager {
                 );
             }
 
-            if let Some(ref mut pdata) = self.piece_data[index as usize] {
+            if let Some(ref mut pdata) = piece.data {
                 let offset = begin as usize;
-                pdata.buffer[offset..offset + data.len()].copy_from_slice(data);
+                pdata[offset..offset + data.len()].copy_from_slice(data);
             }
 
-            if blocks.iter().all(|b| b.state == BlockState::Received) {
-                self.pieces[index as usize] = PieceState::Complete;
-                self.verify_piece(index as usize);
+            if piece.blocks.iter().all(|b| b.state == BlockState::Received) {
+                piece.state = PieceState::Complete;
+                complete = true;
             }
+        }
+        if complete {
+            self.verify_piece(index as usize);
         }
     }
 
     fn verify_piece(&mut self, index: usize) {
-        if index >= self.total_pieces() {
+        let Some(piece) = self.pieces.get_mut(index) else {
             return;
-        }
-        let expected_hash = self.torrent.info.piece_hashes[index];
-        if let Some(ref pdata) = self.piece_data[index] {
+        };
+        let expected_hash = self.torrent.info.piece_hashes[piece.index];
+        if let Some(ref pdata) = piece.data {
             let mut hasher = Sha1::new();
-            hasher.update(&pdata.buffer);
+            hasher.update(pdata);
             let result = hasher.finalize();
 
             if result[..] == expected_hash {
-                self.pieces[index] = PieceState::Verified;
+                piece.state = PieceState::Verified;
                 {
                     let mut bitfield = self.bitfield.lock().unwrap();
-                    bitfield.set(index, true);
+                    bitfield.set(piece.index, true);
                 }
-                if let Err(e) = self.torrent.write_to_disk(index, &pdata.buffer) {
-                    eprintln!("❌ Piece {index} could not be written to disk: {e}");
+                if let Err(e) = self.torrent.write_to_disk(piece.index, pdata) {
+                    eprintln!("❌ Piece {} could not be written to disk: {e}", piece.index);
                 }
                 self.peer_event_tx.publish(
                     consts::TOPIC_PEER_EVENT,
                     PeerEvent::SendToAll {
-                        message: PeerMessage::Have(index as u32),
+                        message: PeerMessage::Have(piece.index as u32),
                     },
                 );
             } else {
-                eprintln!("❌ Piece {index} failed verification");
+                eprintln!("❌ Piece {} failed verification", piece.index);
                 self.client_event_tx.publish(
                     consts::TOPIC_CLIENT_EVENT,
                     ClientEvent::PieceVerificationFailure {
-                        piece_index: index,
-                        data_size: pdata.buffer.len(),
+                        piece_index: piece.index,
+                        data_size: pdata.len(),
                     },
                 );
-                self.pieces[index] = PieceState::Missing;
+                piece.state = PieceState::Missing;
             }
-            self.piece_data[index] = None;
+            piece.data = None;
         }
     }
 
@@ -273,7 +280,9 @@ impl PieceManager {
             .pieces
             .iter()
             .enumerate()
-            .filter(|(_, state)| matches!(state, PieceState::Missing | PieceState::Downloading))
+            .filter(|(_, piece)| {
+                matches!(piece.state, PieceState::Missing | PieceState::Downloading)
+            })
             .map(|(i, _)| i)
             .collect();
 
@@ -284,10 +293,10 @@ impl PieceManager {
         let mut downloading_count = self
             .pieces
             .iter()
-            .filter(|s| **s == PieceState::Downloading)
+            .filter(|piece| matches!(piece.state, PieceState::Downloading))
             .count();
         for &i in &candidates {
-            if self.pieces[i] == PieceState::Downloading {
+            if self.pieces[i].state == PieceState::Downloading {
                 active_indicies.push(i);
             } else if downloading_count < max_active_pieces {
                 active_indicies.push(i);
@@ -321,9 +330,9 @@ impl PieceManager {
             };
 
             let piece_len = self.piece_length_for_index(index);
-            let blocks = &mut self.piece_states[index];
+            let piece = &mut self.pieces[index];
             let mut sent_this_round = 0;
-            for block in blocks.iter_mut() {
+            for block in piece.blocks.iter_mut() {
                 if block.state == BlockState::Received {
                     continue;
                 }
@@ -341,14 +350,12 @@ impl PieceManager {
                 block.state = BlockState::Requested;
                 block.requested_by.insert(**peer, Instant::now());
 
-                if self.pieces[index] == PieceState::Missing {
-                    self.pieces[index] = PieceState::Downloading;
+                if matches!(piece.state, PieceState::Missing) {
+                    piece.state = PieceState::Downloading;
                 }
 
-                if self.piece_data[index].is_none() {
-                    self.piece_data[index] = Some(PieceData {
-                        buffer: vec![0u8; piece_len],
-                    });
+                if piece.data.is_none() {
+                    piece.data = Some(vec![0u8; piece_len]);
                 }
 
                 self.peer_event_tx.publish(
