@@ -27,25 +27,22 @@ use crate::{
 /// between threads in the [`TorrentClient`].
 #[derive(Debug, Clone)]
 pub struct TorrentState {
-    /// The local port used by the torrent client.
-    pub port: u16,
-
     /// Total number of bytes downloaded so far.
     pub downloaded: u64,
+
+    /// Total number of bytes left so far.
+    pub left: u64,
 
     /// Total number of bytes uploaded so far.
     pub uploaded: u64,
 
-    /// Total size of the torrent in bytes.
-    pub total_size: u64,
-
-    /// Number of bytes left to download.
-    pub left: u64,
-
     /// Timestamp when the torrent was started.
     pub started_at: Option<Instant>,
 
+    /// Total number of peers.
     pub peers: usize,
+
+    /// Total number of connected peers.
     pub connected_peers: usize,
 }
 
@@ -53,13 +50,11 @@ impl TorrentState {
     /// Creates a new [`TorrentState`] with the given total size and listening port.
     ///
     /// All counters are initialized to zero, and `left` is set equal to `total_size`.
-    pub fn new(total_size: u64, port: u16) -> Self {
+    pub fn new() -> Self {
         TorrentState {
-            port: port,
             downloaded: 0,
+            left: 0,
             uploaded: 0,
-            total_size: total_size,
-            left: total_size,
             started_at: None,
             peers: 0,
             connected_peers: 0,
@@ -78,7 +73,6 @@ pub struct TorrentClient {
     state: Arc<Mutex<TorrentState>>,
     tpool: Arc<ThreadPool>,
     peer_id: [u8; 20],
-    state_condvar: Arc<Condvar>,
     shutdown: Arc<AtomicBool>,
     shutdown_condvar: Arc<Condvar>,
     peer_manager: Arc<PeerManager>,
@@ -95,9 +89,8 @@ impl TorrentClient {
     /// Creates a new [`TorrentClient`] for the given torrent and listening port.
     ///
     /// Initializes shared state, thread pool, and generates a unique peer ID.
-    pub fn new(torrent: Torrent, port: u16) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(torrent: Torrent) -> Result<Self, Box<dyn std::error::Error>> {
         let torrent = Arc::new(torrent);
-        let total_size = torrent.info.total_size;
         let peer_id = generate_peer_id();
         let tpool = Arc::new(ThreadPool::new());
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -126,10 +119,9 @@ impl TorrentClient {
         let socket_manager = Arc::new(Mutex::new(SocketManager::new()?));
         Ok(Self {
             torrent: torrent,
-            state: Arc::new(Mutex::new(TorrentState::new(total_size, port))),
+            state: Arc::new(Mutex::new(TorrentState::new())),
             tpool: tpool,
             peer_id: peer_id,
-            state_condvar: Arc::new(Condvar::new()),
             shutdown: shutdown,
             shutdown_condvar: shutdown_condvar,
             peer_manager: peer_manager,
@@ -152,18 +144,18 @@ impl TorrentClient {
             }
             st.started_at = Some(Instant::now());
         }
-        self.start_announce_thread();
-        self.start_poll_thread();
+        self.start_threads()?;
         let state = self.state.clone();
         let peer_manager = self.peer_manager.clone();
-        let client_event_rx = self.client_event.subscribe(consts::TOPIC_CLIENT_EVENT);
+        let client_event_rx = self.client_event.subscribe(consts::TOPIC_CLIENT_EVENT)?;
+        let total_size = self.torrent.info.total_size;
         self.tpool.execute(move || {
             while let Ok(ev) = client_event_rx.recv() {
                 match &*ev {
                     ClientEvent::BytesDownloaded { data_size } => {
                         let mut state = state.lock().unwrap();
                         state.downloaded += *data_size as u64;
-                        state.left = state.total_size.saturating_sub(state.downloaded);
+                        state.left = total_size.saturating_sub(state.downloaded);
                     }
                     ClientEvent::PieceVerificationFailure {
                         piece_index: _,
@@ -171,7 +163,7 @@ impl TorrentClient {
                     } => {
                         let mut state = state.lock().unwrap();
                         state.downloaded = state.downloaded.saturating_sub(*data_size as u64);
-                        state.left = state.total_size.saturating_sub(state.downloaded);
+                        state.left = total_size.saturating_sub(state.downloaded);
                     }
                     ClientEvent::PeersChanged => {
                         let mut state = state.lock().unwrap();
@@ -184,58 +176,12 @@ impl TorrentClient {
         Ok(())
     }
 
-    fn start_poll_thread(&self) {
-        let socket_manager = self.socket_manager.clone();
-        let shutdown = self.shutdown.clone();
-        let peer_event_tx = self.peer_event.clone();
-        let (data_tx, data_rx) = Queue::new(None);
-        let socket_rx = self.socket_rx.clone();
-        self.tpool.execute(move || {
-            while !shutdown.load(Ordering::Relaxed) {
-                let mut socket_manager = socket_manager.lock().unwrap();
-                match socket_manager.run_once(&socket_rx, &data_tx) {
-                    Ok(disconnects) => {
-                        for addr in disconnects {
-                            peer_event_tx.publish(
-                                consts::TOPIC_PEER_EVENT,
-                                PeerEvent::SocketDisconnect { addr: addr },
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("socket manager run_once failure: {e}");
-                    }
-                }
-            }
-        });
-
-        let peer_manager = self.peer_manager.clone();
-        let peer_id = self.peer_id;
-        self.tpool.execute(move || {
-            peer_manager.run(peer_id);
-        });
-
-        let peer_event_tx = self.peer_event.clone();
-        self.tpool.execute(move || {
-            while let Ok((data, addr)) = data_rx.recv() {
-                peer_event_tx.publish(
-                    consts::TOPIC_PEER_EVENT,
-                    PeerEvent::SocketData {
-                        addr: addr,
-                        data: data,
-                    },
-                );
-            }
-        });
-
-        let piece_manager = self.piece_manager.clone();
-        let rx = self.piece_event.subscribe(consts::TOPIC_PIECE_EVENT);
-        self.tpool.execute(move || {
-            while let Ok(ev) = rx.recv() {
-                let mut piece_manager = piece_manager.write().unwrap();
-                piece_manager.handle_event(ev);
-            }
-        });
+    fn start_threads(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.start_socket_manager()?;
+        self.start_peer_manager()?;
+        self.start_piece_manager()?;
+        self.start_announce_thread();
+        Ok(())
     }
 
     fn start_announce_thread(&self) {
@@ -283,7 +229,7 @@ impl TorrentClient {
                     None,
                 ) {
                     tracker.update_from_response(&response);
-                    peer_event_tx.publish(
+                    let _ = peer_event_tx.publish(
                         consts::TOPIC_PEER_EVENT,
                         PeerEvent::NewPeers {
                             peers: response.peers,
@@ -294,18 +240,73 @@ impl TorrentClient {
         });
     }
 
-    /// Blocks the current thread until the torrent download completes
-    /// or the client is shut down.
-    ///
-    /// Uses a condition variable to efficiently wait for progress updates.
-    pub fn wait_until_complete(&self) {
-        let mut state = self.state.lock().unwrap();
-        while !self.shutdown.load(Ordering::Relaxed) && state.left > 0 {
-            state = self.state_condvar.wait(state).unwrap();
-        }
+    fn start_socket_manager(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let socket_manager = self.socket_manager.clone();
+        let shutdown = self.shutdown.clone();
+        let peer_event_tx = self.peer_event.clone();
+        let (data_tx, data_rx) = Queue::new(None);
+        let socket_rx = self.socket_rx.clone();
+        self.tpool.execute(move || {
+            while !shutdown.load(Ordering::Relaxed) {
+                let mut socket_manager = socket_manager.lock().unwrap();
+                match socket_manager.run_once(&socket_rx, &data_tx) {
+                    Ok(disconnects) => {
+                        for addr in disconnects {
+                            let _ = peer_event_tx.publish(
+                                consts::TOPIC_PEER_EVENT,
+                                PeerEvent::SocketDisconnect { addr: addr },
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("socket manager run_once failure: {e}");
+                    }
+                }
+            }
+        });
+        let peer_event_tx = self.peer_event.clone();
+        self.tpool.execute(move || {
+            while let Ok((data, addr)) = data_rx.recv() {
+                let _ = peer_event_tx.publish(
+                    consts::TOPIC_PEER_EVENT,
+                    PeerEvent::SocketData {
+                        addr: addr,
+                        data: data,
+                    },
+                );
+            }
+        });
+        Ok(())
+    }
+
+    fn start_peer_manager(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let peer_manager = self.peer_manager.clone();
+        let peer_id = self.peer_id;
+        let peer_event_tx = self.peer_event.subscribe(consts::TOPIC_PEER_EVENT)?;
+        self.tpool.execute(move || {
+            while let Ok(ev) = peer_event_tx.recv() {
+                peer_manager.handle_event(ev, peer_id);
+            }
+        });
+        Ok(())
+    }
+
+    fn start_piece_manager(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let piece_manager = self.piece_manager.clone();
+        let rx = self.piece_event.subscribe(consts::TOPIC_PIECE_EVENT)?;
+        self.tpool.execute(move || {
+            while let Ok(ev) = rx.recv() {
+                let mut piece_manager = piece_manager.write().unwrap();
+                piece_manager.handle_event(ev);
+            }
+        });
+        Ok(())
     }
 
     pub fn is_complete(&self) -> bool {
+        if self.shutdown.load(Ordering::Relaxed) {
+            return true;
+        }
         let piece_manager = self.piece_manager.read().unwrap();
         piece_manager.is_complete()
     }
@@ -316,6 +317,12 @@ impl TorrentClient {
     /// waiting for completion.
     pub fn stop(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        self.peer_event.close();
+        self.piece_event.close();
+        self.client_event.close();
+        let mut socket_manger = self.socket_manager.lock().unwrap();
+        socket_manger.close();
+        drop(socket_manger);
         self.shutdown_condvar.notify_all();
     }
 

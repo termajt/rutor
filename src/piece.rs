@@ -145,13 +145,13 @@ impl PieceManager {
                     return;
                 }
                 block.state = BlockState::Received;
-                self.peer_event_tx.publish(
+                let _ = self.peer_event_tx.publish(
                     consts::TOPIC_PEER_EVENT,
                     PeerEvent::SendToAll {
                         message: PeerMessage::Cancel((index, block.begin, block.length)),
                     },
                 );
-                self.client_event_tx.publish(
+                let _ = self.client_event_tx.publish(
                     consts::TOPIC_CLIENT_EVENT,
                     ClientEvent::BytesDownloaded {
                         data_size: data.len(),
@@ -193,7 +193,7 @@ impl PieceManager {
                 if let Err(e) = self.torrent.write_to_disk(piece.index, pdata) {
                     eprintln!("❌ Piece {} could not be written to disk: {e}", piece.index);
                 }
-                self.peer_event_tx.publish(
+                let _ = self.peer_event_tx.publish(
                     consts::TOPIC_PEER_EVENT,
                     PeerEvent::SendToAll {
                         message: PeerMessage::Have(piece.index as u32),
@@ -201,7 +201,7 @@ impl PieceManager {
                 );
             } else {
                 eprintln!("❌ Piece {} failed verification", piece.index);
-                self.client_event_tx.publish(
+                let _ = self.client_event_tx.publish(
                     consts::TOPIC_CLIENT_EVENT,
                     ClientEvent::PieceVerificationFailure {
                         piece_index: piece.index,
@@ -358,7 +358,7 @@ impl PieceManager {
                     piece.data = Some(vec![0u8; piece_len]);
                 }
 
-                self.peer_event_tx.publish(
+                let _ = self.peer_event_tx.publish(
                     consts::TOPIC_PEER_EVENT,
                     PeerEvent::Send {
                         addr: **peer,

@@ -1,7 +1,10 @@
 use crate::queue::{Queue, Receiver, Sender};
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 type Topic = String;
@@ -9,21 +12,31 @@ type Topic = String;
 #[derive(Debug)]
 pub struct PubSub<T: Send + Sync + 'static> {
     topics: Arc<Mutex<HashMap<Topic, Vec<Sender<Arc<T>>>>>>,
+    closed: AtomicBool,
 }
 
 impl<T: Send + Sync + 'static> PubSub<T> {
     pub fn new() -> Self {
         Self {
             topics: Arc::new(Mutex::new(HashMap::new())),
+            closed: AtomicBool::new(false),
         }
     }
-    pub fn subscribe(&self, topic: &str) -> Receiver<Arc<T>> {
+
+    pub fn subscribe(&self, topic: &str) -> Result<Receiver<Arc<T>>, Box<dyn std::error::Error>> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err("PubSub closed".into());
+        }
         let (tx, rx) = Queue::new(None);
         let mut topics = self.topics.lock().unwrap();
         topics.entry(topic.to_string()).or_default().push(tx);
-        rx
+        Ok(rx)
     }
-    pub fn publish(&self, topic: &str, message: T) {
+
+    pub fn publish(&self, topic: &str, message: T) -> Result<(), Box<dyn std::error::Error>> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err("PubSub closed".into());
+        }
         let message = Arc::new(message);
         let topics = self.topics.lock().unwrap();
         if let Some(subscribers) = topics.get(topic) {
@@ -32,5 +45,16 @@ impl<T: Send + Sync + 'static> PubSub<T> {
                 let _ = tx.send(message.clone());
             }
         }
+        Ok(())
+    }
+
+    pub fn close(&self) {
+        let mut topics = self.topics.lock().unwrap();
+        for subscribers in topics.values() {
+            for subscriber in subscribers {
+                subscriber.close();
+            }
+        }
+        topics.clear();
     }
 }

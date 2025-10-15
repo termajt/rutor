@@ -1,5 +1,6 @@
-use rutor::client::TorrentClient;
+use rutor::client::{TorrentClient, TorrentState};
 use rutor::torrent;
+use std::collections::VecDeque;
 use std::env;
 use std::fs::File;
 use std::path::Path;
@@ -11,7 +12,7 @@ struct ProgressTracker {
     prev_downloaded: u64,
     prev_instant: Instant,
     bar_width: usize,
-    speeds: Vec<f64>,
+    speeds: VecDeque<f64>,
     max_samples: usize,
     eta: f64,
     avg_speed: f64,
@@ -27,7 +28,7 @@ impl ProgressTracker {
             prev_downloaded: 0,
             prev_instant: Instant::now(),
             bar_width: bar_width,
-            speeds: Vec::with_capacity(max_samples),
+            speeds: VecDeque::with_capacity(max_samples),
             max_samples: max_samples,
             eta: f64::INFINITY,
             avg_speed: 0.0,
@@ -69,7 +70,7 @@ impl ProgressTracker {
 
         let reset = "\x1b[0m";
         let green_bg = "\x1b[42m";
-        let white_gray_bg = "\x1b[47m";
+        let white_gray_bg = "\x1b[100m";
 
         format!(
             "[{}{}{}{}{}{}] {:>3}%",
@@ -93,31 +94,31 @@ impl ProgressTracker {
         format!("{:02}:{:02}:{:02}", hours, minutes, secs)
     }
 
-    fn update(&mut self, downloaded: u64, connected_peers: usize, all_peers: usize) {
+    fn update(&mut self, state: &TorrentState) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.prev_instant).as_secs_f64();
         let instant_speeed = if elapsed > 0.0 {
-            (downloaded - self.prev_downloaded) as f64 / elapsed
+            (state.downloaded - self.prev_downloaded) as f64 / elapsed
         } else {
             0.0
         };
 
-        self.speeds.push(instant_speeed);
-        if self.speeds.len() > self.max_samples {
-            self.speeds.remove(0);
+        if self.speeds.len() + 1 > self.max_samples {
+            self.speeds.pop_front();
         }
+        self.speeds.push_back(instant_speeed);
         self.avg_speed = self.speeds.iter().sum::<f64>() / self.speeds.len() as f64;
 
-        let remaining = self.total_size.saturating_sub(downloaded) as f64;
+        let remaining = self.total_size.saturating_sub(state.downloaded) as f64;
         self.eta = if self.avg_speed > 0.0 {
             remaining / self.avg_speed
         } else {
             f64::INFINITY
         };
-        self.prev_downloaded = downloaded;
+        self.prev_downloaded = state.downloaded;
         self.prev_instant = now;
-        self.connected_peers = connected_peers;
-        self.all_peers = all_peers;
+        self.connected_peers = state.connected_peers;
+        self.all_peers = state.peers;
     }
 
     fn display(&self, first_draw: bool) {
@@ -155,14 +156,8 @@ impl ProgressTracker {
         println!("{}", self.format_bar(self.prev_downloaded));
     }
 
-    fn update_and_display(
-        &mut self,
-        downloaded: u64,
-        connected_peers: usize,
-        all_peers: usize,
-        first_draw: bool,
-    ) {
-        self.update(downloaded, connected_peers, all_peers);
+    fn update_and_display(&mut self, state: &TorrentState, first_draw: bool) {
+        self.update(state);
         self.display(first_draw);
     }
 }
@@ -186,29 +181,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let name = torrent.info.name.clone();
     let total_size = torrent.info.total_size;
-    let client = TorrentClient::new(torrent, 6881)?;
+    let client = TorrentClient::new(torrent)?;
     client.start()?;
     let mut first_draw = true;
     let mut progress_tracker = ProgressTracker::new(&name, total_size, 40, 10);
     while !client.is_complete() {
         let state = client.get_state();
-        progress_tracker.update_and_display(
-            state.downloaded,
-            state.connected_peers,
-            state.peers,
-            first_draw,
-        );
+        progress_tracker.update_and_display(&state, first_draw);
         first_draw = false;
         std::thread::sleep(Duration::from_secs(1));
     }
     client.stop();
     let state = client.get_state();
-    progress_tracker.update_and_display(
-        state.downloaded,
-        state.connected_peers,
-        state.peers,
-        first_draw,
-    );
+    progress_tracker.update_and_display(&state, first_draw);
     println!("\nDownload complete!");
     Ok(())
 }

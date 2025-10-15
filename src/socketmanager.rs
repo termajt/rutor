@@ -320,4 +320,11 @@ impl SocketManager {
         }
         Ok(())
     }
+
+    pub fn close(&mut self) {
+        let addrs = self.conns.keys().copied().collect::<Vec<SocketAddr>>();
+        for addr in addrs {
+            self.remove_socket(addr);
+        }
+    }
 }
