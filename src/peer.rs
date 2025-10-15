@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt,
     hash::Hash,
     io::{Read, Write},
@@ -310,15 +310,33 @@ impl Hash for PeerInfo {
 struct PeerStats {
     bytes_downloaded: usize,
     last_update: Instant,
-    speed: f64,
+    speeds: VecDeque<f64>,
+    max_samples: usize,
+    avg_speed: f64,
 }
 
 impl PeerStats {
+    fn new(max_samples: usize) -> Self {
+        Self {
+            bytes_downloaded: 0,
+            last_update: Instant::now(),
+            speeds: VecDeque::with_capacity(max_samples),
+            max_samples: max_samples,
+            avg_speed: 0.0,
+        }
+    }
+
     fn update(&mut self, bytes: usize) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update).as_secs_f64();
         if elapsed > 0.5 {
-            self.speed = (bytes as f64) / elapsed;
+            let instant_speed = (bytes as f64) / elapsed;
+
+            if self.speeds.len() + 1 > self.max_samples {
+                self.speeds.pop_front();
+            }
+            self.speeds.push_back(instant_speed);
+            self.avg_speed = self.speeds.iter().sum::<f64>() / self.speeds.len() as f64;
             self.bytes_downloaded = 0;
             self.last_update = now;
         } else {
@@ -327,7 +345,11 @@ impl PeerStats {
     }
 
     fn current_speed(&self) -> f64 {
-        self.speed.max(1024.0)
+        if self.avg_speed > 1024.0 {
+            self.avg_speed
+        } else {
+            1024.0
+        }
     }
 }
 
@@ -355,11 +377,7 @@ impl PeerConnection {
             choked: true,
             interested: false,
             remote_interested: false,
-            stats: PeerStats {
-                bytes_downloaded: 0,
-                last_update: Instant::now(),
-                speed: 0.0,
-            },
+            stats: PeerStats::new(10),
         }
     }
 
