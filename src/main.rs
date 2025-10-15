@@ -1,41 +1,35 @@
+use rutor::bytespeed::ByteSpeed;
 use rutor::client::{TorrentClient, TorrentState};
 use rutor::torrent;
-use std::collections::VecDeque;
 use std::env;
 use std::fs::File;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct ProgressTracker {
     name: String,
     total_size: u64,
     prev_downloaded: u64,
-    prev_instant: Instant,
-    speeds: VecDeque<f64>,
-    max_samples: usize,
     eta: f64,
-    avg_speed: f64,
     connected_peers: usize,
     all_peers: usize,
     pieces_verified: usize,
     total_pieces: usize,
+    speed: ByteSpeed,
 }
 
 impl ProgressTracker {
-    fn new(name: &str, total_size: u64, max_samples: usize, total_pieces: usize) -> Self {
+    fn new(name: &str, total_size: u64, total_pieces: usize) -> Self {
         Self {
             name: name.to_string(),
             total_size: total_size,
             prev_downloaded: 0,
-            prev_instant: Instant::now(),
-            speeds: VecDeque::with_capacity(max_samples),
-            max_samples: max_samples,
             eta: f64::INFINITY,
-            avg_speed: 0.0,
             connected_peers: 0,
             all_peers: 0,
             pieces_verified: 0,
             total_pieces: total_pieces,
+            speed: ByteSpeed::new(Duration::from_secs(1)),
         }
     }
 
@@ -102,28 +96,16 @@ impl ProgressTracker {
     }
 
     fn update(&mut self, state: &TorrentState, pieces_verified: usize) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.prev_instant).as_secs_f64();
-        let instant_speeed = if elapsed > 0.0 {
-            (state.downloaded - self.prev_downloaded) as f64 / elapsed
-        } else {
-            0.0
-        };
-
-        if self.speeds.len() + 1 > self.max_samples {
-            self.speeds.pop_front();
-        }
-        self.speeds.push_back(instant_speeed);
-        self.avg_speed = self.speeds.iter().sum::<f64>() / self.speeds.len() as f64;
+        self.speed
+            .update(state.downloaded.abs_diff(self.prev_downloaded) as usize);
 
         let remaining = self.total_size.saturating_sub(state.downloaded) as f64;
-        self.eta = if self.avg_speed > 0.0 {
-            remaining / self.avg_speed
+        self.eta = if self.speed.avg > 0.0 {
+            remaining / self.speed.avg
         } else {
             f64::INFINITY
         };
         self.prev_downloaded = state.downloaded;
-        self.prev_instant = now;
         self.connected_peers = state.connected_peers;
         self.all_peers = state.peers;
         self.pieces_verified = pieces_verified;
@@ -152,7 +134,7 @@ impl ProgressTracker {
             self.human_bytes(self.prev_downloaded),
             self.human_bytes(self.total_size),
             yellow,
-            self.human_bytes(self.avg_speed as u64),
+            self.human_bytes(self.speed.avg as u64),
             reset,
             magenta,
             self.format_eta(self.eta),
@@ -220,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = TorrentClient::new(torrent)?;
     client.start()?;
     let mut first_draw = true;
-    let mut progress_tracker = ProgressTracker::new(&name, total_size, 10, client.total_pieces());
+    let mut progress_tracker = ProgressTracker::new(&name, total_size, client.total_pieces());
     while !client.is_complete() {
         let state = client.get_state();
         progress_tracker.update_and_display(&state, client.pieces_verified(), first_draw);

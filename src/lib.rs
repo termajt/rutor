@@ -1,6 +1,7 @@
 pub mod announce;
 pub mod bencode;
 pub mod bitfield;
+pub mod bytespeed;
 pub mod client;
 pub mod consts;
 pub mod peer;

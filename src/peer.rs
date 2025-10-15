@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fmt,
     hash::Hash,
     io::{Read, Write},
@@ -10,6 +10,7 @@ use std::{
 
 use crate::{
     bitfield::Bitfield,
+    bytespeed::ByteSpeed,
     consts::{self, ClientEvent, PeerEvent, PieceEvent},
     pool::ThreadPool,
     pubsub::PubSub,
@@ -307,53 +308,6 @@ impl Hash for PeerInfo {
 }
 
 #[derive(Debug)]
-struct PeerStats {
-    bytes_downloaded: usize,
-    last_update: Instant,
-    speeds: VecDeque<f64>,
-    max_samples: usize,
-    avg_speed: f64,
-}
-
-impl PeerStats {
-    fn new(max_samples: usize) -> Self {
-        Self {
-            bytes_downloaded: 0,
-            last_update: Instant::now(),
-            speeds: VecDeque::with_capacity(max_samples),
-            max_samples: max_samples,
-            avg_speed: 0.0,
-        }
-    }
-
-    fn update(&mut self, bytes: usize) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_update).as_secs_f64();
-        if elapsed > 0.5 {
-            let instant_speed = (bytes as f64) / elapsed;
-
-            if self.speeds.len() + 1 > self.max_samples {
-                self.speeds.pop_front();
-            }
-            self.speeds.push_back(instant_speed);
-            self.avg_speed = self.speeds.iter().sum::<f64>() / self.speeds.len() as f64;
-            self.bytes_downloaded = 0;
-            self.last_update = now;
-        } else {
-            self.bytes_downloaded += bytes;
-        }
-    }
-
-    fn current_speed(&self) -> f64 {
-        if self.avg_speed > 1024.0 {
-            self.avg_speed
-        } else {
-            1024.0
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct PeerConnection {
     addr: SocketAddr,
     peer_id: [u8; 20],
@@ -362,7 +316,7 @@ pub struct PeerConnection {
     choked: bool,
     interested: bool,
     remote_interested: bool,
-    stats: PeerStats,
+    speed: ByteSpeed,
 }
 
 impl PeerConnection {
@@ -377,7 +331,7 @@ impl PeerConnection {
             choked: true,
             interested: false,
             remote_interested: false,
-            stats: PeerStats::new(10),
+            speed: ByteSpeed::new(Duration::from_millis(500)),
         }
     }
 
@@ -402,7 +356,7 @@ impl PeerConnection {
                 self.bitfield.merge(new_bitfield);
             }
             PeerMessage::Piece((_, _, data)) => {
-                self.stats.update(data.len());
+                self.speed.update(data.len());
             }
             _ => return,
         }
@@ -436,7 +390,7 @@ impl PeerConnection {
     }
 
     pub fn get_download_speed(&self) -> f64 {
-        self.stats.current_speed()
+        self.speed.avg.max(1024.0)
     }
 }
 
