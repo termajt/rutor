@@ -70,7 +70,7 @@ impl TorrentState {
 pub struct TorrentClient {
     /// Shared reference to the [`Torrent`] metadata and info.
     pub torrent: Arc<Torrent>,
-    state: Arc<Mutex<TorrentState>>,
+    state: Arc<RwLock<TorrentState>>,
     tpool: Arc<ThreadPool>,
     peer_id: [u8; 20],
     shutdown: Arc<AtomicBool>,
@@ -119,7 +119,7 @@ impl TorrentClient {
         let socket_manager = Arc::new(Mutex::new(SocketManager::new()?));
         Ok(Self {
             torrent: torrent,
-            state: Arc::new(Mutex::new(TorrentState::new())),
+            state: Arc::new(RwLock::new(TorrentState::new())),
             tpool: tpool,
             peer_id: peer_id,
             shutdown: shutdown,
@@ -138,7 +138,7 @@ impl TorrentClient {
     /// Starts the torrent client's background processes.
     pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.write().unwrap();
             if st.started_at.is_some() {
                 return Err("already started".into());
             }
@@ -153,29 +153,33 @@ impl TorrentClient {
         self.tpool.execute(move || {
             while let Ok(ev) = client_event_rx.recv() {
                 match &*ev {
-                    ClientEvent::BytesDownloaded { data_size } => {
-                        let mut state = state.lock().unwrap();
-                        state.downloaded += *data_size as u64;
-                        state.left = total_size.saturating_sub(state.downloaded);
-                    }
                     ClientEvent::PieceVerificationFailure {
                         piece_index: _,
                         data_size,
                     } => {
-                        let mut state = state.lock().unwrap();
+                        let mut state = state.write().unwrap();
                         state.downloaded = state.downloaded.saturating_sub(*data_size as u64);
                         state.left = total_size.saturating_sub(state.downloaded);
                     }
                     ClientEvent::PeersChanged => {
-                        let mut state = state.lock().unwrap();
+                        let mut state = state.write().unwrap();
                         state.connected_peers = peer_manager.connected_peers();
                         state.peers = peer_manager.peer_count();
                     }
-                    ClientEvent::PieceVerified { piece_index, data } => {
-                        if let Err(e) = torrent.write_to_disk(*piece_index, &data) {
-                            eprintln!("failed to write piece {piece_index} to disk: {e}");
-                        }
+                    ClientEvent::PieceVerified { piece_index } => {
                         torrent.info.set_bitfield_index(*piece_index);
+                    }
+                    ClientEvent::WriteToDisk {
+                        piece_index,
+                        begin,
+                        data,
+                    } => {
+                        if let Err(e) = torrent.write_to_disk(*piece_index, *begin, data) {
+                            eprintln!("failed to write block to disk: {e}");
+                        }
+                        let mut state = state.write().unwrap();
+                        state.downloaded += data.len() as u64;
+                        state.left = total_size.saturating_sub(state.downloaded);
                     }
                 }
             }
@@ -221,7 +225,7 @@ impl TorrentClient {
                 };
                 tracker.announced();
                 let (uploaded, downloaded, left) = {
-                    let state = state.lock().unwrap();
+                    let state = state.read().unwrap();
                     (state.uploaded, state.downloaded, state.left)
                 };
                 if let Ok(response) = announce::announce(
@@ -333,7 +337,7 @@ impl TorrentClient {
     }
 
     pub fn get_state(&self) -> TorrentState {
-        self.state.lock().unwrap().clone()
+        self.state.read().unwrap().clone()
     }
 
     pub fn pieces_left(&self) -> usize {

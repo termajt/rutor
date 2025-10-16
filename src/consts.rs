@@ -50,9 +50,6 @@ pub enum PeerEvent {
 
 #[derive(Debug)]
 pub enum ClientEvent {
-    BytesDownloaded {
-        data_size: usize,
-    },
     PieceVerificationFailure {
         piece_index: usize,
         data_size: usize,
@@ -60,6 +57,10 @@ pub enum ClientEvent {
     PeersChanged,
     PieceVerified {
         piece_index: usize,
+    },
+    WriteToDisk {
+        piece_index: usize,
+        begin: usize,
         data: Vec<u8>,
     },
 }

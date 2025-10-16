@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -27,7 +27,6 @@ enum BlockState {
 
 #[derive(Debug)]
 struct BlockInfo {
-    index: u32,
     begin: u32,
     length: u32,
     state: BlockState,
@@ -35,9 +34,8 @@ struct BlockInfo {
 }
 
 impl BlockInfo {
-    fn new(index: u32, begin: u32, length: u32) -> Self {
+    fn new(begin: u32, length: u32) -> Self {
         Self {
-            index: index,
             begin: begin,
             length: length,
             state: BlockState::Missing,
@@ -72,7 +70,78 @@ struct Piece {
     index: usize,
     state: PieceState,
     blocks: Vec<BlockInfo>,
-    data: Option<Vec<u8>>,
+    expected_hash: [u8; 20],
+    hasher: Sha1,
+    next_block_offset: usize,
+    out_of_order_blocks: BTreeMap<u32, Vec<u8>>,
+}
+
+impl Piece {
+    fn new(index: usize, piece_size: usize, expected_hash: [u8; 20]) -> Self {
+        let mut blocks = Vec::new();
+        let mut begin = 0;
+        while begin < piece_size {
+            let len = std::cmp::min(BLOCK_SIZE, piece_size - begin);
+            blocks.push(BlockInfo::new(begin as u32, len as u32));
+            begin += len;
+        }
+
+        Self {
+            index: index,
+            state: PieceState::Missing,
+            blocks: blocks,
+            expected_hash: expected_hash,
+            hasher: Sha1::new(),
+            next_block_offset: 0,
+            out_of_order_blocks: BTreeMap::new(),
+        }
+    }
+
+    fn mark_block_received(&mut self, begin: u32, data: &[u8]) -> bool {
+        if let Some(block) = self.blocks.iter_mut().find(|b| b.begin == begin) {
+            if matches!(block.state, BlockState::Received) {
+                return false;
+            }
+            block.state = BlockState::Received;
+            if begin == self.next_block_offset as u32 {
+                self.hasher.update(data);
+                self.next_block_offset += data.len();
+
+                while let Some(buffered) = self
+                    .out_of_order_blocks
+                    .remove(&(self.next_block_offset as u32))
+                {
+                    self.hasher.update(&buffered);
+                    self.next_block_offset += buffered.len();
+                }
+            } else {
+                self.out_of_order_blocks.insert(begin, data.to_vec());
+            }
+
+            if self.blocks.iter().all(|b| b.state == BlockState::Received) {
+                self.state = PieceState::Complete;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn verify(&mut self) -> bool {
+        let hash_result = self.hasher.clone().finalize();
+        let valid = hash_result.as_slice() == self.expected_hash;
+        if valid {
+            self.state = PieceState::Verified;
+        } else {
+            self.state = PieceState::Missing;
+            for block in self.blocks.iter_mut() {
+                block.state = BlockState::Missing;
+            }
+        }
+        self.hasher.reset();
+        self.next_block_offset = 0;
+        self.out_of_order_blocks.clear();
+        valid
+    }
 }
 
 #[derive(Debug)]
@@ -100,23 +169,12 @@ impl PieceManager {
         let mut pieces = Vec::new();
         for piece_index in 0..total_pieces {
             let piece_size = if piece_index == total_pieces - 1 {
-                (total_size as u32) - (piece_index as u32 * piece_length)
+                (total_size as usize) - (piece_index as usize * piece_length as usize)
             } else {
-                piece_length
+                piece_length as usize
             };
-            let mut blocks = Vec::new();
-            let mut begin = 0u32;
-            while begin < piece_size {
-                let len = std::cmp::min(BLOCK_SIZE as u32, piece_size - begin);
-                blocks.push(BlockInfo::new(piece_index as u32, begin, len));
-                begin += len;
-            }
-            pieces.push(Piece {
-                index: piece_index,
-                state: PieceState::Missing,
-                blocks: blocks,
-                data: None,
-            });
+            let expected_hash = torrent.info.piece_hashes[piece_index];
+            pieces.push(Piece::new(piece_index, piece_size, expected_hash));
         }
         let blocks_per_piece = piece_length as usize / BLOCK_SIZE;
         PieceManager {
@@ -135,79 +193,52 @@ impl PieceManager {
     }
 
     fn mark_block_received(&mut self, index: u32, begin: u32, data: &[u8]) {
-        let mut complete = false;
         if let Some(piece) = self.pieces.get_mut(index as usize) {
-            if let Some(block) = piece.blocks.iter_mut().find(|b| b.begin == begin) {
-                if block.state == BlockState::Received {
-                    return;
+            if piece.mark_block_received(begin, data) {
+                let _ = self.client_event_tx.publish(
+                    consts::TOPIC_CLIENT_EVENT,
+                    ClientEvent::WriteToDisk {
+                        piece_index: piece.index,
+                        begin: begin as usize,
+                        data: data.to_vec(),
+                    },
+                );
+                let _ = self.peer_event_tx.publish(
+                    consts::TOPIC_PEER_EVENT,
+                    PeerEvent::SendToAll {
+                        message: PeerMessage::Cancel((
+                            piece.index as u32,
+                            begin,
+                            data.len() as u32,
+                        )),
+                    },
+                );
+                if matches!(piece.state, PieceState::Complete) {
+                    if piece.verify() {
+                        let _ = self.client_event_tx.publish(
+                            consts::TOPIC_CLIENT_EVENT,
+                            ClientEvent::PieceVerified {
+                                piece_index: piece.index,
+                            },
+                        );
+                        let _ = self.peer_event_tx.publish(
+                            consts::TOPIC_PEER_EVENT,
+                            PeerEvent::SendToAll {
+                                message: PeerMessage::Have(piece.index as u32),
+                            },
+                        );
+                    } else {
+                        eprintln!("❌ Piece {} failed verification", piece.index);
+                        let _ = self.client_event_tx.publish(
+                            consts::TOPIC_CLIENT_EVENT,
+                            ClientEvent::PieceVerificationFailure {
+                                piece_index: piece.index,
+                                data_size: data.len(),
+                            },
+                        );
+                    }
                 }
-                block.state = BlockState::Received;
-                let _ = self.peer_event_tx.publish(
-                    consts::TOPIC_PEER_EVENT,
-                    PeerEvent::SendToAll {
-                        message: PeerMessage::Cancel((index, block.begin, block.length)),
-                    },
-                );
-                let _ = self.client_event_tx.publish(
-                    consts::TOPIC_CLIENT_EVENT,
-                    ClientEvent::BytesDownloaded {
-                        data_size: data.len(),
-                    },
-                );
             }
-
-            if let Some(ref mut pdata) = piece.data {
-                let offset = begin as usize;
-                pdata[offset..offset + data.len()].copy_from_slice(data);
-            }
-
-            if piece.blocks.iter().all(|b| b.state == BlockState::Received) {
-                piece.state = PieceState::Complete;
-                complete = true;
-            }
-        }
-        if complete {
-            self.verify_piece(index as usize);
-        }
-    }
-
-    fn verify_piece(&mut self, index: usize) {
-        let Some(piece) = self.pieces.get_mut(index) else {
-            return;
-        };
-        let expected_hash = self.torrent.info.piece_hashes[piece.index];
-        if let Some(ref pdata) = piece.data {
-            let mut hasher = Sha1::new();
-            hasher.update(pdata);
-            let result = hasher.finalize();
-
-            if result[..] == expected_hash {
-                piece.state = PieceState::Verified;
-                let _ = self.client_event_tx.publish(
-                    consts::TOPIC_CLIENT_EVENT,
-                    ClientEvent::PieceVerified {
-                        piece_index: piece.index,
-                        data: pdata.clone(),
-                    },
-                );
-                let _ = self.peer_event_tx.publish(
-                    consts::TOPIC_PEER_EVENT,
-                    PeerEvent::SendToAll {
-                        message: PeerMessage::Have(piece.index as u32),
-                    },
-                );
-            } else {
-                eprintln!("❌ Piece {} failed verification", piece.index);
-                let _ = self.client_event_tx.publish(
-                    consts::TOPIC_CLIENT_EVENT,
-                    ClientEvent::PieceVerificationFailure {
-                        piece_index: piece.index,
-                        data_size: pdata.len(),
-                    },
-                );
-                piece.state = PieceState::Missing;
-            }
-            piece.data = None;
         }
     }
 
@@ -232,19 +263,6 @@ impl PieceManager {
         }
         self.piece_availability_cache = Some(counts.clone());
         counts
-    }
-
-    fn piece_length_for_index(&self, index: usize) -> usize {
-        if index == (self.total_pieces() - 1) {
-            let remainder = self.torrent.info.total_size % self.torrent.info.piece_length as u64;
-            if remainder == 0 {
-                self.torrent.info.piece_length as usize
-            } else {
-                remainder as usize
-            }
-        } else {
-            self.torrent.info.piece_length as usize
-        }
     }
 
     fn calculate_throttle(&self) -> (usize, usize) {
@@ -311,7 +329,6 @@ impl PieceManager {
                 continue;
             };
 
-            let piece_len = self.piece_length_for_index(index);
             let piece = &mut self.pieces[index];
             let mut sent_this_round = 0;
             for block in piece.blocks.iter_mut() {
@@ -336,15 +353,15 @@ impl PieceManager {
                     piece.state = PieceState::Downloading;
                 }
 
-                if piece.data.is_none() {
-                    piece.data = Some(vec![0u8; piece_len]);
-                }
-
                 let _ = self.peer_event_tx.publish(
                     consts::TOPIC_PEER_EVENT,
                     PeerEvent::Send {
                         addr: **peer,
-                        message: PeerMessage::Request((block.index, block.begin, block.length)),
+                        message: PeerMessage::Request((
+                            piece.index as u32,
+                            block.begin,
+                            block.length,
+                        )),
                     },
                 );
 

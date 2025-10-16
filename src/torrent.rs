@@ -198,6 +198,7 @@ impl TorrentInfo {
     pub fn write_data_to_disk(
         &self,
         piece_index: usize,
+        offset: usize,
         data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut data_offset = 0;
@@ -210,13 +211,33 @@ impl TorrentInfo {
                 PathBuf::from(path_str)
             };
 
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+
             let mut f = OpenOptions::new().write(true).create(true).open(path)?;
 
-            f.seek(SeekFrom::Start(slice.offset_in_file))?;
+            let slice_start_offset = if offset as u64 > slice.offset_in_file {
+                offset as u64 - slice.offset_in_file
+            } else {
+                0
+            };
 
-            let end_offset = data_offset + slice.length as usize;
-            f.write_all(&data[data_offset..end_offset])?;
-            data_offset = end_offset;
+            let write_len = std::cmp::min(
+                slice.length - slice_start_offset,
+                (data.len() - data_offset) as u64,
+            );
+
+            if write_len == 0 {
+                continue;
+            }
+
+            f.seek(SeekFrom::Start(slice.offset_in_file + slice_start_offset))?;
+            f.write_all(&data[data_offset..data_offset + write_len as usize])?;
+            data_offset += write_len as usize;
+            if data_offset >= data.len() {
+                break;
+            }
         }
 
         Ok(())
@@ -324,9 +345,10 @@ impl Torrent {
     pub fn write_to_disk(
         &self,
         piece_index: usize,
+        offset: usize,
         data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.info.write_data_to_disk(piece_index, data)
+        self.info.write_data_to_disk(piece_index, offset, data)
     }
 }
 
