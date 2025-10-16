@@ -3,7 +3,8 @@ use rutor::client::{TorrentClient, TorrentState};
 use rutor::torrent;
 use std::env;
 use std::fs::File;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 struct ProgressTracker {
@@ -180,6 +181,23 @@ fn get_bar_width() -> usize {
     get_terminal_width() / 2
 }
 
+fn print_usage_header<W: Write>(writer: &mut W, prog: &str) {
+    let _ = writeln!(writer, "Usage: {} [OPTIONS...] <torrent-file>", prog);
+}
+
+fn print_usage<W: Write>(writer: &mut W, prog: &str) {
+    print_usage_header(writer, prog);
+
+    let mut usage = String::from("\n");
+    usage.push_str("OPTIONS:\n");
+    usage.push_str(
+        "  -d/--destination    destination folder of where the torrent should be downloaded to\n",
+    );
+    usage.push_str("  -h/--help           shows this help message and exits");
+
+    let _ = writeln!(writer, "{}", usage);
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<String>>();
     let program = Path::new(&args[0])
@@ -188,14 +206,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string_lossy()
         .into_owned();
 
-    if args.len() < 2 {
-        eprintln!("Usage: {} <filename>", program);
+    let mut filename = String::new();
+    let mut destination: Option<PathBuf> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-d" | "--destination" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("ERROR: destination path not provided");
+                    std::process::exit(1);
+                }
+                destination = Some(PathBuf::from(&args[i]));
+            }
+            "-h" | "--help" => {
+                let mut stdout = std::io::stdout();
+                print_usage(&mut stdout, &program);
+                std::process::exit(0);
+            }
+            arg if filename.is_empty() => {
+                filename = arg.to_string();
+            }
+            _ => {
+                eprintln!("ERROR: unknown argument '{}'", args[i]);
+                let mut stderr = std::io::stderr();
+                print_usage_header(&mut stderr, &program);
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    if filename.is_empty() {
+        eprintln!("ERROR: missing torrent file");
+        let mut stderr = std::io::stderr();
+        print_usage_header(&mut stderr, &program);
         std::process::exit(1);
     }
 
     let torrent: torrent::Torrent = {
-        let file = File::open(&args[1])?;
-        torrent::Torrent::from_file(&file)?
+        let file = File::open(filename)?;
+        torrent::Torrent::from_file(&file, destination)?
     };
     let name = torrent.info.name.clone();
     let total_size = torrent.info.total_size;

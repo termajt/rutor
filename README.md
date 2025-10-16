@@ -26,6 +26,18 @@ After building the project, you can run the compiled binary:
 
 This will start downloading the torrent and display a progress bar with download statistics.
 
+### Additional help
+
+For additional help, run with `-h/--help` flag:
+
+```bash
+Usage: rutor [OPTIONS...] <torrent-file>
+
+OPTIONS:
+  -d/--destination    destination folder of where the torrent should be downloaded to
+  -h/--help           shows this help message and exits
+```
+
 ## Notes
 
 - This project is **not production-ready**. It is designed to learn Rust and how torrents work.

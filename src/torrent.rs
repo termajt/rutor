@@ -3,7 +3,7 @@ use std::{
     fmt,
     fs::{File, OpenOptions},
     io::{BufReader, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::PathBuf,
     sync::RwLock,
 };
 
@@ -72,10 +72,11 @@ pub struct TorrentInfo {
     pub total_size: u64,
     files: Vec<TorrentFile>,
     bitfield: RwLock<Bitfield>,
+    destination: Option<PathBuf>,
 }
 
 impl TorrentInfo {
-    pub fn from_bencode(bencode: &Bencode) -> Result<Self, Error> {
+    pub fn from_bencode(bencode: &Bencode, destination: Option<PathBuf>) -> Result<Self, Error> {
         let map = bencode.dict()?;
         let name = match map.get(&b"name".to_vec()) {
             Some(bname) => String::from_utf8_lossy(bname.bytes()?).to_string(),
@@ -155,6 +156,7 @@ impl TorrentInfo {
             total_size: total_size,
             files: files,
             bitfield: RwLock::new(Bitfield::new(total_pieces)),
+            destination: destination,
         })
     }
 
@@ -202,11 +204,11 @@ impl TorrentInfo {
         for slice in self.piece_file_slices(piece_index) {
             let file = &self.files[slice.file_index];
             let path_str = file.path.join(&std::path::MAIN_SEPARATOR.to_string());
-            let path = Path::new(&path_str);
-
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+            let path: PathBuf = if let Some(dest) = &self.destination {
+                dest.join(path_str)
+            } else {
+                PathBuf::from(path_str)
+            };
 
             let mut f = OpenOptions::new().write(true).create(true).open(path)?;
 
@@ -265,12 +267,12 @@ pub struct Torrent {
 }
 
 impl Torrent {
-    pub fn new(bytes: Vec<u8>) -> Result<Self, Error> {
+    pub fn new(bytes: Vec<u8>, destination: Option<PathBuf>) -> Result<Self, Error> {
         let bencode = bencode::decode(&bytes)?;
-        Torrent::from_bencode(bencode)
+        Torrent::from_bencode(bencode, destination)
     }
 
-    pub fn from_bencode(bencode: Bencode) -> Result<Self, Error> {
+    pub fn from_bencode(bencode: Bencode, destination: Option<PathBuf>) -> Result<Self, Error> {
         match bencode {
             Bencode::Dict(map) => {
                 let mut announce: Option<String> = None;
@@ -297,7 +299,7 @@ impl Torrent {
                     .get(&b"info".to_vec())
                     .ok_or_else(|| Error::LoadError("missing 'info' dict".into()))?;
                 let info_hash = compute_info_hash(binfo)?;
-                let info = TorrentInfo::from_bencode(binfo)?;
+                let info = TorrentInfo::from_bencode(binfo, destination)?;
                 Ok(Torrent {
                     announce: announce,
                     announce_list: announce_list,
@@ -309,14 +311,14 @@ impl Torrent {
         }
     }
 
-    pub fn from_file(file: &File) -> Result<Self, Error> {
+    pub fn from_file(file: &File, destination: Option<PathBuf>) -> Result<Self, Error> {
         let reader = BufReader::new(file);
-        Torrent::from_reader(reader)
+        Torrent::from_reader(reader, destination)
     }
 
-    pub fn from_reader<R: Read>(reader: R) -> Result<Self, Error> {
+    pub fn from_reader<R: Read>(reader: R, destination: Option<PathBuf>) -> Result<Self, Error> {
         let bencode = bencode::decode_from_reader(reader)?;
-        Torrent::from_bencode(bencode)
+        Torrent::from_bencode(bencode, destination)
     }
 
     pub fn write_to_disk(
