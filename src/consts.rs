@@ -58,4 +58,8 @@ pub enum ClientEvent {
         data_size: usize,
     },
     PeersChanged,
+    PieceVerified {
+        piece_index: usize,
+        data: Vec<u8>,
+    },
 }

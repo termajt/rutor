@@ -183,10 +183,13 @@ impl PieceManager {
 
             if result[..] == expected_hash {
                 piece.state = PieceState::Verified;
-                self.torrent.info.set_bitfield_index(piece.index);
-                if let Err(e) = self.torrent.write_to_disk(piece.index, pdata) {
-                    eprintln!("❌ Piece {} could not be written to disk: {e}", piece.index);
-                }
+                let _ = self.client_event_tx.publish(
+                    consts::TOPIC_CLIENT_EVENT,
+                    ClientEvent::PieceVerified {
+                        piece_index: piece.index,
+                        data: pdata.clone(),
+                    },
+                );
                 let _ = self.peer_event_tx.publish(
                     consts::TOPIC_PEER_EVENT,
                     PeerEvent::SendToAll {

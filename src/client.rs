@@ -149,6 +149,7 @@ impl TorrentClient {
         let peer_manager = self.peer_manager.clone();
         let client_event_rx = self.client_event.subscribe(consts::TOPIC_CLIENT_EVENT)?;
         let total_size = self.torrent.info.total_size;
+        let torrent = self.torrent.clone();
         self.tpool.execute(move || {
             while let Ok(ev) = client_event_rx.recv() {
                 match &*ev {
@@ -169,6 +170,12 @@ impl TorrentClient {
                         let mut state = state.lock().unwrap();
                         state.connected_peers = peer_manager.connected_peers();
                         state.peers = peer_manager.peer_count();
+                    }
+                    ClientEvent::PieceVerified { piece_index, data } => {
+                        if let Err(e) = torrent.write_to_disk(*piece_index, &data) {
+                            eprintln!("failed to write piece {piece_index} to disk: {e}");
+                        }
+                        torrent.info.set_bitfield_index(*piece_index);
                     }
                 }
             }
