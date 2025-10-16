@@ -315,7 +315,7 @@ pub struct PeerConnection {
     pub bitfield: Bitfield,
     choked: bool,
     interested: bool,
-    remote_interested: bool,
+    am_interested: bool,
     speed: ByteSpeed,
 }
 
@@ -330,7 +330,7 @@ impl PeerConnection {
             bitfield: Bitfield::new(total_pieces),
             choked: true,
             interested: false,
-            remote_interested: false,
+            am_interested: false,
             speed: ByteSpeed::new(Duration::from_secs(4), Duration::from_millis(500)),
         }
     }
@@ -379,14 +379,6 @@ impl PeerConnection {
 
     fn is_choked(&self) -> bool {
         self.choked
-    }
-
-    fn is_remote_interested(&self) -> bool {
-        self.remote_interested
-    }
-
-    pub fn set_remote_interested(&mut self, value: bool) {
-        self.remote_interested = value;
     }
 
     pub fn get_download_speed(&self) -> f64 {
@@ -489,6 +481,7 @@ impl PeerManager {
                 pc.handle_message(&message);
                 match message {
                     PeerMessage::Bitfield(_) | PeerMessage::Have(_) => {
+                        self.update_interest(pc);
                         let _ = self.piece_event_tx.publish(
                             consts::TOPIC_PIECE_EVENT,
                             PieceEvent::PieceAvailabilityChange,
@@ -516,6 +509,27 @@ impl PeerManager {
                     _ => {}
                 }
             }
+        }
+    }
+
+    fn update_interest(&self, pconn: &mut PeerConnection) {
+        let am_interested_now = self.torrent.info.bitfield_differs(&pconn.bitfield);
+        if am_interested_now != pconn.am_interested {
+            pconn.am_interested = am_interested_now;
+
+            let message = if am_interested_now {
+                PeerMessage::Interested
+            } else {
+                PeerMessage::NotInterested
+            };
+
+            let _ = self.peer_event_tx.publish(
+                consts::TOPIC_PEER_EVENT,
+                PeerEvent::Send {
+                    addr: pconn.addr,
+                    message: message,
+                },
+            );
         }
     }
 
@@ -571,7 +585,6 @@ impl PeerManager {
         drop(connected);
         self.send_peers_changed();
         self.maybe_send_bitfield(addr);
-        self.maybe_interest_peer(addr);
     }
 
     /// Marks a peer as having failed to connect, possibly removing it if it failed repeatedly.
@@ -580,7 +593,7 @@ impl PeerManager {
         if let Some(p) = peers.get_mut(&addr) {
             p.status = PeerStatus::Failed;
             p.failures += 1;
-            if p.failures >= 1 {
+            if p.failures >= 3 {
                 peers.remove(&addr);
             }
         }
@@ -701,22 +714,6 @@ impl PeerManager {
             return pc.is_choked();
         }
         return true;
-    }
-
-    fn maybe_interest_peer(&self, addr: &SocketAddr) {
-        let mut connected = self.connected.write().unwrap();
-        if let Some(pc) = connected.get_mut(&addr) {
-            if !pc.is_remote_interested() {
-                pc.set_remote_interested(true);
-                let _ = self.peer_event_tx.publish(
-                    consts::TOPIC_PEER_EVENT,
-                    PeerEvent::Send {
-                        addr: pc.addr,
-                        message: PeerMessage::Interested,
-                    },
-                );
-            }
-        }
     }
 
     fn maybe_send_bitfield(&self, addr: &SocketAddr) {

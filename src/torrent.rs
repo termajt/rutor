@@ -249,6 +249,11 @@ impl TorrentInfo {
         let bitfield = self.bitfield.read().unwrap();
         bitfield.count_ones()
     }
+
+    pub fn bitfield_differs(&self, other: &Bitfield) -> bool {
+        let bitfield = self.bitfield.read().unwrap();
+        bitfield.differs_from(other)
+    }
 }
 
 #[derive(Debug)]

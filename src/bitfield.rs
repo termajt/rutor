@@ -120,6 +120,14 @@ impl Bitfield {
     }
 
     pub fn has_any(&self) -> bool {
-        self.bits.iter().any(|b| b.count_ones() > 0)
+        self.bits.iter().any(|&b| b != 0)
+    }
+
+    pub fn differs_from(&self, other: &Bitfield) -> bool {
+        if self.len() != other.len() {
+            return true;
+        }
+
+        self.bits.iter().zip(&other.bits).any(|(a, b)| a ^ b != 0)
     }
 }
