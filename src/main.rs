@@ -22,6 +22,7 @@ struct ProgressTracker {
     mem_usage_kb: u64,
     pid: Pid,
     show_consumption: bool,
+    thread_workers: usize,
 }
 
 impl ProgressTracker {
@@ -31,6 +32,7 @@ impl ProgressTracker {
         total_pieces: usize,
         pid: Pid,
         show_consumption: bool,
+        thread_workers: usize,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -46,6 +48,7 @@ impl ProgressTracker {
             mem_usage_kb: 0,
             pid: pid,
             show_consumption: show_consumption,
+            thread_workers: thread_workers,
         }
     }
 
@@ -111,7 +114,13 @@ impl ProgressTracker {
         format!("{:02}:{:02}:{:02}", hours, minutes, secs)
     }
 
-    fn update(&mut self, state: &TorrentState, pieces_verified: usize, system: &System) {
+    fn update(
+        &mut self,
+        state: &TorrentState,
+        pieces_verified: usize,
+        system: &System,
+        thread_workers: usize,
+    ) {
         self.speed
             .update(state.downloaded.abs_diff(self.prev_downloaded) as usize);
 
@@ -125,6 +134,7 @@ impl ProgressTracker {
         self.connected_peers = state.connected_peers;
         self.all_peers = state.peers;
         self.pieces_verified = pieces_verified;
+        self.thread_workers = thread_workers;
         if let Some(process) = system.process(self.pid) {
             self.cpu_usage = process.cpu_usage();
             self.mem_usage_kb = process.memory();
@@ -172,9 +182,10 @@ impl ProgressTracker {
         println!("{}", self.format_bar(self.prev_downloaded));
         if self.show_consumption {
             println!(
-                "CPU: {:.1}% | Memory: {}",
+                "CPU: {:.1}% | Memory: {} | Threads: {}",
                 self.cpu_usage,
-                self.human_bytes(self.mem_usage_kb)
+                self.human_bytes(self.mem_usage_kb),
+                self.thread_workers
             );
         }
     }
@@ -184,9 +195,10 @@ impl ProgressTracker {
         state: &TorrentState,
         pieces_verified: usize,
         system: &System,
+        thread_workers: usize,
         first_draw: bool,
     ) {
-        self.update(state, pieces_verified, system);
+        self.update(state, pieces_verified, system, thread_workers);
         self.display(first_draw);
     }
 }
@@ -295,18 +307,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.total_pieces(),
         pid,
         show_consumption,
+        client.get_thread_worker_count(),
     );
     while !client.is_complete() {
         system.refresh_all();
         let state = client.get_state();
-        progress_tracker.update_and_display(&state, client.pieces_verified(), &system, first_draw);
+        progress_tracker.update_and_display(
+            &state,
+            client.pieces_verified(),
+            &system,
+            client.get_thread_worker_count(),
+            first_draw,
+        );
         first_draw = false;
         std::thread::sleep(Duration::from_secs(1));
     }
     client.stop();
     system.refresh_all();
     let state = client.get_state();
-    progress_tracker.update_and_display(&state, client.pieces_verified(), &system, first_draw);
+    progress_tracker.update_and_display(
+        &state,
+        client.pieces_verified(),
+        &system,
+        client.get_thread_worker_count(),
+        first_draw,
+    );
     println!("\nDownload complete!");
     Ok(())
 }

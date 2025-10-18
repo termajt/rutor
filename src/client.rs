@@ -352,6 +352,10 @@ impl TorrentClient {
         self.shutdown_condvar.notify_all();
     }
 
+    pub fn get_thread_worker_count(&self) -> usize {
+        self.tpool.worker_count()
+    }
+
     pub fn get_state(&self) -> TorrentState {
         self.state.read().unwrap().clone()
     }

@@ -539,8 +539,9 @@ impl PeerManager {
 
     fn add_peers(&self, new_peers: &[SocketAddr]) {
         let mut peers = self.peers.write().unwrap();
+        let connected = self.connected.read().unwrap();
         for addr in new_peers {
-            if peers.contains_key(addr) {
+            if peers.contains_key(addr) || connected.contains_key(addr) {
                 continue;
             }
             peers.insert(*addr, PeerInfo::new(*addr));
@@ -572,6 +573,9 @@ impl PeerManager {
 
     /// Marks a peer as successfully connected and initializes a `PeerConnection`.
     fn mark_connected(&self, addr: &SocketAddr, peer_id: &[u8], total_pieces: usize) {
+        let mut pending_connections = self.pending_connections.lock().unwrap();
+        *pending_connections = pending_connections.saturating_sub(1);
+        drop(pending_connections);
         let mut peers = self.peers.write().unwrap();
         if let Some(p) = peers.get_mut(&addr) {
             p.status = PeerStatus::Connected;
@@ -593,6 +597,9 @@ impl PeerManager {
 
     /// Marks a peer as having failed to connect, possibly removing it if it failed repeatedly.
     fn mark_failed(&self, addr: &SocketAddr) {
+        let mut pending_connections = self.pending_connections.lock().unwrap();
+        *pending_connections = pending_connections.saturating_sub(1);
+        drop(pending_connections);
         let mut peers = self.peers.write().unwrap();
         if let Some(p) = peers.get_mut(&addr) {
             p.status = PeerStatus::Failed;
@@ -650,6 +657,7 @@ impl PeerManager {
     }
 
     fn attempt_connect_peers(&self, info_hash: [u8; 20], peer_id: [u8; 20]) {
+        let to_connect: usize;
         {
             let connected = self.connected.read().unwrap();
             let pending_connections = self.pending_connections.lock().unwrap();
@@ -657,32 +665,39 @@ impl PeerManager {
             if connected.len() >= max_connections || *pending_connections >= max_connections {
                 return;
             }
+            to_connect = max_connections.saturating_sub(connected.len() + *pending_connections);
         }
-        while let Some(p) = self.next_peer_to_connect() {
-            {
-                let connected = self.connected.read().unwrap();
-                if connected.contains_key(&p.addr) {
-                    continue;
-                }
-                let mut pending_connections = self.pending_connections.lock().unwrap();
-                let max_connections = *self.max_connections;
-                if connected.len() >= max_connections || *pending_connections >= max_connections {
-                    return;
-                }
-                *pending_connections += 1;
+        if to_connect == 0 {
+            return;
+        }
+        let mut c = Vec::new();
+        for _ in 0..to_connect {
+            if let Some(p) = self.next_peer_to_connect() {
+                c.push(p);
+            } else {
+                break;
             }
-            let addr = p.addr;
-            let pending_conneections = self.pending_connections.clone();
+        }
+        if c.is_empty() {
+            return;
+        }
+        for p in c {
+            let connected = self.connected.clone();
             let socket_tx = self.socket_tx.clone();
             let peer_event_tx = self.peer_event_tx.clone();
             self.tpool.execute(move || {
-                match connect_peer(addr, &info_hash, &peer_id) {
+                let connected = connected.read().unwrap();
+                if connected.contains_key(&p.addr) {
+                    return;
+                }
+                drop(connected);
+                match connect_peer(p.addr, &info_hash, &peer_id) {
                     Ok((peer_id, socket)) => {
-                        let _ = socket_tx.send(Command::Add((socket, addr, 512)));
+                        let _ = socket_tx.send(Command::Add((socket, p.addr, None)));
                         let _ = peer_event_tx.publish(
                             consts::TOPIC_PEER_EVENT,
                             PeerEvent::PeerConnected {
-                                addr: addr,
+                                addr: p.addr,
                                 peer_id: peer_id,
                             },
                         );
@@ -690,13 +705,9 @@ impl PeerManager {
                     Err(_) => {
                         let _ = peer_event_tx.publish(
                             consts::TOPIC_PEER_EVENT,
-                            PeerEvent::ConnectFailure { addr: addr },
+                            PeerEvent::ConnectFailure { addr: p.addr },
                         );
                     }
-                }
-                {
-                    let mut pending_connections = pending_conneections.lock().unwrap();
-                    *pending_connections = pending_connections.saturating_sub(1);
                 }
             });
         }

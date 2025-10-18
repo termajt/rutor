@@ -23,7 +23,7 @@ pub enum Command {
     // Close the client with the given socket.
     CloseSocket((Socket, SocketAddr)),
     // Add socket.
-    Add((Socket, SocketAddr, usize)),
+    Add((Socket, SocketAddr, Option<usize>)),
 }
 
 /// Represents a socket managed by the `SocketManager`.
@@ -48,11 +48,11 @@ impl Socket {
 struct Connection {
     socket: Socket,
     send_queue: VecDeque<Vec<u8>>,
-    max_send_queue_size: usize,
+    max_send_queue_size: Option<usize>,
 }
 
 impl Connection {
-    fn new(socket: Socket, max_send_queue_size: usize) -> Self {
+    fn new(socket: Socket, max_send_queue_size: Option<usize>) -> Self {
         Connection {
             socket: socket,
             send_queue: VecDeque::new(),
@@ -96,7 +96,7 @@ impl SocketManager {
         &mut self,
         addr: SocketAddr,
         socket: Socket,
-        max_send_queue_size: usize,
+        max_send_queue_size: Option<usize>,
     ) -> io::Result<()> {
         let fd = socket.get_raw_fd();
         let mut ev = epoll_event {
@@ -130,11 +130,13 @@ impl SocketManager {
 
     fn queue_message(&mut self, addr: SocketAddr, data: Vec<u8>, is_critical: bool) {
         if let Some(conn) = self.conns.get_mut(&addr) {
-            if conn.send_queue.len() >= conn.max_send_queue_size {
-                if is_critical {
-                    return;
+            if let Some(max_queue_size) = conn.max_send_queue_size {
+                if conn.send_queue.len() >= max_queue_size {
+                    if is_critical {
+                        return;
+                    }
+                    conn.send_queue.pop_front();
                 }
-                conn.send_queue.pop_front();
             }
             conn.send_queue.push_back(data);
             let fd = conn.socket.get_raw_fd();
@@ -254,7 +256,7 @@ impl SocketManager {
         loop {
             match listener.accept() {
                 Ok((stream, addr)) => {
-                    if let Err(e) = self.add_socket(addr, Socket::Client((stream, addr)), 40) {
+                    if let Err(e) = self.add_socket(addr, Socket::Client((stream, addr)), None) {
                         eprintln!("Failed to add client connection: {e}");
                     }
                 }
