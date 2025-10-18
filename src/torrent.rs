@@ -1,10 +1,11 @@
 use sha1::{Digest, Sha1};
 use std::{
+    collections::HashMap,
     fmt,
     fs::{File, OpenOptions},
     io::{BufReader, Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::RwLock,
+    sync::{Mutex, RwLock},
 };
 
 use crate::{
@@ -52,6 +53,33 @@ impl std::error::Error for Error {
 }
 
 #[derive(Debug)]
+struct FileHandleCache {
+    handles: Mutex<HashMap<PathBuf, File>>,
+}
+
+impl FileHandleCache {
+    fn new() -> Self {
+        Self {
+            handles: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn with_file<F, T>(&self, path: &PathBuf, f: F) -> Result<T, Box<dyn std::error::Error>>
+    where
+        F: FnOnce(&mut File) -> Result<T, Box<dyn std::error::Error>>,
+    {
+        let mut handles = self.handles.lock().unwrap();
+        if !handles.contains_key(path) {
+            let file = OpenOptions::new().write(true).create(true).open(path)?;
+            handles.insert(path.to_path_buf(), file);
+        }
+
+        let file = handles.get_mut(path).unwrap();
+        f(file)
+    }
+}
+
+#[derive(Debug)]
 pub struct FileSlice {
     pub file_index: usize,
     pub offset_in_file: u64,
@@ -73,6 +101,7 @@ pub struct TorrentInfo {
     files: Vec<TorrentFile>,
     bitfield: RwLock<Bitfield>,
     destination: Option<PathBuf>,
+    file_handle_cache: FileHandleCache,
 }
 
 impl TorrentInfo {
@@ -157,6 +186,7 @@ impl TorrentInfo {
             files: files,
             bitfield: RwLock::new(Bitfield::new(total_pieces)),
             destination: destination,
+            file_handle_cache: FileHandleCache::new(),
         })
     }
 
@@ -215,8 +245,6 @@ impl TorrentInfo {
                 std::fs::create_dir_all(parent)?;
             }
 
-            let mut f = OpenOptions::new().write(true).create(true).open(path)?;
-
             let slice_start_offset = if offset as u64 > slice.offset_in_file {
                 offset as u64 - slice.offset_in_file
             } else {
@@ -232,8 +260,11 @@ impl TorrentInfo {
                 continue;
             }
 
-            f.seek(SeekFrom::Start(slice.offset_in_file + slice_start_offset))?;
-            f.write_all(&data[data_offset..data_offset + write_len as usize])?;
+            self.file_handle_cache.with_file(&path, |f| {
+                f.seek(SeekFrom::Start(slice.offset_in_file + slice_start_offset))?;
+                f.write_all(&data[data_offset..data_offset + write_len as usize])?;
+                Ok(())
+            })?;
             data_offset += write_len as usize;
             if data_offset >= data.len() {
                 break;
@@ -250,7 +281,7 @@ impl TorrentInfo {
 
     pub fn set_bitfield_index(&self, index: usize) {
         let mut bitfield = self.bitfield.write().unwrap();
-        bitfield.set(index, true);
+        bitfield.set(&index, true);
     }
 
     pub fn bitfield(&self) -> Bitfield {

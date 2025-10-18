@@ -56,8 +56,8 @@ impl Bitfield {
     /// # Panics
     ///
     /// Panics if `index >= length`.
-    pub fn set(&mut self, index: usize, value: bool) {
-        assert!(index < self.length, "index out of range");
+    pub fn set(&mut self, index: &usize, value: bool) {
+        assert!(*index < self.length, "index out of range");
         let byte_index = index / 8;
         let bit_index = 7 - (index % 8);
         if value {
@@ -76,11 +76,24 @@ impl Bitfield {
     /// # Panics
     ///
     /// Panics if `index >= length`.
-    pub fn get(&self, index: usize) -> bool {
-        assert!(index < self.length, "index out of range");
+    pub fn get(&self, index: &usize) -> bool {
+        assert!(*index < self.length, "index out of range");
         let byte_index = index / 8;
         let bit_index = 7 - (index % 8);
         (self.bits[byte_index] & (1 << bit_index)) != 0
+    }
+
+    pub fn get_ones(&self) -> Vec<usize> {
+        let mut result = Vec::new();
+        for index in 0..self.length {
+            let byte_index = index / 8;
+            let bit_index = 7 - (index % 8);
+
+            if (self.bits[byte_index] & (1 << bit_index)) != 0 {
+                result.push(index);
+            }
+        }
+        result
     }
 
     /// Returns the underlying bytes of the bitfield.

@@ -35,6 +35,7 @@ Usage: rutor [OPTIONS...] <torrent-file>
 
 OPTIONS:
   -d/--destination    destination folder of where the torrent should be downloaded to
+  -c/--consumption    shows cpu and memory consumption used by the client
   -h/--help           shows this help message and exits
 ```
 

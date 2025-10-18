@@ -11,6 +11,7 @@ use rand::{Rng, distr::Alphanumeric};
 use crate::{
     announce::{self, AnnounceManager},
     consts::{self, ClientEvent, PeerEvent, PieceEvent},
+    event::ManualResetEvent,
     peer::PeerManager,
     piece::PieceManager,
     pool::ThreadPool,
@@ -83,6 +84,7 @@ pub struct TorrentClient {
     peer_event: Arc<PubSub<PeerEvent>>,
     socket_rx: Arc<Receiver<Command>>,
     piece_event: Arc<PubSub<PieceEvent>>,
+    shutdown_ev: Arc<ManualResetEvent>,
 }
 
 impl TorrentClient {
@@ -132,6 +134,7 @@ impl TorrentClient {
             peer_event: peer_event,
             socket_rx: socket_rx,
             piece_event: piece_event,
+            shutdown_ev: Arc::new(ManualResetEvent::new(false)),
         })
     }
 
@@ -303,12 +306,24 @@ impl TorrentClient {
     }
 
     fn start_piece_manager(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let piece_manager = self.piece_manager.clone();
         let rx = self.piece_event.subscribe(consts::TOPIC_PIECE_EVENT)?;
+        let piece_manager = self.piece_manager.clone();
         self.tpool.execute(move || {
             while let Ok(ev) = rx.recv() {
                 let mut piece_manager = piece_manager.write().unwrap();
                 piece_manager.handle_event(ev);
+            }
+        });
+        let piece_manager = self.piece_manager.clone();
+        let shutdown_ev = self.shutdown_ev.clone();
+        self.tpool.execute(move || {
+            loop {
+                let piece_manager = piece_manager.read().unwrap();
+                piece_manager.run_piece_selection_once();
+                drop(piece_manager);
+                if shutdown_ev.wait_timeout(Duration::from_millis(250)) {
+                    break;
+                }
             }
         });
         Ok(())
@@ -326,6 +341,7 @@ impl TorrentClient {
     /// Sets the shutdown flag and signals any condition variables
     /// waiting for completion.
     pub fn stop(&self) {
+        self.shutdown_ev.set();
         self.shutdown.store(true, Ordering::Relaxed);
         self.peer_event.close();
         self.piece_event.close();

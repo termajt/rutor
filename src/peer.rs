@@ -313,7 +313,7 @@ pub struct PeerConnection {
     peer_id: [u8; 20],
     buffer: Vec<u8>,
     pub bitfield: Bitfield,
-    choked: bool,
+    pub choked: bool,
     interested: bool,
     am_interested: bool,
     speed: ByteSpeed,
@@ -350,7 +350,7 @@ impl PeerConnection {
                 self.interested = false;
             }
             PeerMessage::Have(index) => {
-                self.bitfield.set(*index as usize, true);
+                self.bitfield.set(&(*index as usize), true);
             }
             PeerMessage::Bitfield(new_bitfield) => {
                 self.bitfield.merge(new_bitfield);
@@ -484,7 +484,10 @@ impl PeerManager {
                         self.update_interest(pc);
                         let _ = self.piece_event_tx.publish(
                             consts::TOPIC_PIECE_EVENT,
-                            PieceEvent::PieceAvailabilityChange,
+                            PieceEvent::PieceAvailabilityChange {
+                                peer: pc.addr,
+                                bitfield: pc.bitfield.clone(),
+                            },
                         );
                     }
                     PeerMessage::Choke | PeerMessage::Unchoke => {
@@ -500,6 +503,7 @@ impl PeerManager {
                         let _ = self.piece_event_tx.publish(
                             consts::TOPIC_PIECE_EVENT,
                             PieceEvent::BlockData {
+                                peer: pc.addr,
                                 piece_index: index,
                                 begin: begin,
                                 data: data,
@@ -593,7 +597,7 @@ impl PeerManager {
         if let Some(p) = peers.get_mut(&addr) {
             p.status = PeerStatus::Failed;
             p.failures += 1;
-            if p.failures >= 3 {
+            if p.failures >= 1 {
                 peers.remove(&addr);
             }
         }
@@ -614,6 +618,10 @@ impl PeerManager {
         let mut connected = self.connected.write().unwrap();
         connected.remove(addr);
         drop(connected);
+        let _ = self.piece_event_tx.publish(
+            consts::TOPIC_PIECE_EVENT,
+            PieceEvent::PeerDisconnected { peer: *addr },
+        );
         self.send_peers_changed();
     }
 
@@ -699,7 +707,7 @@ impl PeerManager {
         connected
             .iter()
             .filter_map(|(addr, pc)| {
-                if pc.bitfield.get(index) {
+                if pc.bitfield.get(&index) {
                     Some(*addr)
                 } else {
                     None

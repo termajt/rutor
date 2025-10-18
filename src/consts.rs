@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use crate::peer::PeerMessage;
+use crate::{bitfield::Bitfield, peer::PeerMessage};
 
 pub const TOPIC_CLIENT_EVENT: &str = &"client_event";
 pub const TOPIC_PIECE_EVENT: &str = &"piece_event";
@@ -9,14 +9,21 @@ pub const TOPIC_PEER_EVENT: &str = &"peer_event";
 #[derive(Debug)]
 pub enum PieceEvent {
     BlockData {
+        peer: SocketAddr,
         piece_index: u32,
         begin: u32,
         data: Vec<u8>,
     },
-    PieceAvailabilityChange,
+    PieceAvailabilityChange {
+        peer: SocketAddr,
+        bitfield: Bitfield,
+    },
     PeerChokeChanged {
         addr: SocketAddr,
         choked: bool,
+    },
+    PeerDisconnected {
+        peer: SocketAddr,
     },
 }
 

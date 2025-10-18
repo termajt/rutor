@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use sysinfo::{Pid, System};
 
 struct ProgressTracker {
     name: String,
@@ -17,10 +18,20 @@ struct ProgressTracker {
     pieces_verified: usize,
     total_pieces: usize,
     speed: ByteSpeed,
+    cpu_usage: f32,
+    mem_usage_kb: u64,
+    pid: Pid,
+    show_consumption: bool,
 }
 
 impl ProgressTracker {
-    fn new(name: &str, total_size: u64, total_pieces: usize) -> Self {
+    fn new(
+        name: &str,
+        total_size: u64,
+        total_pieces: usize,
+        pid: Pid,
+        show_consumption: bool,
+    ) -> Self {
         Self {
             name: name.to_string(),
             total_size: total_size,
@@ -31,6 +42,10 @@ impl ProgressTracker {
             pieces_verified: 0,
             total_pieces: total_pieces,
             speed: ByteSpeed::new(Duration::from_secs(7), Duration::from_secs(1)),
+            cpu_usage: 0.0,
+            mem_usage_kb: 0,
+            pid: pid,
+            show_consumption: show_consumption,
         }
     }
 
@@ -96,7 +111,7 @@ impl ProgressTracker {
         format!("{:02}:{:02}:{:02}", hours, minutes, secs)
     }
 
-    fn update(&mut self, state: &TorrentState, pieces_verified: usize) {
+    fn update(&mut self, state: &TorrentState, pieces_verified: usize, system: &System) {
         self.speed
             .update(state.downloaded.abs_diff(self.prev_downloaded) as usize);
 
@@ -110,11 +125,16 @@ impl ProgressTracker {
         self.connected_peers = state.connected_peers;
         self.all_peers = state.peers;
         self.pieces_verified = pieces_verified;
+        if let Some(process) = system.process(self.pid) {
+            self.cpu_usage = process.cpu_usage();
+            self.mem_usage_kb = process.memory();
+        }
     }
 
     fn display(&self, first_draw: bool) {
         if !first_draw {
-            for _ in 0..5 {
+            let max = if self.show_consumption { 6 } else { 5 };
+            for _ in 0..max {
                 print!("\r\x1B[1A\x1b[2K");
             }
         }
@@ -150,15 +170,23 @@ impl ProgressTracker {
             white, reset, self.pieces_verified, self.total_pieces
         );
         println!("{}", self.format_bar(self.prev_downloaded));
+        if self.show_consumption {
+            println!(
+                "CPU: {:.1}% | Memory: {}",
+                self.cpu_usage,
+                self.human_bytes(self.mem_usage_kb)
+            );
+        }
     }
 
     fn update_and_display(
         &mut self,
         state: &TorrentState,
         pieces_verified: usize,
+        system: &System,
         first_draw: bool,
     ) {
-        self.update(state, pieces_verified);
+        self.update(state, pieces_verified, system);
         self.display(first_draw);
     }
 }
@@ -193,6 +221,7 @@ fn print_usage<W: Write>(writer: &mut W, prog: &str) {
     usage.push_str(
         "  -d/--destination    destination folder of where the torrent should be downloaded to\n",
     );
+    usage.push_str("  -c/--consumption    shows cpu and memory consumption used by the client\n");
     usage.push_str("  -h/--help           shows this help message and exits");
 
     let _ = writeln!(writer, "{}", usage);
@@ -208,6 +237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut filename = String::new();
     let mut destination: Option<PathBuf> = None;
+    let mut show_consumption = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -223,6 +253,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut stdout = std::io::stdout();
                 print_usage(&mut stdout, &program);
                 std::process::exit(0);
+            }
+            "-c" | "--consumption" => {
+                show_consumption = true;
             }
             arg if filename.is_empty() => {
                 filename = arg.to_string();
@@ -244,6 +277,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    let pid = sysinfo::get_current_pid()?;
+    let mut system = System::new_all();
+
     let torrent: torrent::Torrent = {
         let file = File::open(filename)?;
         torrent::Torrent::from_file(&file, destination)?
@@ -253,16 +289,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = TorrentClient::new(torrent)?;
     client.start()?;
     let mut first_draw = true;
-    let mut progress_tracker = ProgressTracker::new(&name, total_size, client.total_pieces());
+    let mut progress_tracker = ProgressTracker::new(
+        &name,
+        total_size,
+        client.total_pieces(),
+        pid,
+        show_consumption,
+    );
     while !client.is_complete() {
+        system.refresh_all();
         let state = client.get_state();
-        progress_tracker.update_and_display(&state, client.pieces_verified(), first_draw);
+        progress_tracker.update_and_display(&state, client.pieces_verified(), &system, first_draw);
         first_draw = false;
         std::thread::sleep(Duration::from_secs(1));
     }
     client.stop();
+    system.refresh_all();
     let state = client.get_state();
-    progress_tracker.update_and_display(&state, client.pieces_verified(), first_draw);
+    progress_tracker.update_and_display(&state, client.pieces_verified(), &system, first_draw);
     println!("\nDownload complete!");
     Ok(())
 }

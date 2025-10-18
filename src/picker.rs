@@ -301,45 +301,12 @@ impl PiecePicker {
                         .map(|s| s.expected_timeout(self.config.block_size))
                         .unwrap_or(Duration::from_secs(10));
                     if now.duration_since(start_time) >= expected_timeout {
-                        timed_out.push((piece_index, block_index, expected_timeout));
+                        timed_out.push((piece_index, block_index));
                         break;
                     }
                 }
             }
         }
-
-        for (piece_index, block_index, expected_timeout) in timed_out {
-            println!(
-                "clearing timed out piece {} block {} which had expected timeout: {:?}!",
-                piece_index, block_index, expected_timeout
-            );
-            self.request_timeouts.remove(&(piece_index, block_index));
-            if let Some(peers) = self.duplicates.remove(&(piece_index, block_index)) {
-                for peer in peers {
-                    if let Some(cnt) = self.outstanding_requests_per_peer.get_mut(&peer) {
-                        *cnt = cnt.saturating_sub(1);
-                        if *cnt == 0 {
-                            self.outstanding_requests_per_peer.remove(&peer);
-                        }
-                    }
-                }
-            }
-
-            if let Some(piece) = self.pieces.get_mut(piece_index) {
-                if !matches!(piece.blocks[block_index], BlockState::Have) {
-                    piece.blocks[block_index] = BlockState::Missing;
-                }
-            }
-        }
-        /*
-        let timeout = self.request_timeout;
-
-        let timed_out: Vec<_> = self
-            .request_timeouts
-            .iter()
-            .filter(|(_, t)| now.duration_since(**t) >= timeout)
-            .map(|(key, _)| *key)
-            .collect();
 
         for (piece_index, block_index) in timed_out {
             self.request_timeouts.remove(&(piece_index, block_index));
@@ -360,7 +327,6 @@ impl PiecePicker {
                 }
             }
         }
-        */
     }
 
     pub fn peer_disconnected(&mut self, peer: &PeerId) {
