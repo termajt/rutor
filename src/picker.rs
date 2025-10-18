@@ -75,6 +75,11 @@ struct Piece {
     length: usize,
     blocks: Vec<BlockState>,
     expected_hash: [u8; 20],
+    received_bytes: usize,
+    received_blocks: HashMap<usize, Vec<u8>>,
+    hasher: Sha1,
+    next_hash_index: usize,
+    verified: bool,
 }
 
 impl Piece {
@@ -85,10 +90,18 @@ impl Piece {
             length: length,
             blocks: vec![BlockState::Missing; num_blocks],
             expected_hash: expected_hash,
+            received_bytes: 0,
+            received_blocks: HashMap::new(),
+            hasher: Sha1::new(),
+            next_hash_index: 0,
+            verified: false,
         }
     }
 
     fn is_complete(&self) -> bool {
+        if self.verified {
+            return true;
+        }
         for b in self.blocks.iter() {
             if !matches!(b, BlockState::Have) {
                 return false;
@@ -103,18 +116,57 @@ impl Piece {
             .filter(|b| !matches!(b, BlockState::Have))
             .count()
     }
+
+    fn add_block(&mut self, block_index: usize, data: &[u8]) -> bool {
+        if matches!(self.blocks[block_index], BlockState::Have) {
+            return false;
+        }
+        self.blocks[block_index] = BlockState::Have;
+        self.received_bytes += data.len();
+        self.received_blocks.insert(block_index, data.to_vec());
+        self.hash_contiguous_blocks();
+        true
+    }
+
+    fn hash_contiguous_blocks(&mut self) {
+        while let Some(data) = self.received_blocks.remove(&self.next_hash_index) {
+            self.hasher.update(&data);
+            self.next_hash_index += 1;
+        }
+    }
+
+    fn verify_and_reset(&mut self) -> bool {
+        self.hash_contiguous_blocks();
+        if self.next_hash_index != self.blocks.len() {
+            return false;
+        }
+        let hasher = std::mem::take(&mut self.hasher);
+        let result = hasher.finalize();
+        let ok = result[..] == self.expected_hash;
+
+        self.received_blocks.clear();
+        self.hasher = Sha1::new();
+        self.received_bytes = 0;
+        self.next_hash_index = 0;
+        self.verified = ok;
+        if !ok {
+            for b in self.blocks.iter_mut() {
+                *b = BlockState::Missing;
+            }
+        }
+        ok
+    }
 }
 
 #[derive(Debug)]
 pub struct PiecePicker {
-    pieces: Vec<Piece>,
+    pieces: HashMap<usize, Piece>,
     piece_count: usize,
     config: PickerConfig,
     peer_has: HashMap<PeerId, Bitfield>,
     availability: Vec<usize>,
     outstanding_requests_per_peer: HashMap<PeerId, usize>,
     duplicates: HashMap<(usize, usize), HashSet<PeerId>>,
-    piece_data: HashMap<usize, Vec<u8>>,
     rarity_order: Vec<usize>,
     rarity_dirty: bool,
     peer_stats: HashMap<PeerId, PeerStats>,
@@ -129,7 +181,7 @@ impl PiecePicker {
         torrent: Arc<Torrent>,
     ) -> Self {
         let piece_count = ((total_size + piece_length as u64 - 1) / piece_length as u64) as usize;
-        let mut pieces = Vec::with_capacity(piece_count);
+        let mut pieces = HashMap::with_capacity(piece_count);
         for i in 0..piece_count {
             let offset = (i as u64) * (piece_length as u64);
             let remaining = if offset + piece_length as u64 > total_size {
@@ -137,12 +189,15 @@ impl PiecePicker {
             } else {
                 piece_length
             };
-            pieces.push(Piece::new(
+            pieces.insert(
                 i,
-                remaining,
-                config.block_size,
-                torrent.info.piece_hashes[i],
-            ));
+                Piece::new(
+                    i,
+                    remaining,
+                    config.block_size,
+                    torrent.info.piece_hashes[i],
+                ),
+            );
         }
         Self {
             pieces: pieces,
@@ -152,7 +207,6 @@ impl PiecePicker {
             availability: vec![0; piece_count],
             outstanding_requests_per_peer: HashMap::new(),
             duplicates: HashMap::new(),
-            piece_data: HashMap::new(),
             rarity_order: Vec::new(),
             rarity_dirty: true,
             peer_stats: HashMap::new(),
@@ -180,7 +234,7 @@ impl PiecePicker {
     }
 
     pub fn mark_block_requested(&mut self, piece_index: usize, block_index: usize, peer: &PeerId) {
-        if let Some(p) = self.pieces.get_mut(piece_index) {
+        if let Some(p) = self.pieces.get_mut(&piece_index) {
             p.blocks[block_index] = BlockState::Requested;
             self.request_timeouts
                 .insert((piece_index, block_index), Instant::now());
@@ -203,68 +257,55 @@ impl PiecePicker {
         data: &[u8],
     ) -> (Vec<PeerId>, bool) {
         let mut cancel_peers = Vec::new();
-        let block_index = offset / self.config.block_size;
-        let p = &mut self.pieces[piece_index];
         let mut received = false;
-        if !matches!(p.blocks[block_index], BlockState::Have) {
-            p.blocks[block_index] = BlockState::Have;
-            let buf = self
-                .piece_data
-                .entry(piece_index)
-                .or_insert_with(|| vec![0; p.length]);
-            buf[offset..offset + data.len()].copy_from_slice(data);
-            if let Some(start_time) = self.request_timeouts.remove(&(piece_index, block_index)) {
-                let elapsed = start_time.elapsed();
-                self.peer_stats
-                    .entry(*received_from)
-                    .or_insert_with(PeerStats::new)
-                    .update(data.len(), elapsed);
-            }
-            received = true;
-        }
-        if let Some(peers) = self.duplicates.remove(&(piece_index, block_index)) {
-            for peer in peers {
-                if &peer != received_from {
-                    cancel_peers.push(peer);
+        if let Some(p) = self.pieces.get_mut(&piece_index) {
+            let block_index = offset / self.config.block_size;
+            received = p.add_block(block_index, data);
+            if received {
+                if let Some(start_time) = self.request_timeouts.remove(&(piece_index, block_index))
+                {
+                    let elapsed = start_time.elapsed();
+                    self.peer_stats
+                        .entry(*received_from)
+                        .or_insert_with(PeerStats::new)
+                        .update(data.len(), elapsed);
                 }
             }
-        }
-        if let Some(cnt) = self.outstanding_requests_per_peer.get_mut(received_from) {
-            *cnt = cnt.saturating_sub(1);
-            if *cnt == 0 {
-                self.outstanding_requests_per_peer.remove(received_from);
+            if let Some(peers) = self.duplicates.remove(&(piece_index, block_index)) {
+                for peer in peers {
+                    if &peer != received_from {
+                        cancel_peers.push(peer);
+                    }
+                }
             }
+            if let Some(cnt) = self.outstanding_requests_per_peer.get_mut(received_from) {
+                *cnt = cnt.saturating_sub(1);
+                if *cnt == 0 {
+                    self.outstanding_requests_per_peer.remove(received_from);
+                }
+            }
+            self.request_timeouts.remove(&(piece_index, block_index));
         }
-        self.request_timeouts.remove(&(piece_index, block_index));
         (cancel_peers, received)
     }
 
     pub fn verify_piece(&mut self, piece_index: usize) -> Result<bool, Box<dyn std::error::Error>> {
-        let Some(p) = self.pieces.get_mut(piece_index) else {
-            return Err(format!("no piece for index: {}", piece_index).into());
+        let Some(p) = self.pieces.get_mut(&piece_index) else {
+            return Err(format!("no piece {}, already verified", piece_index).into());
         };
         if !p.is_complete() {
             return Err(format!("piece {} is not complete yet", piece_index).into());
         }
-        let Some(buf) = self.piece_data.remove(&piece_index) else {
-            return Err(format!("no buffer for piece: {}", piece_index).into());
-        };
-        let mut hasher = Sha1::new();
-        hasher.update(buf);
-        let result = hasher.finalize();
-        self.rarity_dirty = true;
-        if result[..] == p.expected_hash {
-            return Ok(true);
-        } else {
-            for i in 0..p.blocks.len() {
-                p.blocks[i] = BlockState::Missing;
-            }
+        let valid = p.verify_and_reset();
+        if valid {
+            self.pieces.remove(&piece_index);
         }
-        Ok(false)
+        self.rarity_dirty = true;
+        Ok(valid)
     }
 
     pub fn total_remaining_blocks(&self) -> usize {
-        self.pieces.iter().map(|p| p.remaining_blocks()).sum()
+        self.pieces.values().map(|p| p.remaining_blocks()).sum()
     }
 
     fn total_outstanding_requests(&self) -> usize {
@@ -276,7 +317,7 @@ impl PiecePicker {
             return;
         }
         let mut items: Vec<(usize, usize)> = Vec::with_capacity(self.piece_count);
-        for p in &self.pieces {
+        for (_, p) in &self.pieces {
             if p.is_complete() {
                 continue;
             }
@@ -321,7 +362,7 @@ impl PiecePicker {
                 }
             }
 
-            if let Some(piece) = self.pieces.get_mut(piece_index) {
+            if let Some(piece) = self.pieces.get_mut(&piece_index) {
                 if !matches!(piece.blocks[block_index], BlockState::Have) {
                     piece.blocks[block_index] = BlockState::Missing;
                 }
@@ -337,12 +378,22 @@ impl PiecePicker {
         self.peer_stats.remove(peer);
     }
 
+    fn calculate_endgame_threshold(&self, connected_peers: usize) -> usize {
+        let min_pieces = 4;
+        let peer_factor = (connected_peers * 2).max(min_pieces);
+        let dynamic = (self.piece_count as f32 * 0.05) as usize;
+        peer_factor.max(dynamic).min(64)
+    }
+
     pub fn pick_requests_for_peers(
         &mut self,
         peers: &[PeerId],
         max_outstanding_requests: usize,
     ) -> HashMap<PeerId, Vec<(u32, u32, u32)>> {
         let mut results: HashMap<SocketAddr, Vec<(u32, u32, u32)>> = HashMap::new();
+        if peers.is_empty() {
+            return results;
+        }
         let mut sorted_peers = peers.to_vec();
         sorted_peers
             .sort_by_key(|peer| *self.outstanding_requests_per_peer.get(peer).unwrap_or(&0));
@@ -358,9 +409,10 @@ impl PiecePicker {
         }
 
         let remaining = self.total_remaining_blocks();
-        let max_dups = if remaining <= 8 {
+        let endgame_threshold = self.calculate_endgame_threshold(peers.len());
+        let max_dups = if remaining <= endgame_threshold {
             4
-        } else if remaining <= 32 {
+        } else if remaining <= endgame_threshold * 4 {
             2
         } else {
             1
@@ -392,11 +444,13 @@ impl PiecePicker {
             let mut to_mark = Vec::new();
 
             'outer: for &pidx in &self.rarity_order {
-                if !peer_has.get(&pidx) || self.pieces[pidx].is_complete() {
+                let Some(piece) = self.pieces.get_mut(&pidx) else {
+                    continue;
+                };
+                if !peer_has.get(&pidx) || piece.is_complete() {
                     continue;
                 }
 
-                let piece = &mut self.pieces[pidx];
                 for b_idx in 0..piece.blocks.len() {
                     if picked.len() >= can_send {
                         break 'outer;

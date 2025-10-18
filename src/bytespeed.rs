@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ByteSpeed {
     last_update: Instant,
     pub avg: f64,

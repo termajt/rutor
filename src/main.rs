@@ -1,4 +1,3 @@
-use rutor::bytespeed::ByteSpeed;
 use rutor::client::{TorrentClient, TorrentState};
 use rutor::torrent;
 use std::env;
@@ -17,7 +16,7 @@ struct ProgressTracker {
     all_peers: usize,
     pieces_verified: usize,
     total_pieces: usize,
-    speed: ByteSpeed,
+    download_speed: f64,
     cpu_usage: f32,
     mem_usage_kb: u64,
     pid: Pid,
@@ -43,7 +42,7 @@ impl ProgressTracker {
             all_peers: 0,
             pieces_verified: 0,
             total_pieces: total_pieces,
-            speed: ByteSpeed::new(Duration::from_secs(7), Duration::from_secs(1)),
+            download_speed: 0.0,
             cpu_usage: 0.0,
             mem_usage_kb: 0,
             pid: pid,
@@ -121,12 +120,9 @@ impl ProgressTracker {
         system: &System,
         thread_workers: usize,
     ) {
-        self.speed
-            .update(state.downloaded.abs_diff(self.prev_downloaded) as usize);
-
         let remaining = self.total_size.saturating_sub(state.downloaded) as f64;
-        self.eta = if self.speed.avg > 0.0 {
-            remaining / self.speed.avg
+        self.eta = if state.download_speed.avg > 0.0 {
+            remaining / state.download_speed.avg
         } else {
             f64::INFINITY
         };
@@ -135,6 +131,7 @@ impl ProgressTracker {
         self.all_peers = state.peers;
         self.pieces_verified = pieces_verified;
         self.thread_workers = thread_workers;
+        self.download_speed = state.download_speed.avg;
         if let Some(process) = system.process(self.pid) {
             self.cpu_usage = process.cpu_usage();
             self.mem_usage_kb = process.memory();
@@ -165,7 +162,7 @@ impl ProgressTracker {
             self.human_bytes(self.prev_downloaded),
             self.human_bytes(self.total_size),
             yellow,
-            self.human_bytes(self.speed.avg as u64),
+            self.human_bytes(self.download_speed as u64),
             reset,
             magenta,
             self.format_eta(self.eta),

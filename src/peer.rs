@@ -10,7 +10,6 @@ use std::{
 
 use crate::{
     bitfield::Bitfield,
-    bytespeed::ByteSpeed,
     consts::{self, ClientEvent, PeerEvent, PieceEvent},
     pool::ThreadPool,
     pubsub::PubSub,
@@ -316,7 +315,6 @@ pub struct PeerConnection {
     pub choked: bool,
     interested: bool,
     am_interested: bool,
-    speed: ByteSpeed,
 }
 
 impl PeerConnection {
@@ -331,7 +329,6 @@ impl PeerConnection {
             choked: true,
             interested: false,
             am_interested: false,
-            speed: ByteSpeed::new(Duration::from_secs(4), Duration::from_millis(500)),
         }
     }
 
@@ -355,9 +352,6 @@ impl PeerConnection {
             PeerMessage::Bitfield(new_bitfield) => {
                 self.bitfield.merge(new_bitfield);
             }
-            PeerMessage::Piece((_, _, data)) => {
-                self.speed.update(data.len());
-            }
             _ => return,
         }
     }
@@ -379,10 +373,6 @@ impl PeerConnection {
 
     fn is_choked(&self) -> bool {
         self.choked
-    }
-
-    pub fn get_download_speed(&self) -> f64 {
-        self.speed.avg.max(1024.0)
     }
 }
 
@@ -444,24 +434,6 @@ impl PeerManager {
             max_connections: Arc::new(max_connections),
             pending_connections: Arc::new(Mutex::new(0)),
         })
-    }
-
-    pub fn get_download_speeds(&self) -> HashMap<SocketAddr, f64> {
-        let mut map = HashMap::new();
-        let connected = self.connected.read().unwrap();
-        for (addr, pconn) in connected.iter() {
-            map.insert(*addr, pconn.get_download_speed());
-        }
-        map
-    }
-
-    pub fn get_download_speed(&self, addr: &SocketAddr) -> Option<f64> {
-        let connected = self.connected.read().unwrap();
-        if let Some(pconn) = connected.get(addr) {
-            Some(pconn.get_download_speed())
-        } else {
-            None
-        }
     }
 
     fn data_received(&self, addr: &SocketAddr, data: &[u8]) {

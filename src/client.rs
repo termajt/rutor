@@ -10,6 +10,7 @@ use rand::{Rng, distr::Alphanumeric};
 
 use crate::{
     announce::{self, AnnounceManager},
+    bytespeed::ByteSpeed,
     consts::{self, ClientEvent, PeerEvent, PieceEvent},
     event::ManualResetEvent,
     peer::PeerManager,
@@ -45,6 +46,9 @@ pub struct TorrentState {
 
     /// Total number of connected peers.
     pub connected_peers: usize,
+
+    /// The download byte speed.
+    pub download_speed: ByteSpeed,
 }
 
 impl TorrentState {
@@ -59,6 +63,7 @@ impl TorrentState {
             started_at: None,
             peers: 0,
             connected_peers: 0,
+            download_speed: ByteSpeed::new(Duration::from_secs(20), Duration::from_secs(1)),
         }
     }
 }
@@ -184,6 +189,21 @@ impl TorrentClient {
                         state.downloaded += data.len() as u64;
                         state.left = total_size.saturating_sub(state.downloaded);
                     }
+                }
+            }
+        });
+        let state = self.state.clone();
+        let shutdown_ev = self.shutdown_ev.clone();
+        self.tpool.execute(move || {
+            let mut prev_downloaded = 0;
+            loop {
+                let mut state = state.write().unwrap();
+                let downloaded_now = state.downloaded.saturating_sub(prev_downloaded);
+                prev_downloaded = state.downloaded;
+                state.download_speed.update(downloaded_now as usize);
+                drop(state);
+                if shutdown_ev.wait_timeout(Duration::from_millis(100)) {
+                    break;
                 }
             }
         });
