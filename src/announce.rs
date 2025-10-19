@@ -261,7 +261,7 @@ pub fn announce(
     event: Option<&str>,
     timeout: Option<Duration>,
 ) -> Result<TrackerResponse, Box<dyn std::error::Error>> {
-    if tracker_url.starts_with("http://") {
+    if tracker_url.starts_with("http") {
         announce_http(
             tracker_url,
             info_hash,
@@ -273,7 +273,7 @@ pub fn announce(
             event,
             timeout,
         )
-    } else if tracker_url.starts_with("udp://") {
+    } else if tracker_url.starts_with("udp") {
         announce_udp(
             tracker_url,
             info_hash,
