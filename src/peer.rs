@@ -4,7 +4,7 @@ use std::{
     hash::Hash,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -391,6 +391,38 @@ impl Hash for PeerConnection {
     }
 }
 
+#[derive(Debug)]
+struct PeerManagerState {
+    peers: HashMap<SocketAddr, PeerInfo>,
+    connected: HashMap<SocketAddr, PeerConnection>,
+    pending: usize,
+}
+
+impl PeerManagerState {
+    fn new() -> Self {
+        Self {
+            peers: HashMap::new(),
+            connected: HashMap::new(),
+            pending: 0,
+        }
+    }
+
+    fn available_capacity(&self, max_connections: usize) -> usize {
+        max_connections.saturating_sub(self.connected.len() + self.pending)
+    }
+
+    fn next_peer(&mut self) -> Option<SocketAddr> {
+        self.peers.values_mut().find_map(|p| {
+            if matches!(p.status, PeerStatus::New | PeerStatus::Failed) {
+                p.status = PeerStatus::Connecting;
+                Some(p.addr)
+            } else {
+                None
+            }
+        })
+    }
+}
+
 /// Manages all peers in the swarm for a single torrent.
 ///
 /// The `PeerManager` handles discovering peers, initiating connections,
@@ -404,10 +436,8 @@ pub struct PeerManager {
     piece_event_tx: Arc<PubSub<PieceEvent>>,
     client_event_tx: Arc<PubSub<ClientEvent>>,
     socket_tx: Arc<Sender<Command>>,
-    peers: Arc<RwLock<HashMap<SocketAddr, PeerInfo>>>,
-    pub connected: Arc<RwLock<HashMap<SocketAddr, PeerConnection>>>,
     max_connections: Arc<usize>,
-    pending_connections: Arc<Mutex<usize>>,
+    state: Arc<RwLock<PeerManagerState>>,
 }
 
 impl PeerManager {
@@ -429,22 +459,20 @@ impl PeerManager {
             piece_event_tx: piece_event_tx,
             client_event_tx: client_event_tx,
             socket_tx: socket_tx,
-            peers: Arc::new(RwLock::new(HashMap::new())),
-            connected: Arc::new(RwLock::new(HashMap::new())),
             max_connections: Arc::new(max_connections),
-            pending_connections: Arc::new(Mutex::new(0)),
+            state: Arc::new(RwLock::new(PeerManagerState::new())),
         })
     }
 
     fn data_received(&self, addr: &SocketAddr, data: &[u8]) {
-        let mut connected = self.connected.write().unwrap();
+        let mut state = self.state.write().unwrap();
         let mut piece_events = Vec::new();
         let mut peer_events = Vec::new();
-        if let Some(pc) = connected.get_mut(addr) {
+        if let Some(pc) = state.connected.get_mut(addr) {
             pc.on_recv(data);
             self.parse_handle_messages(pc, &mut piece_events, &mut peer_events);
         }
-        drop(connected);
+        drop(state);
         for event in piece_events {
             let _ = self
                 .piece_event_tx
@@ -504,98 +532,86 @@ impl PeerManager {
     }
 
     fn add_peers(&self, new_peers: &[SocketAddr]) {
-        let mut peers = self.peers.write().unwrap();
-        let connected = self.connected.read().unwrap();
+        let mut state = self.state.write().unwrap();
         for addr in new_peers {
-            if peers.contains_key(addr) || connected.contains_key(addr) {
+            if state.peers.contains_key(addr) || state.connected.contains_key(addr) {
                 continue;
             }
-            peers.insert(*addr, PeerInfo::new(*addr));
+            state.peers.insert(*addr, PeerInfo::new(*addr));
         }
-        drop(peers);
+        drop(state);
         self.send_peers_changed();
     }
 
-    /// Selects the next available peer to attempt a connection.
-    fn next_peer_to_connect(&self) -> Option<PeerInfo> {
-        let connected = self.connected.read().unwrap();
-        if connected.len() >= *self.max_connections {
-            return None;
-        }
-        drop(connected);
-        let mut peers = self.peers.write().unwrap();
-        peers
-            .values_mut()
-            .find(|p| match p.status {
-                PeerStatus::New => true,
-                PeerStatus::Failed => true,
-                _ => false,
-            })
-            .map(|p| {
-                p.status = PeerStatus::Connecting;
-                p.clone()
-            })
-    }
-
     /// Marks a peer as successfully connected and initializes a `PeerConnection`.
-    fn mark_connected(&self, addr: &SocketAddr, peer_id: &[u8], total_pieces: usize) {
-        let mut pending_connections = self.pending_connections.lock().unwrap();
-        *pending_connections = pending_connections.saturating_sub(1);
-        drop(pending_connections);
-        let mut peers = self.peers.write().unwrap();
-        if let Some(p) = peers.get_mut(&addr) {
+    fn mark_connected(&self, addr: &SocketAddr, peer_id: &[u8]) {
+        let mut state = self.state.write().unwrap();
+        state.pending = state.pending.saturating_sub(1);
+        if let Some(p) = state.peers.get_mut(&addr) {
             p.status = PeerStatus::Connected;
             p.last_seen = Instant::now();
             p.failures = 0;
         }
-        drop(peers);
-        let mut connected = self.connected.write().unwrap();
-        if !connected.contains_key(&addr) {
-            connected.insert(
+        let mut changed = false;
+        if !state.connected.contains_key(&addr) {
+            changed = true;
+            state.connected.insert(
                 *addr,
-                PeerConnection::new(*addr, peer_id.to_vec(), total_pieces),
+                PeerConnection::new(
+                    *addr,
+                    peer_id.to_vec(),
+                    self.torrent.info.piece_hashes.len(),
+                ),
             );
         }
-        drop(connected);
-        self.send_peers_changed();
-        self.maybe_send_bitfield(addr);
+        drop(state);
+        if changed {
+            self.send_peers_changed();
+            self.maybe_send_bitfield(addr);
+        }
     }
 
     /// Marks a peer as having failed to connect, possibly removing it if it failed repeatedly.
     fn mark_failed(&self, addr: &SocketAddr) {
-        let mut pending_connections = self.pending_connections.lock().unwrap();
-        *pending_connections = pending_connections.saturating_sub(1);
-        drop(pending_connections);
-        let mut peers = self.peers.write().unwrap();
-        if let Some(p) = peers.get_mut(&addr) {
+        let mut state = self.state.write().unwrap();
+        state.pending = state.pending.saturating_sub(1);
+        let mut changed = false;
+        if let Some(p) = state.peers.get_mut(&addr) {
             p.status = PeerStatus::Failed;
             p.failures += 1;
             if p.failures >= 1 {
-                peers.remove(&addr);
+                state.peers.remove(&addr);
+                changed = true;
             }
         }
-        drop(peers);
-
-        let mut connected = self.connected.write().unwrap();
-        connected.remove(&addr);
-        drop(connected);
-        self.send_peers_changed();
+        if let Some(_) = state.connected.remove(&addr) {
+            changed = true;
+        }
+        drop(state);
+        if changed {
+            self.send_peers_changed();
+        }
     }
 
     /// Removes a peer that has been disconnected.
     fn mark_disconnected(&self, addr: &SocketAddr) {
-        let mut peers = self.peers.write().unwrap();
-        peers.remove(addr);
-        drop(peers);
+        let mut state = self.state.write().unwrap();
+        let mut changed = false;
+        if let Some(_) = state.peers.remove(addr) {
+            changed = true;
+        }
 
-        let mut connected = self.connected.write().unwrap();
-        connected.remove(addr);
-        drop(connected);
+        if let Some(_) = state.connected.remove(addr) {
+            changed = true;
+        }
+        drop(state);
         let _ = self.piece_event_tx.publish(
             consts::TOPIC_PIECE_EVENT,
             PieceEvent::PeerDisconnected { peer: *addr },
         );
-        self.send_peers_changed();
+        if changed {
+            self.send_peers_changed();
+        }
     }
 
     fn send_peers_changed(&self) {
@@ -606,62 +622,52 @@ impl PeerManager {
 
     /// Returns the number of currently connected peers.
     pub fn connected_peers(&self) -> usize {
-        let connected = self.connected.read().unwrap();
-        connected.len()
+        let state = self.state.read().unwrap();
+        state.connected.len()
     }
 
     /// Returns the total number of known peers.
     pub fn peer_count(&self) -> usize {
-        let peers = self.peers.read().unwrap();
-        peers.len()
+        let state = self.state.read().unwrap();
+        state.peers.len()
     }
 
     /// Returns the number of pending (in-progress) connections.
     pub fn get_pending_connections(&self) -> usize {
-        let pending_connections = self.pending_connections.lock().unwrap();
-        *pending_connections
+        let state = self.state.read().unwrap();
+        state.pending
+    }
+
+    pub fn get_unchoked_and_interested_peers(&self) -> Vec<SocketAddr> {
+        let state = self.state.read().unwrap();
+        state
+            .connected
+            .iter()
+            .filter(|(_, pcon)| !pcon.choked && pcon.am_interested)
+            .map(|(addr, _)| *addr)
+            .collect()
     }
 
     fn attempt_connect_peers(&self, info_hash: [u8; 20], peer_id: [u8; 20]) {
-        let connected = self.connected.read().unwrap();
-        let pending_connections = self.pending_connections.lock().unwrap();
-        let max_connections = *self.max_connections;
-        if connected.len() >= max_connections {
-            return;
+        let to_connect;
+        let peers_to_try: Vec<SocketAddr>;
+        {
+            let mut state = self.state.write().unwrap();
+            to_connect = state.available_capacity(*self.max_connections);
+            peers_to_try = (0..to_connect).filter_map(|_| state.next_peer()).collect();
+            state.pending += peers_to_try.len();
         }
-        let to_connect = max_connections.saturating_sub(connected.len() + *pending_connections);
-        drop(connected);
-        if to_connect == 0 {
-            return;
-        }
-        let mut c = Vec::new();
-        for _ in 0..to_connect {
-            if let Some(p) = self.next_peer_to_connect() {
-                c.push(p);
-            } else {
-                break;
-            }
-        }
-        if c.is_empty() {
-            return;
-        }
-        for p in c {
-            let connected = self.connected.clone();
+        for addr in peers_to_try {
             let socket_tx = self.socket_tx.clone();
             let peer_event_tx = self.peer_event_tx.clone();
-            self.tpool.execute(move || {
-                let connected = connected.read().unwrap();
-                if connected.contains_key(&p.addr) {
-                    return;
-                }
-                drop(connected);
-                match connect_peer(p.addr, &info_hash, &peer_id) {
+            self.tpool
+                .execute(move || match connect_peer(addr, &info_hash, &peer_id) {
                     Ok((peer_id, socket)) => {
-                        let _ = socket_tx.send(Command::Add((socket, p.addr, None)));
+                        let _ = socket_tx.send(Command::Add((socket, addr, None)));
                         let _ = peer_event_tx.publish(
                             consts::TOPIC_PEER_EVENT,
                             PeerEvent::PeerConnected {
-                                addr: p.addr,
+                                addr: addr,
                                 peer_id: peer_id,
                             },
                         );
@@ -669,40 +675,17 @@ impl PeerManager {
                     Err(_) => {
                         let _ = peer_event_tx.publish(
                             consts::TOPIC_PEER_EVENT,
-                            PeerEvent::ConnectFailure { addr: p.addr },
+                            PeerEvent::ConnectFailure { addr: addr },
                         );
                     }
-                }
-            });
+                });
         }
-    }
-
-    pub fn peers_with_piece(&self, index: usize) -> Vec<SocketAddr> {
-        let connected = self.connected.read().unwrap();
-        connected
-            .iter()
-            .filter_map(|(addr, pc)| {
-                if pc.bitfield.get(&index) {
-                    Some(*addr)
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub fn is_choked(&self, addr: &SocketAddr) -> bool {
-        let connected = self.connected.read().unwrap();
-        if let Some(pc) = connected.get(addr) {
-            return pc.is_choked();
-        }
-        return true;
     }
 
     fn maybe_send_bitfield(&self, addr: &SocketAddr) {
-        let connected = self.connected.read().unwrap();
         let mut event_opt = None;
-        if let Some(pc) = connected.get(addr) {
+        let state = self.state.read().unwrap();
+        if let Some(pc) = state.connected.get(addr) {
             if self.torrent.info.has_any_pieces() {
                 event_opt = Some(PeerEvent::Send {
                     addr: pc.addr,
@@ -710,36 +693,50 @@ impl PeerManager {
                 });
             }
         }
-        drop(connected);
+        drop(state);
         if let Some(event) = event_opt {
             let _ = self.peer_event_tx.publish(consts::TOPIC_PEER_EVENT, event);
         }
     }
 
-    fn send_message_to_socket(&self, pcon: &PeerConnection, message: &PeerMessage) {
+    fn get_message_to_socket(
+        &self,
+        pcon: &PeerConnection,
+        message: &PeerMessage,
+    ) -> Option<Command> {
         let check_choked = !matches!(message, PeerMessage::Interested);
         if check_choked && pcon.is_choked() {
-            return;
+            return None;
         }
         let encoded = message.encode();
         let is_critical = message.is_critical();
-        let _ = self
-            .socket_tx
-            .send(Command::Send(pcon.addr, encoded, is_critical));
+        Some(Command::Send(pcon.addr, encoded, is_critical))
     }
 
     pub fn handle_event(&self, ev: Arc<PeerEvent>, my_peer_id: [u8; 20]) {
         match &*ev {
             PeerEvent::SendToAll { message } => {
-                let connected = self.connected.read().unwrap();
-                for pcon in connected.values() {
-                    self.send_message_to_socket(pcon, message);
+                let mut messages = Vec::new();
+                let state = self.state.read().unwrap();
+                for pcon in state.connected.values() {
+                    if let Some(msg) = self.get_message_to_socket(pcon, message) {
+                        messages.push(msg);
+                    }
+                }
+                drop(state);
+                for msg in messages {
+                    let _ = self.socket_tx.send(msg);
                 }
             }
             PeerEvent::Send { addr, message } => {
-                let connected = self.connected.read().unwrap();
-                if let Some(pcon) = connected.get(addr) {
-                    self.send_message_to_socket(pcon, message);
+                let mut message_opt = None;
+                let state = self.state.read().unwrap();
+                if let Some(pcon) = state.connected.get(addr) {
+                    message_opt = self.get_message_to_socket(pcon, message);
+                }
+                drop(state);
+                if let Some(msg) = message_opt {
+                    let _ = self.socket_tx.send(msg);
                 }
             }
             PeerEvent::SocketData { addr, data } => {
@@ -761,8 +758,7 @@ impl PeerManager {
                 self.attempt_connect_peers(info_hash, my_peer_id);
             }
             PeerEvent::PeerConnected { addr, peer_id } => {
-                let total_pieces = self.torrent.info.piece_hashes.len();
-                self.mark_connected(addr, peer_id, total_pieces);
+                self.mark_connected(addr, peer_id);
                 let info_hash = self.torrent.info_hash;
                 self.attempt_connect_peers(info_hash, my_peer_id);
             }
