@@ -314,7 +314,7 @@ pub struct PeerConnection {
     pub bitfield: Bitfield,
     pub choked: bool,
     interested: bool,
-    am_interested: bool,
+    pub am_interested: bool,
 }
 
 impl PeerConnection {

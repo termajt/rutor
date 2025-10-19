@@ -62,12 +62,13 @@ impl PieceManager {
         let connected = self.peer_manager.connected.read().unwrap();
         let peers = connected
             .iter()
-            .filter(|(_, conn)| !conn.choked)
+            .filter(|(_, conn)| !conn.choked && conn.am_interested)
             .map(|(addr, _)| *addr)
             .collect::<Vec<SocketAddr>>();
         let mut picker = self.picker.lock().unwrap();
         picker.cleanup_timed_out_requests();
         let reqs = picker.pick_requests_for_peers(&peers, max_outstanding_requests);
+        drop(picker);
         for (peer, reqs) in reqs {
             self.send_requests(&peer, &reqs);
         }
