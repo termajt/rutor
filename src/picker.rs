@@ -22,7 +22,7 @@ impl PeerStats {
 
     fn new() -> Self {
         Self {
-            avg_speed: 16_000.0,
+            avg_speed: 1024.0,
             last_update: Instant::now(),
         }
     }
@@ -394,10 +394,6 @@ impl PiecePicker {
         if peers.is_empty() {
             return results;
         }
-        let mut sorted_peers = peers.to_vec();
-        sorted_peers
-            .sort_by_key(|peer| *self.outstanding_requests_per_peer.get(peer).unwrap_or(&0));
-
         let total_outstanding = self.total_outstanding_requests();
         if total_outstanding >= max_outstanding_requests {
             return results;
@@ -408,8 +404,59 @@ impl PiecePicker {
             return results;
         }
 
+        let mut sorted_peers = peers.to_vec();
         let remaining = self.total_remaining_blocks();
         let endgame_threshold = self.calculate_endgame_threshold(peers.len());
+        if remaining <= endgame_threshold {
+            // When very few pieces remain, switch to endgame mode,
+            // prioritize peers that can deliver the fastest (lowest expected timeout),
+            // to minimize the risk of waiting on slow peers for final pieces.
+            sorted_peers.sort_by(|a, b| {
+                // Estimate how long each peer would take to deliver one block.
+                // If stats are missing, assume a conservative 10-second timeout.
+                let ta = self
+                    .peer_stats
+                    .get(a)
+                    .map(|s| s.expected_timeout(self.config.block_size))
+                    .unwrap_or(Duration::from_secs(10));
+                let tb = self
+                    .peer_stats
+                    .get(b)
+                    .map(|s| s.expected_timeout(self.config.block_size))
+                    .unwrap_or(Duration::from_secs(10));
+
+                // Lower timeout = better (asc order)
+                ta.cmp(&tb)
+            });
+        } else {
+            // Normal operating mode:
+            // Balance between throughput and fairness using a weighted priority.
+            // Peers with higher avg_speed and fewer outstanding requests are favored,
+            // but slow peers still receive some work.
+            sorted_peers.sort_by(|a, b| {
+                // Historical average download speeds (bytes/sec),
+                // fall back to a default baseline if unknown.
+                let sa = self
+                    .peer_stats
+                    .get(a)
+                    .map(|s| s.avg_speed)
+                    .unwrap_or(1024.0);
+                let sb = self
+                    .peer_stats
+                    .get(b)
+                    .map(|s| s.avg_speed)
+                    .unwrap_or(1024.0);
+                let ra = *self.outstanding_requests_per_peer.get(a).unwrap_or(&0);
+                let rb = *self.outstanding_requests_per_peer.get(b).unwrap_or(&0);
+
+                // Weighted priority: higher speed and fewer outstanding = better
+                let pa = sa / (1.0 + ra as f64);
+                let pb = sb / (1.0 + rb as f64);
+
+                // Sort descending: higher priority peers first.
+                pb.partial_cmp(&pa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
         let max_dups = if remaining <= endgame_threshold {
             4
         } else if remaining <= endgame_threshold * 4 {
