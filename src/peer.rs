@@ -438,74 +438,68 @@ impl PeerManager {
 
     fn data_received(&self, addr: &SocketAddr, data: &[u8]) {
         let mut connected = self.connected.write().unwrap();
+        let mut piece_events = Vec::new();
+        let mut peer_events = Vec::new();
         if let Some(pc) = connected.get_mut(addr) {
             pc.on_recv(data);
+            self.parse_handle_messages(pc, &mut piece_events, &mut peer_events);
         }
         drop(connected);
-        self.parse_handle_messages();
-    }
-
-    fn parse_handle_messages(&self) {
-        let total_pieces = self.torrent.info.piece_hashes.len();
-        let mut connected = self.connected.write().unwrap();
-        for pc in connected.values_mut() {
-            while let Some(message) = pc.parse_messages(total_pieces) {
-                pc.handle_message(&message);
-                match message {
-                    PeerMessage::Bitfield(_) | PeerMessage::Have(_) => {
-                        self.update_interest(pc);
-                        let _ = self.piece_event_tx.publish(
-                            consts::TOPIC_PIECE_EVENT,
-                            PieceEvent::PieceAvailabilityChange {
-                                peer: pc.addr,
-                                bitfield: pc.bitfield.clone(),
-                            },
-                        );
-                    }
-                    PeerMessage::Choke | PeerMessage::Unchoke => {
-                        let _ = self.piece_event_tx.publish(
-                            consts::TOPIC_PIECE_EVENT,
-                            PieceEvent::PeerChokeChanged {
-                                addr: pc.addr,
-                                choked: matches!(message, PeerMessage::Choke),
-                            },
-                        );
-                    }
-                    PeerMessage::Piece((index, begin, data)) => {
-                        let _ = self.piece_event_tx.publish(
-                            consts::TOPIC_PIECE_EVENT,
-                            PieceEvent::BlockData {
-                                peer: pc.addr,
-                                piece_index: index,
-                                begin: begin,
-                                data: data,
-                            },
-                        );
-                    }
-                    _ => {}
-                }
-            }
+        for event in piece_events {
+            let _ = self
+                .piece_event_tx
+                .publish(consts::TOPIC_PIECE_EVENT, event);
+        }
+        for event in peer_events {
+            let _ = self.peer_event_tx.publish(consts::TOPIC_PEER_EVENT, event);
         }
     }
 
-    fn update_interest(&self, pconn: &mut PeerConnection) {
-        let am_interested_now = self.torrent.info.bitfield_differs(&pconn.bitfield);
-        if am_interested_now != pconn.am_interested {
-            pconn.am_interested = am_interested_now;
-
-            let message = if am_interested_now {
-                PeerMessage::Interested
-            } else {
-                PeerMessage::NotInterested
-            };
-
-            let _ = self.peer_event_tx.publish(
-                consts::TOPIC_PEER_EVENT,
-                PeerEvent::Send {
-                    addr: pconn.addr,
-                    message: message,
-                },
-            );
+    fn parse_handle_messages(
+        &self,
+        pc: &mut PeerConnection,
+        piece_events: &mut Vec<PieceEvent>,
+        peer_events: &mut Vec<PeerEvent>,
+    ) {
+        let total_pieces = self.torrent.info.piece_hashes.len();
+        while let Some(message) = pc.parse_messages(total_pieces) {
+            pc.handle_message(&message);
+            match message {
+                PeerMessage::Bitfield(_) | PeerMessage::Have(_) => {
+                    let am_interested_now = self.torrent.info.bitfield_differs(&pc.bitfield);
+                    if am_interested_now != pc.am_interested {
+                        pc.am_interested = am_interested_now;
+                        let message = if am_interested_now {
+                            PeerMessage::Interested
+                        } else {
+                            PeerMessage::NotInterested
+                        };
+                        peer_events.push(PeerEvent::Send {
+                            addr: pc.addr,
+                            message: message,
+                        });
+                    }
+                    piece_events.push(PieceEvent::PieceAvailabilityChange {
+                        peer: pc.addr,
+                        bitfield: pc.bitfield.clone(),
+                    });
+                }
+                PeerMessage::Choke | PeerMessage::Unchoke => {
+                    piece_events.push(PieceEvent::PeerChokeChanged {
+                        addr: pc.addr,
+                        choked: matches!(message, PeerMessage::Choke),
+                    });
+                }
+                PeerMessage::Piece((index, begin, data)) => {
+                    piece_events.push(PieceEvent::BlockData {
+                        peer: pc.addr,
+                        piece_index: index,
+                        begin: begin,
+                        data: data,
+                    });
+                }
+                _ => {}
+            }
         }
     }
 
@@ -629,16 +623,14 @@ impl PeerManager {
     }
 
     fn attempt_connect_peers(&self, info_hash: [u8; 20], peer_id: [u8; 20]) {
-        let to_connect: usize;
-        {
-            let connected = self.connected.read().unwrap();
-            let pending_connections = self.pending_connections.lock().unwrap();
-            let max_connections = *self.max_connections;
-            if connected.len() >= max_connections || *pending_connections >= max_connections {
-                return;
-            }
-            to_connect = max_connections.saturating_sub(connected.len() + *pending_connections);
+        let connected = self.connected.read().unwrap();
+        let pending_connections = self.pending_connections.lock().unwrap();
+        let max_connections = *self.max_connections;
+        if connected.len() >= max_connections {
+            return;
         }
+        let to_connect = max_connections.saturating_sub(connected.len() + *pending_connections);
+        drop(connected);
         if to_connect == 0 {
             return;
         }
@@ -709,16 +701,18 @@ impl PeerManager {
 
     fn maybe_send_bitfield(&self, addr: &SocketAddr) {
         let connected = self.connected.read().unwrap();
+        let mut event_opt = None;
         if let Some(pc) = connected.get(addr) {
             if self.torrent.info.has_any_pieces() {
-                let _ = self.peer_event_tx.publish(
-                    consts::TOPIC_PEER_EVENT,
-                    PeerEvent::Send {
-                        addr: pc.addr,
-                        message: PeerMessage::Bitfield(self.torrent.info.bitfield()),
-                    },
-                );
+                event_opt = Some(PeerEvent::Send {
+                    addr: pc.addr,
+                    message: PeerMessage::Bitfield(self.torrent.info.bitfield()),
+                });
             }
+        }
+        drop(connected);
+        if let Some(event) = event_opt {
+            let _ = self.peer_event_tx.publish(consts::TOPIC_PEER_EVENT, event);
         }
     }
 
@@ -734,7 +728,7 @@ impl PeerManager {
             .send(Command::Send(pcon.addr, encoded, is_critical));
     }
 
-    pub fn handle_event(&self, ev: Arc<PeerEvent>, peer_id: [u8; 20]) {
+    pub fn handle_event(&self, ev: Arc<PeerEvent>, my_peer_id: [u8; 20]) {
         match &*ev {
             PeerEvent::SendToAll { message } => {
                 let connected = self.connected.read().unwrap();
@@ -754,21 +748,23 @@ impl PeerManager {
             PeerEvent::SocketDisconnect { addr } => {
                 self.mark_disconnected(addr);
                 let info_hash = self.torrent.info_hash;
-                self.attempt_connect_peers(info_hash, peer_id);
+                self.attempt_connect_peers(info_hash, my_peer_id);
             }
             PeerEvent::ConnectFailure { addr } => {
                 self.mark_failed(addr);
                 let info_hash = self.torrent.info_hash;
-                self.attempt_connect_peers(info_hash, peer_id);
+                self.attempt_connect_peers(info_hash, my_peer_id);
             }
             PeerEvent::NewPeers { peers } => {
                 self.add_peers(peers);
                 let info_hash = self.torrent.info_hash;
-                self.attempt_connect_peers(info_hash, peer_id);
+                self.attempt_connect_peers(info_hash, my_peer_id);
             }
             PeerEvent::PeerConnected { addr, peer_id } => {
                 let total_pieces = self.torrent.info.piece_hashes.len();
                 self.mark_connected(addr, peer_id, total_pieces);
+                let info_hash = self.torrent.info_hash;
+                self.attempt_connect_peers(info_hash, my_peer_id);
             }
         }
     }
