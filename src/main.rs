@@ -82,7 +82,9 @@ impl ProgressTracker {
             "" // empty
         };
 
-        let empty_blocks = bar_width - filled_blocks - if partial_block.is_empty() { 0 } else { 1 };
+        let empty_blocks = bar_width
+            .saturating_sub(filled_blocks)
+            .saturating_sub(if partial_block.is_empty() { 0 } else { 1 });
 
         let green = "\x1b[32m"; // filled
         let yellow = "\x1b[33m"; // partial

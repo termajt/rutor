@@ -146,36 +146,42 @@ impl TorrentClient {
         let client_event_rx = self.client_event.subscribe(consts::TOPIC_CLIENT_EVENT)?;
         let total_size = self.torrent.info.total_size;
         let torrent = self.torrent.clone();
+        let shutdown_ev = self.shutdown_ev.clone();
         self.tpool.execute(move || {
-            while let Ok(ev) = client_event_rx.recv() {
-                match &*ev {
-                    ClientEvent::PieceVerificationFailure {
-                        piece_index: _,
-                        data_size,
-                    } => {
-                        let mut state = state.write().unwrap();
-                        state.downloaded = state.downloaded.saturating_sub(*data_size as u64);
-                        state.left = total_size.saturating_sub(state.downloaded);
+            while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
+                while let Ok(ev) = client_event_rx.try_recv() {
+                    if shutdown_ev.is_set() {
+                        break;
                     }
-                    ClientEvent::PeersChanged => {
-                        let mut state = state.write().unwrap();
-                        state.connected_peers = peer_manager.connected_peers();
-                        state.peers = peer_manager.peer_count();
-                    }
-                    ClientEvent::PieceVerified { piece_index } => {
-                        torrent.info.set_bitfield_index(*piece_index);
-                    }
-                    ClientEvent::WriteToDisk {
-                        piece_index,
-                        begin,
-                        data,
-                    } => {
-                        if let Err(e) = torrent.write_to_disk(*piece_index, *begin, data) {
-                            eprintln!("failed to write block to disk: {e}");
+                    match &*ev {
+                        ClientEvent::PieceVerificationFailure {
+                            piece_index: _,
+                            data_size,
+                        } => {
+                            let mut state = state.write().unwrap();
+                            state.downloaded = state.downloaded.saturating_sub(*data_size as u64);
+                            state.left = total_size.saturating_sub(state.downloaded);
                         }
-                        let mut state = state.write().unwrap();
-                        state.downloaded += data.len() as u64;
-                        state.left = total_size.saturating_sub(state.downloaded);
+                        ClientEvent::PeersChanged => {
+                            let mut state = state.write().unwrap();
+                            state.connected_peers = peer_manager.connected_peers();
+                            state.peers = peer_manager.peer_count();
+                        }
+                        ClientEvent::PieceVerified { piece_index } => {
+                            torrent.info.set_bitfield_index(*piece_index);
+                        }
+                        ClientEvent::WriteToDisk {
+                            piece_index,
+                            begin,
+                            data,
+                        } => {
+                            if let Err(e) = torrent.write_to_disk(*piece_index, *begin, data) {
+                                eprintln!("failed to write block to disk: {e}");
+                            }
+                            let mut state = state.write().unwrap();
+                            state.downloaded += data.len() as u64;
+                            state.left = total_size.saturating_sub(state.downloaded);
+                        }
                     }
                 }
             }
@@ -184,15 +190,12 @@ impl TorrentClient {
         let shutdown_ev = self.shutdown_ev.clone();
         self.tpool.execute(move || {
             let mut prev_downloaded = 0;
-            loop {
+            while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
                 let mut state = state.write().unwrap();
                 let downloaded_now = state.downloaded.saturating_sub(prev_downloaded);
                 prev_downloaded = state.downloaded;
                 state.download_speed.update(downloaded_now as usize);
                 drop(state);
-                if shutdown_ev.wait_timeout(Duration::from_millis(100)) {
-                    break;
-                }
             }
         });
         Ok(())
@@ -290,15 +293,21 @@ impl TorrentClient {
             }
         });
         let peer_event_tx = self.peer_event.clone();
+        let shutdown_ev = self.shutdown_ev.clone();
         self.tpool.execute(move || {
-            while let Ok((data, addr)) = data_rx.recv() {
-                let _ = peer_event_tx.publish(
-                    consts::TOPIC_PEER_EVENT,
-                    PeerEvent::SocketData {
-                        addr: addr,
-                        data: data,
-                    },
-                );
+            while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
+                while let Ok((data, addr)) = data_rx.try_recv() {
+                    if shutdown_ev.is_set() {
+                        break;
+                    }
+                    let _ = peer_event_tx.publish(
+                        consts::TOPIC_PEER_EVENT,
+                        PeerEvent::SocketData {
+                            addr: addr,
+                            data: data,
+                        },
+                    );
+                }
             }
         });
         Ok(())
@@ -307,10 +316,16 @@ impl TorrentClient {
     fn start_peer_manager(&self) -> Result<(), Box<dyn std::error::Error>> {
         let peer_manager = self.peer_manager.clone();
         let peer_id = self.peer_id;
-        let peer_event_tx = self.peer_event.subscribe(consts::TOPIC_PEER_EVENT)?;
+        let peer_event_rx = self.peer_event.subscribe(consts::TOPIC_PEER_EVENT)?;
+        let shutdown_ev = self.shutdown_ev.clone();
         self.tpool.execute(move || {
-            while let Ok(ev) = peer_event_tx.recv() {
-                peer_manager.handle_event(ev, peer_id);
+            while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
+                while let Ok(ev) = peer_event_rx.try_recv() {
+                    if shutdown_ev.is_set() {
+                        break;
+                    }
+                    peer_manager.handle_event(ev, peer_id);
+                }
             }
         });
         Ok(())
@@ -319,22 +334,25 @@ impl TorrentClient {
     fn start_piece_manager(&self) -> Result<(), Box<dyn std::error::Error>> {
         let rx = self.piece_event.subscribe(consts::TOPIC_PIECE_EVENT)?;
         let piece_manager = self.piece_manager.clone();
+        let shutdown_ev = self.shutdown_ev.clone();
         self.tpool.execute(move || {
-            while let Ok(ev) = rx.recv() {
-                let mut piece_manager = piece_manager.write().unwrap();
-                piece_manager.handle_event(ev);
+            while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
+                while let Ok(ev) = rx.try_recv() {
+                    if shutdown_ev.is_set() {
+                        break;
+                    }
+                    let mut piece_manager = piece_manager.write().unwrap();
+                    piece_manager.handle_event(ev);
+                }
             }
         });
         let piece_manager = self.piece_manager.clone();
         let shutdown_ev = self.shutdown_ev.clone();
         self.tpool.execute(move || {
-            loop {
+            while !shutdown_ev.wait_timeout(Duration::from_millis(250)) {
                 let piece_manager = piece_manager.read().unwrap();
                 piece_manager.run_piece_selection_once();
                 drop(piece_manager);
-                if shutdown_ev.wait_timeout(Duration::from_millis(250)) {
-                    break;
-                }
             }
         });
         Ok(())
