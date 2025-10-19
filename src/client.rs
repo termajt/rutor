@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -91,7 +94,15 @@ impl TorrentClient {
     pub fn new(torrent: Torrent) -> Result<Self, Box<dyn std::error::Error>> {
         let torrent = Arc::new(torrent);
         let peer_id = generate_peer_id();
-        let tpool = Arc::new(ThreadPool::new());
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let workers = std::env::var("RUTOR_MAX_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(cores);
+        let thread_workers = (workers * 2).min(64);
+        let tpool = Arc::new(ThreadPool::with_capacity(thread_workers));
         let (socket_tx, socket_rx) = Queue::new(None);
         let (socket_tx, socket_rx) = (Arc::new(socket_tx), Arc::new(socket_rx));
         let client_event = Arc::new(PubSub::new());
@@ -203,8 +214,9 @@ impl TorrentClient {
 
     fn start_threads(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.start_socket_manager()?;
-        self.start_peer_manager()?;
-        self.start_piece_manager()?;
+        let max_handlers = std::cmp::max(2, self.tpool.max_workers());
+        self.start_peer_manager(max_handlers)?;
+        self.start_piece_manager(max_handlers)?;
         self.start_announce_thread();
         Ok(())
     }
@@ -313,48 +325,110 @@ impl TorrentClient {
         Ok(())
     }
 
-    fn start_peer_manager(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn start_peer_manager(&self, max_handlers: usize) -> Result<(), Box<dyn std::error::Error>> {
         let peer_manager = self.peer_manager.clone();
         let peer_id = self.peer_id;
         let peer_event_rx = self.peer_event.subscribe(consts::TOPIC_PEER_EVENT)?;
         let shutdown_ev = self.shutdown_ev.clone();
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let tpool = self.tpool.clone();
         self.tpool.execute(move || {
             while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
                 while let Ok(ev) = peer_event_rx.try_recv() {
                     if shutdown_ev.is_set() {
                         break;
                     }
-                    peer_manager.handle_event(ev, peer_id);
+
+                    let is_connect_related = matches!(
+                        *ev,
+                        PeerEvent::ConnectFailure { .. }
+                            | PeerEvent::SocketDisconnect { .. }
+                            | PeerEvent::PeerConnected { .. }
+                            | PeerEvent::NewPeers { .. }
+                    );
+
+                    if is_connect_related {
+                        let cur = inflight.load(Ordering::Relaxed);
+                        if cur < max_handlers {
+                            inflight.fetch_add(1, Ordering::SeqCst);
+
+                            let peer_manager = peer_manager.clone();
+                            let inflight = inflight.clone();
+                            let shutdown_ev = shutdown_ev.clone();
+                            let ev = ev.clone();
+
+                            tpool.execute(move || {
+                                if shutdown_ev.is_set() {
+                                    inflight.fetch_sub(1, Ordering::SeqCst);
+                                    return;
+                                }
+
+                                peer_manager.handle_event(ev, peer_id);
+                            });
+                        } else {
+                            peer_manager.handle_event(ev, peer_id);
+                        }
+                    } else {
+                        peer_manager.handle_event(ev, peer_id);
+                    }
                 }
             }
         });
         Ok(())
     }
 
-    fn start_piece_manager(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let rx = self.piece_event.subscribe(consts::TOPIC_PIECE_EVENT)?;
-        let piece_manager = self.piece_manager.clone();
-        let shutdown_ev = self.shutdown_ev.clone();
-        self.tpool.execute(move || {
-            while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
-                while let Ok(ev) = rx.try_recv() {
-                    if shutdown_ev.is_set() {
-                        break;
+    fn start_piece_manager(&self, max_handlers: usize) -> Result<(), Box<dyn std::error::Error>> {
+        {
+            let inflight = Arc::new(AtomicUsize::new(0));
+            let rx = self.piece_event.subscribe(consts::TOPIC_PIECE_EVENT)?;
+            let piece_manager = self.piece_manager.clone();
+            let shutdown_ev = self.shutdown_ev.clone();
+            let tpool = self.tpool.clone();
+            self.tpool.execute(move || {
+                while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
+                    while let Ok(ev) = rx.try_recv() {
+                        if shutdown_ev.is_set() {
+                            break;
+                        }
+
+                        let cur = inflight.load(Ordering::Relaxed);
+                        if cur < max_handlers {
+                            inflight.fetch_add(1, Ordering::SeqCst);
+
+                            let inflight = inflight.clone();
+                            let piece_manager = piece_manager.clone();
+                            let ev = ev.clone();
+                            let shutdown_ev = shutdown_ev.clone();
+                            tpool.execute(move || {
+                                if shutdown_ev.is_set() {
+                                    inflight.fetch_sub(1, Ordering::SeqCst);
+                                    return;
+                                }
+
+                                let mut piece_manager = piece_manager.write().unwrap();
+                                piece_manager.handle_event(ev);
+                                drop(piece_manager);
+                                inflight.fetch_sub(1, Ordering::SeqCst);
+                            });
+                        } else {
+                            let mut piece_manager = piece_manager.write().unwrap();
+                            piece_manager.handle_event(ev);
+                        }
                     }
-                    let mut piece_manager = piece_manager.write().unwrap();
-                    piece_manager.handle_event(ev);
                 }
-            }
-        });
-        let piece_manager = self.piece_manager.clone();
-        let shutdown_ev = self.shutdown_ev.clone();
-        self.tpool.execute(move || {
-            while !shutdown_ev.wait_timeout(Duration::from_millis(250)) {
-                let piece_manager = piece_manager.read().unwrap();
-                piece_manager.run_piece_selection_once();
-                drop(piece_manager);
-            }
-        });
+            });
+        }
+        {
+            let piece_manager = self.piece_manager.clone();
+            let shutdown_ev = self.shutdown_ev.clone();
+            self.tpool.execute(move || {
+                while !shutdown_ev.wait_timeout(Duration::from_millis(250)) {
+                    let piece_manager = piece_manager.read().unwrap();
+                    piece_manager.run_piece_selection_once();
+                    drop(piece_manager);
+                }
+            });
+        }
         Ok(())
     }
 

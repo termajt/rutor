@@ -103,6 +103,10 @@ impl ThreadPool {
         }
     }
 
+    pub fn max_workers(&self) -> usize {
+        self.max_workers
+    }
+
     /// Submits a job (closure) to the thread pool for execution.
     ///
     /// If there are idle workers available, one is woken to handle the job.
