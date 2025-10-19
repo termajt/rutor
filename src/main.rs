@@ -22,6 +22,7 @@ struct ProgressTracker {
     pid: Pid,
     show_consumption: bool,
     thread_workers: usize,
+    files: Vec<String>,
 }
 
 impl ProgressTracker {
@@ -32,6 +33,7 @@ impl ProgressTracker {
         pid: Pid,
         show_consumption: bool,
         thread_workers: usize,
+        files: Vec<String>,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -48,6 +50,7 @@ impl ProgressTracker {
             pid: pid,
             show_consumption: show_consumption,
             thread_workers: thread_workers,
+            files: files,
         }
     }
 
@@ -142,7 +145,7 @@ impl ProgressTracker {
 
     fn display(&self, first_draw: bool) {
         if !first_draw {
-            let max = if self.show_consumption { 6 } else { 5 };
+            let max = if self.show_consumption { 7 } else { 6 } + self.files.len();
             for _ in 0..max {
                 print!("\r\x1B[1A\x1b[2K");
             }
@@ -153,10 +156,15 @@ impl ProgressTracker {
         let yellow = "\x1b[33m";
         let magenta = "\x1b[35m";
         let blue = "\x1b[34m";
+        let gray = "\x1b[90m";
         let white = "\x1b[97m";
         let reset = "\x1b[0m";
 
         println!("{}Name:{} {}", cyan, reset, self.name);
+        println!("{}Files:{}", cyan, reset);
+        for file in self.files.iter() {
+            println!("  {}•{} {}", gray, reset, file);
+        }
         println!(
             "{}Downloaded:{} {} / {} at {}{}/s{}, ETA: {}{}{}",
             green,
@@ -295,6 +303,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let file = File::open(filename)?;
         torrent::Torrent::from_file(&file, destination)?
     };
+    let files: Vec<String> = torrent
+        .info
+        .files
+        .iter()
+        .map(|f| {
+            let path_str = f.path.join(&std::path::MAIN_SEPARATOR.to_string());
+            let path = PathBuf::from(path_str);
+            path.file_name().unwrap().to_str().unwrap().to_string()
+        })
+        .collect();
     let name = torrent.info.name.clone();
     let total_size = torrent.info.total_size;
     let client = TorrentClient::new(torrent)?;
@@ -307,6 +325,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pid,
         show_consumption,
         client.get_thread_worker_count(),
+        files,
     );
     while !client.is_complete() {
         system.refresh_all();

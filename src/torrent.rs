@@ -89,7 +89,7 @@ pub struct FileSlice {
 #[derive(Debug, Clone)]
 pub struct TorrentFile {
     length: u64,
-    path: Vec<String>,
+    pub path: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -98,7 +98,7 @@ pub struct TorrentInfo {
     pub piece_length: u32,
     pub piece_hashes: Vec<[u8; 20]>,
     pub total_size: u64,
-    files: Vec<TorrentFile>,
+    pub files: Vec<TorrentFile>,
     bitfield: RwLock<Bitfield>,
     destination: Option<PathBuf>,
     file_handle_cache: FileHandleCache,
