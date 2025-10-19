@@ -263,6 +263,7 @@ impl TorrentClient {
                     None,
                 ) {
                     tracker.update_from_response(&response);
+                    drop(manager);
                     let _ = peer_event_tx.publish(
                         consts::TOPIC_PEER_EVENT,
                         PeerEvent::NewPeers {
@@ -283,18 +284,20 @@ impl TorrentClient {
         self.tpool.execute(move || {
             while !shutdown.load(Ordering::Relaxed) {
                 let mut socket_manager = socket_manager.lock().unwrap();
+                let mut events = Vec::new();
                 match socket_manager.run_once(&socket_rx, &data_tx) {
                     Ok(disconnects) => {
                         for addr in disconnects {
-                            let _ = peer_event_tx.publish(
-                                consts::TOPIC_PEER_EVENT,
-                                PeerEvent::SocketDisconnect { addr: addr },
-                            );
+                            events.push(PeerEvent::SocketDisconnect { addr: addr });
                         }
                     }
                     Err(e) => {
                         eprintln!("socket manager run_once failure: {e}");
                     }
+                }
+                drop(socket_manager);
+                for event in events {
+                    let _ = peer_event_tx.publish(consts::TOPIC_PEER_EVENT, event);
                 }
             }
         });
