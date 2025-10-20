@@ -7,6 +7,9 @@ pub const TOPIC_PIECE_EVENT: &str = &"piece_event";
 pub const TOPIC_PEER_EVENT: &str = &"peer_event";
 
 #[derive(Debug)]
+pub enum TorrentEvent {}
+
+#[derive(Debug)]
 pub enum PieceEvent {
     BlockData {
         peer: SocketAddr,
@@ -35,10 +38,6 @@ pub enum PeerEvent {
     Send {
         addr: SocketAddr,
         message: PeerMessage,
-    },
-    SocketData {
-        addr: SocketAddr,
-        data: Vec<u8>,
     },
     SocketDisconnect {
         addr: SocketAddr,

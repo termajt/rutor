@@ -17,7 +17,7 @@ use crate::{
     piece::PieceManager,
     pool::ThreadPool,
     pubsub::PubSub,
-    queue::{Queue, Receiver},
+    queue::{Queue, QueueError, Receiver},
     socketmanager::{Command, SocketManager},
     torrent::Torrent,
 };
@@ -155,53 +155,40 @@ impl TorrentClient {
         let state = self.state.clone();
         let peer_manager = self.peer_manager.clone();
         let client_event_rx = self.client_event.subscribe(consts::TOPIC_CLIENT_EVENT)?;
-        let total_size = self.torrent.info.total_size;
         let torrent = self.torrent.clone();
         let shutdown_ev = self.shutdown_ev.clone();
         self.tpool.execute(move || {
-            while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
-                while let Ok(ev) = client_event_rx.try_recv() {
-                    if shutdown_ev.is_set() {
-                        break;
+            let mut delay = Duration::from_millis(5);
+            let max_delay = Duration::from_secs(1);
+            while !shutdown_ev.is_set() {
+                match client_event_rx.recv_timeout(delay) {
+                    Ok(ev) => {
+                        handle_client_event(&ev, &torrent, &state, &peer_manager);
+                        delay = Duration::from_millis(5);
                     }
-                    match &*ev {
-                        ClientEvent::PieceVerificationFailure {
-                            piece_index: _,
-                            data_size,
-                        } => {
-                            let mut state = state.write().unwrap();
-                            state.downloaded = state.downloaded.saturating_sub(*data_size as u64);
-                            state.left = total_size.saturating_sub(state.downloaded);
-                        }
-                        ClientEvent::PeersChanged => {
-                            let mut state = state.write().unwrap();
-                            state.connected_peers = peer_manager.connected_peers();
-                            state.peers = peer_manager.peer_count();
-                        }
-                        ClientEvent::PieceVerified { piece_index } => {
-                            torrent.info.set_bitfield_index(*piece_index);
-                        }
-                        ClientEvent::WriteToDisk {
-                            piece_index,
-                            begin,
-                            data,
-                        } => {
-                            if let Err(e) = torrent.write_to_disk(*piece_index, *begin, data) {
-                                eprintln!("failed to write block to disk: {e}");
-                            }
-                            let mut state = state.write().unwrap();
-                            state.downloaded += data.len() as u64;
-                            state.left = total_size.saturating_sub(state.downloaded);
-                        }
+                    Err(ref e) if matches!(e, QueueError::Timeout) => {
+                        delay = (delay * 2).min(max_delay)
+                    }
+                    Err(ref e) if matches!(e, QueueError::ClosedRecv) => {
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("client event recv error: {e}");
                     }
                 }
             }
+            // Drain events
+            eprintln!("draining client events...");
+            while let Ok(ev) = client_event_rx.try_recv() {
+                handle_client_event(&ev, &torrent, &state, &peer_manager);
+            }
+            eprintln!("client events drained!");
         });
         let state = self.state.clone();
         let shutdown_ev = self.shutdown_ev.clone();
         self.tpool.execute(move || {
             let mut prev_downloaded = 0;
-            while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
+            while !shutdown_ev.wait_timeout(Duration::from_millis(500)) {
                 let mut state = state.write().unwrap();
                 let downloaded_now = state.downloaded.saturating_sub(prev_downloaded);
                 prev_downloaded = state.downloaded;
@@ -243,6 +230,7 @@ impl TorrentClient {
                                 .unwrap_or(Duration::from_secs(30));
                             drop(manager);
                             if shutdown_ev.wait_timeout(next_time) {
+                                println!("!!");
                                 break;
                             }
                             continue;
@@ -304,21 +292,27 @@ impl TorrentClient {
                 }
             }
         });
-        let peer_event_tx = self.peer_event.clone();
+        // let peer_event_tx = self.peer_event.clone();
         let shutdown_ev = self.shutdown_ev.clone();
+        let peer_manager = self.peer_manager.clone();
         self.tpool.execute(move || {
-            while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
-                while let Ok((data, addr)) = data_rx.try_recv() {
-                    if shutdown_ev.is_set() {
-                        break;
+            let mut delay = Duration::from_millis(5);
+            let max_delay = Duration::from_millis(500);
+            while !shutdown_ev.is_set() {
+                match data_rx.recv_timeout(delay) {
+                    Ok((data, addr)) => {
+                        peer_manager.data_received(&addr, &data);
+                        delay = Duration::from_millis(5);
                     }
-                    let _ = peer_event_tx.publish(
-                        consts::TOPIC_PEER_EVENT,
-                        PeerEvent::SocketData {
-                            addr: addr,
-                            data: data,
-                        },
-                    );
+                    Err(ref e) if matches!(e, QueueError::Timeout) => {
+                        delay = (delay * 2).min(max_delay)
+                    }
+                    Err(ref e) if matches!(e, QueueError::ClosedRecv) => {
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("socket event recv error: {e}");
+                    }
                 }
             }
         });
@@ -333,46 +327,49 @@ impl TorrentClient {
         let inflight = Arc::new(AtomicUsize::new(0));
         let tpool = self.tpool.clone();
         self.tpool.execute(move || {
-            while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
-                while let Ok(ev) = peer_event_rx.try_recv() {
-                    if shutdown_ev.is_set() {
-                        break;
+            let mut delay = Duration::from_millis(5);
+            let max_delay = Duration::from_secs(1);
+            while !shutdown_ev.is_set() {
+                match peer_event_rx.recv_timeout(delay) {
+                    Ok(ev) => {
+                        handle_peer_event(
+                            ev,
+                            inflight.clone(),
+                            max_handlers,
+                            peer_manager.clone(),
+                            shutdown_ev.clone(),
+                            tpool.clone(),
+                            peer_id,
+                            false,
+                        );
                     }
-
-                    let is_connect_related = matches!(
-                        *ev,
-                        PeerEvent::ConnectFailure { .. }
-                            | PeerEvent::SocketDisconnect { .. }
-                            | PeerEvent::PeerConnected { .. }
-                            | PeerEvent::NewPeers { .. }
-                    );
-
-                    if is_connect_related {
-                        let cur = inflight.load(Ordering::Relaxed);
-                        if cur < max_handlers {
-                            inflight.fetch_add(1, Ordering::SeqCst);
-
-                            let peer_manager = peer_manager.clone();
-                            let inflight = inflight.clone();
-                            let shutdown_ev = shutdown_ev.clone();
-                            let ev = ev.clone();
-
-                            tpool.execute(move || {
-                                if shutdown_ev.is_set() {
-                                    inflight.fetch_sub(1, Ordering::SeqCst);
-                                    return;
-                                }
-
-                                peer_manager.handle_event(ev, peer_id);
-                            });
-                        } else {
-                            peer_manager.handle_event(ev, peer_id);
-                        }
-                    } else {
-                        peer_manager.handle_event(ev, peer_id);
+                    Err(ref e) if matches!(e, QueueError::Timeout) => {
+                        delay = (delay * 2).min(max_delay)
+                    }
+                    Err(ref e) if matches!(e, QueueError::ClosedRecv) => {
+                        return;
+                    }
+                    Err(e) => {
+                        eprintln!("socket event recv error: {e}");
                     }
                 }
             }
+
+            // Drain events
+            eprintln!("draining peer events...");
+            while let Ok(ev) = peer_event_rx.try_recv() {
+                handle_peer_event(
+                    ev,
+                    inflight.clone(),
+                    max_handlers,
+                    peer_manager.clone(),
+                    shutdown_ev.clone(),
+                    tpool.clone(),
+                    peer_id,
+                    true,
+                );
+            }
+            eprintln!("peer events drained!");
         });
         Ok(())
     }
@@ -385,37 +382,47 @@ impl TorrentClient {
             let shutdown_ev = self.shutdown_ev.clone();
             let tpool = self.tpool.clone();
             self.tpool.execute(move || {
-                while !shutdown_ev.wait_timeout(Duration::from_millis(100)) {
-                    while let Ok(ev) = rx.try_recv() {
-                        if shutdown_ev.is_set() {
-                            break;
+                let mut delay = Duration::from_millis(5);
+                let max_delay = Duration::from_secs(1);
+                while !shutdown_ev.is_set() {
+                    match rx.recv_timeout(delay) {
+                        Ok(ev) => {
+                            handle_piece_event(
+                                ev,
+                                inflight.clone(),
+                                max_handlers,
+                                piece_manager.clone(),
+                                shutdown_ev.clone(),
+                                tpool.clone(),
+                                false,
+                            );
                         }
-
-                        let cur = inflight.load(Ordering::Relaxed);
-                        if cur < max_handlers {
-                            inflight.fetch_add(1, Ordering::SeqCst);
-
-                            let inflight = inflight.clone();
-                            let piece_manager = piece_manager.clone();
-                            let ev = ev.clone();
-                            let shutdown_ev = shutdown_ev.clone();
-                            tpool.execute(move || {
-                                if shutdown_ev.is_set() {
-                                    inflight.fetch_sub(1, Ordering::SeqCst);
-                                    return;
-                                }
-
-                                let mut piece_manager = piece_manager.write().unwrap();
-                                piece_manager.handle_event(ev);
-                                drop(piece_manager);
-                                inflight.fetch_sub(1, Ordering::SeqCst);
-                            });
-                        } else {
-                            let mut piece_manager = piece_manager.write().unwrap();
-                            piece_manager.handle_event(ev);
+                        Err(ref e) if matches!(e, QueueError::Timeout) => {
+                            delay = (delay * 2).min(max_delay)
+                        }
+                        Err(ref e) if matches!(e, QueueError::ClosedRecv) => {
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("socket event recv error: {e}");
                         }
                     }
                 }
+
+                // Drain events
+                eprintln!("draining piece events...");
+                while let Ok(ev) = rx.try_recv() {
+                    handle_piece_event(
+                        ev,
+                        inflight.clone(),
+                        max_handlers,
+                        piece_manager.clone(),
+                        shutdown_ev.clone(),
+                        tpool.clone(),
+                        true,
+                    );
+                }
+                eprintln!("piece events drained!");
             });
         }
         {
@@ -445,12 +452,15 @@ impl TorrentClient {
     /// waiting for completion.
     pub fn stop(&self) {
         self.shutdown_ev.set();
+        /*
         self.peer_event.close();
         self.piece_event.close();
         self.client_event.close();
+        */
         let mut socket_manger = self.socket_manager.lock().unwrap();
         socket_manger.close();
         drop(socket_manger);
+        self.tpool.close();
     }
 
     pub fn get_thread_worker_count(&self) -> usize {
@@ -487,4 +497,133 @@ fn generate_peer_id() -> [u8; 20] {
     }
 
     peer_id
+}
+
+fn handle_client_event(
+    ev: &ClientEvent,
+    torrent: &Torrent,
+    state: &RwLock<TorrentState>,
+    peer_manager: &PeerManager,
+) {
+    match ev {
+        ClientEvent::PieceVerificationFailure {
+            piece_index: _,
+            data_size,
+        } => {
+            let total_size = torrent.info.total_size;
+            let mut state = state.write().unwrap();
+            state.downloaded = state.downloaded.saturating_sub(*data_size as u64);
+            state.left = total_size.saturating_sub(state.downloaded);
+        }
+        ClientEvent::PeersChanged => {
+            let mut state = state.write().unwrap();
+            state.connected_peers = peer_manager.connected_peers();
+            state.peers = peer_manager.peer_count();
+        }
+        ClientEvent::PieceVerified { piece_index } => {
+            torrent.info.set_bitfield_index(*piece_index);
+        }
+        ClientEvent::WriteToDisk {
+            piece_index,
+            begin,
+            data,
+        } => {
+            if let Err(e) = torrent.write_to_disk(*piece_index, *begin, data) {
+                eprintln!("failed to write block to disk: {e}");
+            }
+            let total_size = torrent.info.total_size;
+            let mut state = state.write().unwrap();
+            state.downloaded += data.len() as u64;
+            state.left = total_size.saturating_sub(state.downloaded);
+        }
+    }
+}
+
+fn handle_peer_event(
+    ev: Arc<PeerEvent>,
+    inflight: Arc<AtomicUsize>,
+    max_handlers: usize,
+    peer_manager: Arc<PeerManager>,
+    shutdown_ev: Arc<ManualResetEvent>,
+    tpool: Arc<ThreadPool>,
+    peer_id: [u8; 20],
+    sync: bool,
+) {
+    if sync {
+        eprintln!("handling peer event: {ev:?}");
+        peer_manager.handle_event(ev, peer_id);
+        return;
+    }
+    let is_connect_related = matches!(
+        *ev,
+        PeerEvent::ConnectFailure { .. }
+            | PeerEvent::SocketDisconnect { .. }
+            | PeerEvent::PeerConnected { .. }
+            | PeerEvent::NewPeers { .. }
+    );
+
+    if is_connect_related {
+        let cur = inflight.load(Ordering::Relaxed);
+        if cur < max_handlers {
+            inflight.fetch_add(1, Ordering::SeqCst);
+
+            let peer_manager = peer_manager.clone();
+            let inflight = inflight.clone();
+            let shutdown_ev = shutdown_ev.clone();
+            let ev = ev.clone();
+
+            tpool.execute(move || {
+                if shutdown_ev.is_set() {
+                    inflight.fetch_sub(1, Ordering::SeqCst);
+                    return;
+                }
+
+                peer_manager.handle_event(ev, peer_id);
+            });
+        } else {
+            peer_manager.handle_event(ev, peer_id);
+        }
+    } else {
+        peer_manager.handle_event(ev, peer_id);
+    }
+}
+
+fn handle_piece_event(
+    ev: Arc<PieceEvent>,
+    inflight: Arc<AtomicUsize>,
+    max_handlers: usize,
+    piece_manager: Arc<RwLock<PieceManager>>,
+    shutdown_ev: Arc<ManualResetEvent>,
+    tpool: Arc<ThreadPool>,
+    sync: bool,
+) {
+    if sync {
+        eprintln!("handling piece event: {ev:?}");
+        let mut piece_manager = piece_manager.write().unwrap();
+        piece_manager.handle_event(ev);
+        return;
+    }
+    let cur = inflight.load(Ordering::Relaxed);
+    if cur < max_handlers {
+        inflight.fetch_add(1, Ordering::SeqCst);
+
+        let inflight = inflight.clone();
+        let piece_manager = piece_manager.clone();
+        let ev = ev.clone();
+        let shutdown_ev = shutdown_ev.clone();
+        tpool.execute(move || {
+            if shutdown_ev.is_set() {
+                inflight.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+
+            let mut piece_manager = piece_manager.write().unwrap();
+            piece_manager.handle_event(ev);
+            drop(piece_manager);
+            inflight.fetch_sub(1, Ordering::SeqCst);
+        });
+    } else {
+        let mut piece_manager = piece_manager.write().unwrap();
+        piece_manager.handle_event(ev);
+    }
 }

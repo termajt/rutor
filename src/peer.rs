@@ -464,7 +464,7 @@ impl PeerManager {
         })
     }
 
-    fn data_received(&self, addr: &SocketAddr, data: &[u8]) {
+    pub fn data_received(&self, addr: &SocketAddr, data: &[u8]) {
         let mut state = self.state.write().unwrap();
         let mut piece_events = Vec::new();
         let mut peer_events = Vec::new();
@@ -738,9 +738,6 @@ impl PeerManager {
                 if let Some(msg) = message_opt {
                     let _ = self.socket_tx.send(msg);
                 }
-            }
-            PeerEvent::SocketData { addr, data } => {
-                self.data_received(addr, &data);
             }
             PeerEvent::SocketDisconnect { addr } => {
                 self.mark_disconnected(addr);

@@ -145,7 +145,7 @@ impl ProgressTracker {
 
     fn display(&self, first_draw: bool) {
         if !first_draw {
-            let max = if self.show_consumption { 7 } else { 6 } + self.files.len();
+            let max = if self.show_consumption { 6 } else { 5 } + self.files.len();
             for _ in 0..max {
                 print!("\r\x1B[1A\x1b[2K");
             }
@@ -160,8 +160,7 @@ impl ProgressTracker {
         let white = "\x1b[97m";
         let reset = "\x1b[0m";
 
-        println!("{}Name:{} {}", cyan, reset, self.name);
-        println!("{}Files:{}", cyan, reset);
+        println!("{}{}:{}", cyan, self.name, reset);
         for file in self.files.iter() {
             println!("  {}•{} {}", gray, reset, file);
         }

@@ -1,33 +1,11 @@
 use std::{
     fmt,
     sync::{Arc, Condvar, Mutex},
-    thread,
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
-
-struct WorkerHandle {
-    thread: Option<thread::JoinHandle<()>>,
-    idle_flag: Arc<(Mutex<bool>, Condvar)>,
-    alive: Arc<Mutex<bool>>,
-}
-
-struct PoolState {
-    jobs: Mutex<Vec<Job>>,
-    workers: Mutex<Vec<WorkerHandle>>,
-    available: Condvar,
-}
-
-impl fmt::Debug for PoolState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PoolState")
-            .field("jobs", &self.jobs.lock().unwrap().len())
-            .field("workers", &self.workers.lock().unwrap().len())
-            .field("available", &self.available)
-            .finish()
-    }
-}
 
 /// A dynamically-scaling thread pool with an idle timeout.
 ///
@@ -37,11 +15,22 @@ impl fmt::Debug for PoolState {
 /// - Terminate idle threads after `idle_timeout`.
 ///
 /// When dropped, the pool gracefully stops all workers and waits for them to exit.
-#[derive(Debug)]
 pub struct ThreadPool {
-    state: Arc<PoolState>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+    jobs: Arc<Mutex<Vec<Job>>>,
+    available: Arc<Condvar>,
     max_workers: usize,
     idle_timeout: Duration,
+    shutting_down: Arc<Mutex<bool>>,
+}
+
+impl fmt::Debug for ThreadPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThreadPool")
+            .field("jobs_count", &self.jobs.lock().unwrap().len())
+            .field("worker_count", &self.workers.lock().unwrap().len())
+            .finish()
+    }
 }
 
 impl ThreadPool {
@@ -92,14 +81,13 @@ impl ThreadPool {
     /// Panics if `max_workers` is 0.
     pub fn with_capacity_and_timeout(max_workers: usize, idle_timeout: Duration) -> Self {
         assert!(max_workers > 0);
-        ThreadPool {
-            state: Arc::new(PoolState {
-                jobs: Mutex::new(Vec::new()),
-                workers: Mutex::new(Vec::new()),
-                available: Condvar::new(),
-            }),
+        Self {
+            workers: Mutex::new(Vec::new()),
+            jobs: Arc::new(Mutex::new(Vec::new())),
+            available: Arc::new(Condvar::new()),
             max_workers: max_workers,
             idle_timeout: idle_timeout,
+            shutting_down: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -116,33 +104,22 @@ impl ThreadPool {
     where
         F: FnOnce() + Send + 'static,
     {
-        {
-            let mut jobs = self.state.jobs.lock().unwrap();
-            jobs.push(Box::new(f));
-        }
+        let mut jobs = self.jobs.lock().unwrap();
+        jobs.push(Box::new(f));
+        drop(jobs);
+        self.available.notify_one();
 
-        let mut workers = self.state.workers.lock().unwrap();
-        self.cleanup_dead_workers(&mut workers);
-
-        let idle_worker = workers.iter().find(|w| *w.idle_flag.0.lock().unwrap());
-        if let Some(w) = idle_worker {
-            w.idle_flag.1.notify_one();
-        } else if workers.len() < self.max_workers {
-            let idle_flag = Arc::new((Mutex::new(false), Condvar::new()));
-            let state = self.state.clone();
-            let idle_clone = idle_flag.clone();
-            let alive = Arc::new(Mutex::new(true));
-            let alive_clone = alive.clone();
+        let mut workers = self.workers.lock().unwrap();
+        if workers.len() < self.max_workers {
+            let shutting_down = self.shutting_down.clone();
+            let jobs = self.jobs.clone();
+            let available = self.available.clone();
             let timeout = self.idle_timeout;
-            let thread =
-                thread::spawn(move || worker_loop(state, idle_clone, alive_clone, timeout));
-            workers.push(WorkerHandle {
-                thread: Some(thread),
-                idle_flag: idle_flag,
-                alive: alive,
+
+            let handle = thread::spawn(move || {
+                worker_loop(jobs, available, timeout, shutting_down);
             });
-        } else {
-            self.state.available.notify_one();
+            workers.push(handle);
         }
     }
 
@@ -150,75 +127,63 @@ impl ThreadPool {
     ///
     /// This automatically removes terminated workers before counting.
     pub fn worker_count(&self) -> usize {
-        let mut workers = self.state.workers.lock().unwrap();
-        self.cleanup_dead_workers(&mut workers);
+        let workers = self.workers.lock().unwrap();
         workers.len()
     }
 
-    fn cleanup_dead_workers(&self, workers: &mut Vec<WorkerHandle>) {
-        workers.retain(|w| *w.alive.lock().unwrap());
+    pub fn close(&self) {
+        {
+            let mut shutting_down = self.shutting_down.lock().unwrap();
+            if *shutting_down {
+                return;
+            }
+            *shutting_down = true;
+        }
+
+        self.available.notify_all();
+
+        let mut workers = self.workers.lock().unwrap();
+        while let Some(handle) = workers.pop() {
+            let _ = handle.join();
+        }
     }
 }
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        let mut workers = self.state.workers.lock().unwrap();
-        for mut w in workers.drain(..) {
-            *w.alive.lock().unwrap() = false;
-            w.idle_flag.1.notify_all();
-            if let Some(thread) = w.thread.take() {
-                let _ = thread.join();
-            }
-        }
+        self.close();
     }
 }
 
 fn worker_loop(
-    state: Arc<PoolState>,
-    idle_flag: Arc<(Mutex<bool>, Condvar)>,
-    alive: Arc<Mutex<bool>>,
-    timeout: Duration,
+    jobs: Arc<Mutex<Vec<Job>>>,
+    available: Arc<Condvar>,
+    idle_timeout: Duration,
+    shutting_down: Arc<Mutex<bool>>,
 ) {
     loop {
-        let job = {
-            let mut jobs = state.jobs.lock().unwrap();
-            loop {
-                if let Some(job) = jobs.pop() {
-                    break Some(job);
+        let job_opt = {
+            let mut jobs_guard = jobs.lock().unwrap();
+
+            while jobs_guard.is_empty() {
+                let shutting_down_guard = shutting_down.lock().unwrap();
+                if *shutting_down_guard {
+                    return;
                 }
+                drop(shutting_down_guard);
 
-                {
-                    let alive = alive.lock().unwrap();
-                    if !*alive {
-                        return;
-                    }
-                }
+                let (guard, timeout_res) =
+                    available.wait_timeout(jobs_guard, idle_timeout).unwrap();
+                jobs_guard = guard;
 
-                {
-                    let mut idle = idle_flag.0.lock().unwrap();
-                    *idle = true;
-                }
-
-                let (lock, timeout_result) = idle_flag.1.wait_timeout(jobs, timeout).unwrap();
-                jobs = lock;
-
-                {
-                    let mut idle = idle_flag.0.lock().unwrap();
-                    *idle = false;
-                }
-
-                if timeout_result.timed_out() {
-                    {
-                        let mut alive = alive.lock().unwrap();
-                        *alive = false;
-                    }
+                if timeout_res.timed_out() && jobs_guard.is_empty() {
                     return;
                 }
             }
+            jobs_guard.pop()
         };
-        if let Some(job) = job {
+        if let Some(job) = job_opt {
             job();
-            state.available.notify_one();
         }
     }
 }
