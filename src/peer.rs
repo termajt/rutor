@@ -4,7 +4,7 @@ use std::{
     hash::Hash,
     io::{Read, Write},
     net::{SocketAddr, TcpStream},
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, mpsc::Sender},
     time::{Duration, Instant},
 };
 
@@ -13,7 +13,6 @@ use crate::{
     consts::{self, ClientEvent, PeerEvent, PieceEvent},
     pool::ThreadPool,
     pubsub::PubSub,
-    queue::Sender,
     socketmanager::{Command, Socket},
     torrent::Torrent,
 };
@@ -435,7 +434,6 @@ pub struct PeerManager {
     peer_event_tx: Arc<PubSub<PeerEvent>>,
     piece_event_tx: Arc<PubSub<PieceEvent>>,
     client_event_tx: Arc<PubSub<ClientEvent>>,
-    socket_tx: Arc<Sender<Command>>,
     max_connections: Arc<usize>,
     state: Arc<RwLock<PeerManagerState>>,
 }
@@ -450,7 +448,6 @@ impl PeerManager {
         peer_event_tx: Arc<PubSub<PeerEvent>>,
         piece_event_tx: Arc<PubSub<PieceEvent>>,
         client_event_tx: Arc<PubSub<ClientEvent>>,
-        socket_tx: Arc<Sender<Command>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             tpool: tpool,
@@ -458,7 +455,6 @@ impl PeerManager {
             peer_event_tx: peer_event_tx,
             piece_event_tx: piece_event_tx,
             client_event_tx: client_event_tx,
-            socket_tx: socket_tx,
             max_connections: Arc::new(max_connections),
             state: Arc::new(RwLock::new(PeerManagerState::new())),
         })
@@ -646,7 +642,12 @@ impl PeerManager {
             .collect()
     }
 
-    fn attempt_connect_peers(&self, info_hash: [u8; 20], peer_id: [u8; 20]) {
+    fn attempt_connect_peers(
+        &self,
+        info_hash: [u8; 20],
+        peer_id: [u8; 20],
+        socket_tx: Arc<Sender<Command>>,
+    ) {
         let to_connect;
         let peers_to_try: Vec<SocketAddr>;
         {
@@ -656,8 +657,8 @@ impl PeerManager {
             state.pending += peers_to_try.len();
         }
         for addr in peers_to_try {
-            let socket_tx = self.socket_tx.clone();
             let peer_event_tx = self.peer_event_tx.clone();
+            let socket_tx = socket_tx.clone();
             self.tpool
                 .execute(move || match connect_peer(addr, &info_hash, &peer_id) {
                     Ok((peer_id, socket)) => {
@@ -712,7 +713,12 @@ impl PeerManager {
         Some(Command::Send(pcon.addr, encoded, is_critical))
     }
 
-    pub fn handle_event(&self, ev: Arc<PeerEvent>, my_peer_id: [u8; 20]) {
+    pub fn handle_event(
+        &self,
+        ev: Arc<PeerEvent>,
+        my_peer_id: [u8; 20],
+        socket_tx: Arc<Sender<Command>>,
+    ) {
         match &*ev {
             PeerEvent::SendToAll { message } => {
                 let mut messages = Vec::new();
@@ -724,7 +730,7 @@ impl PeerManager {
                 }
                 drop(state);
                 for msg in messages {
-                    let _ = self.socket_tx.send(msg);
+                    let _ = socket_tx.send(msg);
                 }
             }
             PeerEvent::Send { addr, message } => {
@@ -735,7 +741,7 @@ impl PeerManager {
                 }
                 drop(state);
                 if let Some(msg) = message_opt {
-                    let _ = self.socket_tx.send(msg);
+                    let _ = socket_tx.send(msg);
                 }
             }
             PeerEvent::SocketDisconnect { addr } => {
@@ -743,28 +749,28 @@ impl PeerManager {
                 let torrent = self.torrent.read().unwrap();
                 let info_hash = torrent.info_hash;
                 drop(torrent);
-                self.attempt_connect_peers(info_hash, my_peer_id);
+                self.attempt_connect_peers(info_hash, my_peer_id, socket_tx);
             }
             PeerEvent::ConnectFailure { addr } => {
                 self.mark_failed(addr);
                 let torrent = self.torrent.read().unwrap();
                 let info_hash = torrent.info_hash;
                 drop(torrent);
-                self.attempt_connect_peers(info_hash, my_peer_id);
+                self.attempt_connect_peers(info_hash, my_peer_id, socket_tx);
             }
             PeerEvent::NewPeers { peers } => {
                 self.add_peers(peers);
                 let torrent = self.torrent.read().unwrap();
                 let info_hash = torrent.info_hash;
                 drop(torrent);
-                self.attempt_connect_peers(info_hash, my_peer_id);
+                self.attempt_connect_peers(info_hash, my_peer_id, socket_tx);
             }
             PeerEvent::PeerConnected { addr, peer_id } => {
                 self.mark_connected(addr, peer_id);
                 let torrent = self.torrent.read().unwrap();
                 let info_hash = torrent.info_hash;
                 drop(torrent);
-                self.attempt_connect_peers(info_hash, my_peer_id);
+                self.attempt_connect_peers(info_hash, my_peer_id, socket_tx);
             }
         }
     }

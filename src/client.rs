@@ -3,6 +3,7 @@ use std::{
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicUsize, Ordering},
+        mpsc::{self, Sender},
     },
     time::Duration,
 };
@@ -18,7 +19,6 @@ use crate::{
     piece::PieceManager,
     pool::ThreadPool,
     pubsub::PubSub,
-    queue::{Queue, QueueError, Receiver},
     socketmanager::{Command, SocketManager},
     torrent::Torrent,
 };
@@ -82,7 +82,6 @@ pub struct TorrentClient {
     socket_manager: Arc<Mutex<SocketManager>>,
     client_event: Arc<PubSub<ClientEvent>>,
     peer_event: Arc<PubSub<PeerEvent>>,
-    socket_rx: Arc<Receiver<Command>>,
     piece_event: Arc<PubSub<PieceEvent>>,
     shutdown_ev: Arc<ManualResetEvent>,
     started: Mutex<bool>,
@@ -104,8 +103,6 @@ impl TorrentClient {
             .unwrap_or(cores);
         let thread_workers = (workers * 2).min(64);
         let tpool = Arc::new(ThreadPool::with_capacity(thread_workers));
-        let (socket_tx, socket_rx) = Queue::new(None);
-        let (socket_tx, socket_rx) = (Arc::new(socket_tx), Arc::new(socket_rx));
         let client_event = Arc::new(PubSub::new());
         let peer_event = Arc::new(PubSub::new());
         let piece_event = Arc::new(PubSub::new());
@@ -116,7 +113,6 @@ impl TorrentClient {
             peer_event.clone(),
             piece_event.clone(),
             client_event.clone(),
-            socket_tx.clone(),
         )?);
         let piece_manager = Arc::new(RwLock::new(PieceManager::new(
             torrent.clone(),
@@ -137,7 +133,6 @@ impl TorrentClient {
             socket_manager: socket_manager,
             client_event: client_event,
             peer_event: peer_event,
-            socket_rx: socket_rx,
             piece_event: piece_event,
             shutdown_ev: Arc::new(ManualResetEvent::new(false)),
             started: Mutex::new(false),
@@ -176,15 +171,7 @@ impl TorrentClient {
                         handle_client_event(&ev, torrent.clone(), &state, &peer_manager);
                         delay = Duration::from_millis(5);
                     }
-                    Err(ref e) if matches!(e, QueueError::Timeout) => {
-                        delay = (delay * 2).min(max_delay)
-                    }
-                    Err(ref e) if matches!(e, QueueError::ClosedRecv) => {
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!("client event recv error: {e}");
-                    }
+                    Err(_) => delay = (delay * 2).min(max_delay),
                 }
             }
             // Drain events
@@ -210,9 +197,9 @@ impl TorrentClient {
     }
 
     fn start_threads(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.start_socket_manager()?;
+        let socket_tx = self.start_socket_manager()?;
         let max_handlers = std::cmp::max(2, self.tpool.max_workers());
-        self.start_peer_manager(max_handlers)?;
+        self.start_peer_manager(max_handlers, socket_tx)?;
         self.start_piece_manager(max_handlers)?;
         self.start_announce_thread();
         Ok(())
@@ -278,12 +265,12 @@ impl TorrentClient {
         });
     }
 
-    fn start_socket_manager(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn start_socket_manager(&self) -> Result<Arc<Sender<Command>>, Box<dyn std::error::Error>> {
         let socket_manager = self.socket_manager.clone();
         let peer_event_tx = self.peer_event.clone();
-        let (data_tx, data_rx) = Queue::new(None);
-        let socket_rx = self.socket_rx.clone();
         let shutdown_ev = self.shutdown_ev.clone();
+        let (socket_tx, socket_rx) = mpsc::channel();
+        let (data_tx, data_rx) = mpsc::channel();
         self.tpool.execute(move || {
             while !shutdown_ev.is_set() {
                 let mut socket_manager = socket_manager.lock().unwrap();
@@ -316,22 +303,18 @@ impl TorrentClient {
                         peer_manager.data_received(&addr, &data);
                         delay = Duration::from_millis(5);
                     }
-                    Err(ref e) if matches!(e, QueueError::Timeout) => {
-                        delay = (delay * 2).min(max_delay)
-                    }
-                    Err(ref e) if matches!(e, QueueError::ClosedRecv) => {
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!("socket event recv error: {e}");
-                    }
+                    Err(_) => delay = (delay * 2).min(max_delay),
                 }
             }
         });
-        Ok(())
+        Ok(Arc::new(socket_tx))
     }
 
-    fn start_peer_manager(&self, max_handlers: usize) -> Result<(), Box<dyn std::error::Error>> {
+    fn start_peer_manager(
+        &self,
+        max_handlers: usize,
+        socket_tx: Arc<Sender<Command>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let peer_manager = self.peer_manager.clone();
         let peer_id = self.peer_id;
         let peer_event_rx = self.peer_event.subscribe(consts::TOPIC_PEER_EVENT)?;
@@ -352,18 +335,11 @@ impl TorrentClient {
                             shutdown_ev.clone(),
                             tpool.clone(),
                             peer_id,
+                            socket_tx.clone(),
                             false,
                         );
                     }
-                    Err(ref e) if matches!(e, QueueError::Timeout) => {
-                        delay = (delay * 2).min(max_delay)
-                    }
-                    Err(ref e) if matches!(e, QueueError::ClosedRecv) => {
-                        return;
-                    }
-                    Err(e) => {
-                        eprintln!("socket event recv error: {e}");
-                    }
+                    Err(_) => delay = (delay * 2).min(max_delay),
                 }
             }
 
@@ -378,6 +354,7 @@ impl TorrentClient {
                     shutdown_ev.clone(),
                     tpool.clone(),
                     peer_id,
+                    socket_tx.clone(),
                     true,
                 );
             }
@@ -409,15 +386,7 @@ impl TorrentClient {
                                 false,
                             );
                         }
-                        Err(ref e) if matches!(e, QueueError::Timeout) => {
-                            delay = (delay * 2).min(max_delay)
-                        }
-                        Err(ref e) if matches!(e, QueueError::ClosedRecv) => {
-                            return;
-                        }
-                        Err(e) => {
-                            eprintln!("socket event recv error: {e}");
-                        }
+                        Err(_) => delay = (delay * 2).min(max_delay),
                     }
                 }
 
@@ -571,11 +540,12 @@ fn handle_peer_event(
     shutdown_ev: Arc<ManualResetEvent>,
     tpool: Arc<ThreadPool>,
     peer_id: [u8; 20],
+    socket_tx: Arc<Sender<Command>>,
     sync: bool,
 ) {
     if sync {
         eprintln!("handling peer event: {ev:?}");
-        peer_manager.handle_event(ev, peer_id);
+        peer_manager.handle_event(ev, peer_id, socket_tx);
         return;
     }
     let is_connect_related = matches!(
@@ -595,6 +565,7 @@ fn handle_peer_event(
             let inflight = inflight.clone();
             let shutdown_ev = shutdown_ev.clone();
             let ev = ev.clone();
+            let socket_tx = socket_tx.clone();
 
             tpool.execute(move || {
                 if shutdown_ev.is_set() {
@@ -602,13 +573,13 @@ fn handle_peer_event(
                     return;
                 }
 
-                peer_manager.handle_event(ev, peer_id);
+                peer_manager.handle_event(ev, peer_id, socket_tx);
             });
         } else {
-            peer_manager.handle_event(ev, peer_id);
+            peer_manager.handle_event(ev, peer_id, socket_tx);
         }
     } else {
-        peer_manager.handle_event(ev, peer_id);
+        peer_manager.handle_event(ev, peer_id, socket_tx);
     }
 }
 

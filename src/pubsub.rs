@@ -1,9 +1,9 @@
-use crate::queue::{Queue, Receiver, Sender};
 use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
     },
 };
 
@@ -27,7 +27,7 @@ impl<T: Send + Sync + 'static> PubSub<T> {
         if self.closed.load(Ordering::Relaxed) {
             return Err("PubSub closed".into());
         }
-        let (tx, rx) = Queue::new(None);
+        let (tx, rx) = mpsc::channel();
         let mut topics = self.topics.lock().unwrap();
         topics.entry(topic.to_string()).or_default().push(tx);
         Ok(rx)
@@ -50,11 +50,6 @@ impl<T: Send + Sync + 'static> PubSub<T> {
 
     pub fn close(&self) {
         let mut topics = self.topics.lock().unwrap();
-        for subscribers in topics.values() {
-            for subscriber in subscribers {
-                subscriber.close();
-            }
-        }
         topics.clear();
     }
 }

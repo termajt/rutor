@@ -10,6 +10,5 @@ pub mod picker;
 pub mod piece;
 pub mod pool;
 pub mod pubsub;
-pub mod queue;
 pub mod socketmanager;
 pub mod torrent;

@@ -4,14 +4,13 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     os::fd::{AsRawFd, RawFd},
     ptr,
+    sync::mpsc::{Receiver, Sender},
 };
 
 use libc::{
     EPOLL_CTL_ADD, EPOLL_CTL_DEL, EPOLL_CTL_MOD, EPOLLET, EPOLLIN, EPOLLOUT, F_SETFL, O_NONBLOCK,
     epoll_create1, epoll_ctl, epoll_event, epoll_wait, fcntl,
 };
-
-use crate::queue::{Receiver, Sender};
 
 /// Commands sent to the `SocketManager` from other threads.
 #[derive(Debug)]
