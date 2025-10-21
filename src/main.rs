@@ -69,6 +69,7 @@ impl ProgressTracker {
 
     fn format_bar(&self, downloaded: u64) -> String {
         let progress = downloaded as f64 / self.total_size as f64;
+        let percent = (progress * 100.0).floor() as usize;
         let bar_width = get_bar_width();
         let filled_blocks = (progress * bar_width as f64).floor() as usize;
         let remainder = progress * bar_width as f64 - filled_blocks as f64;
@@ -101,10 +102,7 @@ impl ProgressTracker {
         // Rounded/circular brackets
         format!(
             "[{}{}{}] {:>3}%",
-            filled_str,
-            partial_str,
-            empty_str,
-            (progress * 100.0).round() as usize
+            filled_str, partial_str, empty_str, percent
         )
     }
 
@@ -147,7 +145,10 @@ impl ProgressTracker {
 
     fn display(&self, first_draw: bool) {
         if !first_draw {
-            let max = if self.show_consumption { 6 } else { 5 } + self.files.len();
+            let mut max = if self.show_consumption { 6 } else { 5 };
+            if self.files.len() > 1 {
+                max += self.files.len();
+            }
             for _ in 0..max {
                 print!("\r\x1B[1A\x1b[2K");
             }
@@ -162,37 +163,46 @@ impl ProgressTracker {
         let white = "\x1b[97m";
         let reset = "\x1b[0m";
 
-        println!("{}{}:{}", cyan, self.name, reset);
-        for (path, written, total_size) in &self.files {
-            println!(
-                "  {}•{}{} {} / {}",
-                gray,
-                path.file_name().unwrap().to_str().unwrap(),
-                reset,
-                self.human_bytes(*written),
-                self.human_bytes(*total_size)
-            );
+        if self.files.len() == 1 {
+            println!("📦 {}{}{}", cyan, self.name, reset);
+        } else {
+            println!("📦 {}{}{}", cyan, self.name, reset);
+            for (path, written, total_size) in &self.files {
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("[unknown]");
+                println!(
+                    "  {}• {}{} {} / {}",
+                    gray,
+                    file_name,
+                    reset,
+                    self.human_bytes(*written),
+                    self.human_bytes(*total_size)
+                );
+            }
         }
         println!(
-            "{}Downloaded:{} {} / {} at {}{}/s{}, ETA: {}{}{}",
+            "{0}{1:<10}:{2} {3} / {4} @ {5}{6}/s{7} ETA: {8}{9}{10}",
             green,
+            "Downloaded",
             reset,
             self.human_bytes(self.prev_downloaded),
             self.human_bytes(self.total_size),
             yellow,
             self.human_bytes(self.download_speed as u64),
             reset,
-            magenta,
             self.format_eta(self.eta),
-            reset
+            reset,
+            magenta,
         );
         println!(
-            "{}Peers:{} {} (C) / {} (A)",
-            blue, reset, self.connected_peers, self.all_peers
+            "{0}{1:<10}:{2} {3} (C) / {4} (A)",
+            blue, "Peers", reset, self.connected_peers, self.all_peers
         );
         println!(
-            "{}Pieces:{} {} / {}",
-            white, reset, self.pieces_verified, self.total_pieces
+            "{0}{1:<10}:{2} {3} / {4}",
+            white, "Pieces", reset, self.pieces_verified, self.total_pieces
         );
         println!("{}", self.format_bar(self.prev_downloaded));
         if self.show_consumption {

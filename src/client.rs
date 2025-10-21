@@ -180,6 +180,7 @@ impl TorrentClient {
                 handle_client_event(&ev, torrent.clone(), &state, &peer_manager);
             }
             eprintln!("client events drained!");
+            eprintln!("client events thread returning!");
         });
         let state = self.state.clone();
         let shutdown_ev = self.shutdown_ev.clone();
@@ -192,6 +193,7 @@ impl TorrentClient {
                 state.download_speed.update(downloaded_now as usize);
                 drop(state);
             }
+            eprintln!("download speed thread returning!");
         });
         Ok(())
     }
@@ -262,6 +264,7 @@ impl TorrentClient {
                     );
                 }
             }
+            eprintln!("announce thread returning!");
         });
     }
 
@@ -290,6 +293,7 @@ impl TorrentClient {
                     let _ = peer_event_tx.publish(consts::TOPIC_PEER_EVENT, event);
                 }
             }
+            eprintln!("socket manager thread returning!");
         });
         // let peer_event_tx = self.peer_event.clone();
         let shutdown_ev = self.shutdown_ev.clone();
@@ -306,6 +310,7 @@ impl TorrentClient {
                     Err(_) => delay = (delay * 2).min(max_delay),
                 }
             }
+            eprintln!("socket data thread returning!");
         });
         Ok(Arc::new(socket_tx))
     }
@@ -359,6 +364,7 @@ impl TorrentClient {
                 );
             }
             eprintln!("peer events drained!");
+            eprintln!("peer events thread returning!");
         });
         Ok(())
     }
@@ -404,6 +410,7 @@ impl TorrentClient {
                     );
                 }
                 eprintln!("piece events drained!");
+                eprintln!("piece events thread returning!");
             });
         }
         {
@@ -415,6 +422,7 @@ impl TorrentClient {
                     piece_manager.run_piece_selection_once();
                     drop(piece_manager);
                 }
+                eprintln!("piece selection thread returning!");
             });
         }
         Ok(())
@@ -433,18 +441,21 @@ impl TorrentClient {
     /// Sets the shutdown flag and signals any condition variables
     /// waiting for completion.
     pub fn stop(&self) {
+        if self.shutdown_ev.is_set() {
+            return;
+        }
         self.shutdown_ev.set();
-        /*
-        self.peer_event.close();
-        self.piece_event.close();
-        self.client_event.close();
-        */
         let mut socket_manger = self.socket_manager.lock().unwrap();
         socket_manger.close();
         drop(socket_manger);
+        eprintln!("socket manager closed!");
+        eprintln!("closing threadpool...");
         self.tpool.close();
+        eprintln!("threadpool closed and joined!");
+        eprintln!("closing torrent...");
         let torrent = self.torrent.read().unwrap();
         torrent.close();
+        eprintln!("torrent closed and flushed!");
     }
 
     pub fn get_thread_worker_count(&self) -> usize {
