@@ -8,10 +8,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+use threadpool::ThreadPool;
+
 use crate::{
     bitfield::Bitfield,
     consts::{self, ClientEvent, PeerEvent, PieceEvent},
-    pool::ThreadPool,
     pubsub::PubSub,
     socketmanager::{Command, Socket},
     torrent::Torrent,

@@ -8,7 +8,6 @@ pub mod event;
 pub mod peer;
 pub mod picker;
 pub mod piece;
-pub mod pool;
 pub mod pubsub;
 pub mod socketmanager;
 pub mod torrent;

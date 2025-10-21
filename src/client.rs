@@ -9,6 +9,7 @@ use std::{
 };
 
 use rand::{Rng, distr::Alphanumeric};
+use threadpool::ThreadPool;
 
 use crate::{
     announce::{self, AnnounceManager},
@@ -17,7 +18,6 @@ use crate::{
     event::ManualResetEvent,
     peer::PeerManager,
     piece::PieceManager,
-    pool::ThreadPool,
     pubsub::PubSub,
     socketmanager::{Command, SocketManager},
     torrent::Torrent,
@@ -102,7 +102,7 @@ impl TorrentClient {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(cores);
         let thread_workers = (workers * 2).min(64);
-        let tpool = Arc::new(ThreadPool::with_capacity(thread_workers));
+        let tpool = Arc::new(ThreadPool::new(thread_workers));
         let client_event = Arc::new(PubSub::new());
         let peer_event = Arc::new(PubSub::new());
         let piece_event = Arc::new(PubSub::new());
@@ -200,7 +200,7 @@ impl TorrentClient {
 
     fn start_threads(&self) -> Result<(), Box<dyn std::error::Error>> {
         let socket_tx = self.start_socket_manager()?;
-        let max_handlers = std::cmp::max(2, self.tpool.max_workers());
+        let max_handlers = std::cmp::max(2, self.tpool.max_count());
         self.start_peer_manager(max_handlers, socket_tx)?;
         self.start_piece_manager(max_handlers)?;
         self.start_announce_thread();
@@ -450,7 +450,7 @@ impl TorrentClient {
         drop(socket_manger);
         eprintln!("socket manager closed!");
         eprintln!("closing threadpool...");
-        self.tpool.close();
+        self.tpool.join();
         eprintln!("threadpool closed and joined!");
         eprintln!("closing torrent...");
         let torrent = self.torrent.read().unwrap();
@@ -459,7 +459,7 @@ impl TorrentClient {
     }
 
     pub fn get_thread_worker_count(&self) -> usize {
-        self.tpool.worker_count()
+        self.tpool.active_count()
     }
 
     pub fn get_state(&self) -> TorrentState {
