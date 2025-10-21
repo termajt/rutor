@@ -1,4 +1,5 @@
 use std::{
+    path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicUsize, Ordering},
@@ -71,7 +72,7 @@ impl TorrentState {
 /// state through shared synchronization primitives.
 pub struct TorrentClient {
     /// Shared reference to the [`Torrent`] metadata and info.
-    pub torrent: Arc<Torrent>,
+    torrent: Arc<RwLock<Torrent>>,
     state: Arc<RwLock<TorrentState>>,
     tpool: Arc<ThreadPool>,
     peer_id: [u8; 20],
@@ -92,7 +93,7 @@ impl TorrentClient {
     ///
     /// Initializes shared state, thread pool, and generates a unique peer ID.
     pub fn new(torrent: Torrent) -> Result<Self, Box<dyn std::error::Error>> {
-        let torrent = Arc::new(torrent);
+        let torrent = Arc::new(RwLock::new(torrent));
         let peer_id = generate_peer_id();
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -123,7 +124,7 @@ impl TorrentClient {
             peer_event.clone(),
             client_event.clone(),
         )));
-        let announce_manager = Arc::new(Mutex::new(AnnounceManager::new(&torrent)));
+        let announce_manager = Arc::new(Mutex::new(AnnounceManager::new(torrent.clone())));
         let socket_manager = Arc::new(Mutex::new(SocketManager::new()?));
         Ok(Self {
             torrent: torrent,
@@ -141,6 +142,15 @@ impl TorrentClient {
             shutdown_ev: Arc::new(ManualResetEvent::new(false)),
             started: Mutex::new(false),
         })
+    }
+
+    pub fn file_status(&self) -> Vec<(PathBuf, u64, u64)> {
+        let torrent = self.torrent.read().unwrap();
+        let mut results = Vec::new();
+        for f in &torrent.info.files {
+            results.push((f.path(), f.written(), f.length()))
+        }
+        results
     }
 
     /// Starts the torrent client's background processes.
@@ -163,7 +173,7 @@ impl TorrentClient {
             while !shutdown_ev.is_set() {
                 match client_event_rx.recv_timeout(delay) {
                     Ok(ev) => {
-                        handle_client_event(&ev, &torrent, &state, &peer_manager);
+                        handle_client_event(&ev, torrent.clone(), &state, &peer_manager);
                         delay = Duration::from_millis(5);
                     }
                     Err(ref e) if matches!(e, QueueError::Timeout) => {
@@ -180,7 +190,7 @@ impl TorrentClient {
             // Drain events
             eprintln!("draining client events...");
             while let Ok(ev) = client_event_rx.try_recv() {
-                handle_client_event(&ev, &torrent, &state, &peer_manager);
+                handle_client_event(&ev, torrent.clone(), &state, &peer_manager);
             }
             eprintln!("client events drained!");
         });
@@ -209,7 +219,9 @@ impl TorrentClient {
     }
 
     fn start_announce_thread(&self) {
-        let info_hash = self.torrent.info_hash;
+        let torrent = self.torrent.read().unwrap();
+        let info_hash = torrent.info_hash;
+        drop(torrent);
         let peer_id = self.peer_id;
         let state = self.state.clone();
         let announce_manager = self.announce_manager.clone();
@@ -229,8 +241,8 @@ impl TorrentClient {
                                 .min()
                                 .unwrap_or(Duration::from_secs(30));
                             drop(manager);
+                            eprintln!("announcing again in {:?}", next_time);
                             if shutdown_ev.wait_timeout(next_time) {
-                                println!("!!");
                                 break;
                             }
                             continue;
@@ -443,7 +455,8 @@ impl TorrentClient {
         if self.shutdown_ev.is_set() {
             return true;
         }
-        self.torrent.info.is_complete()
+        let torrent = self.torrent.read().unwrap();
+        torrent.info.is_complete()
     }
 
     /// Stops the torrent client and notifies all waiting threads.
@@ -461,6 +474,8 @@ impl TorrentClient {
         socket_manger.close();
         drop(socket_manger);
         self.tpool.close();
+        let torrent = self.torrent.read().unwrap();
+        torrent.close();
     }
 
     pub fn get_thread_worker_count(&self) -> usize {
@@ -472,15 +487,18 @@ impl TorrentClient {
     }
 
     pub fn pieces_left(&self) -> usize {
-        self.torrent.info.pieces_left()
+        let torrent = self.torrent.read().unwrap();
+        torrent.info.pieces_left()
     }
 
     pub fn total_pieces(&self) -> usize {
-        self.torrent.info.piece_hashes.len()
+        let torrent = self.torrent.read().unwrap();
+        torrent.info.piece_hashes.len()
     }
 
     pub fn pieces_verified(&self) -> usize {
-        self.torrent.info.pieces_verified()
+        let torrent = self.torrent.read().unwrap();
+        torrent.info.pieces_verified()
     }
 }
 
@@ -501,7 +519,7 @@ fn generate_peer_id() -> [u8; 20] {
 
 fn handle_client_event(
     ev: &ClientEvent,
-    torrent: &Torrent,
+    torrent: Arc<RwLock<Torrent>>,
     state: &RwLock<TorrentState>,
     peer_manager: &PeerManager,
 ) {
@@ -510,7 +528,9 @@ fn handle_client_event(
             piece_index: _,
             data_size,
         } => {
+            let torrent = torrent.read().unwrap();
             let total_size = torrent.info.total_size;
+            drop(torrent);
             let mut state = state.write().unwrap();
             state.downloaded = state.downloaded.saturating_sub(*data_size as u64);
             state.left = total_size.saturating_sub(state.downloaded);
@@ -521,6 +541,7 @@ fn handle_client_event(
             state.peers = peer_manager.peer_count();
         }
         ClientEvent::PieceVerified { piece_index } => {
+            let mut torrent = torrent.write().unwrap();
             torrent.info.set_bitfield_index(*piece_index);
         }
         ClientEvent::WriteToDisk {
@@ -528,9 +549,12 @@ fn handle_client_event(
             begin,
             data,
         } => {
-            if let Err(e) = torrent.write_to_disk(*piece_index, *begin, data) {
+            let mut guard = torrent.write().unwrap();
+            if let Err(e) = guard.write_to_disk(*piece_index, *begin, data) {
                 eprintln!("failed to write block to disk: {e}");
             }
+            drop(guard);
+            let torrent = torrent.read().unwrap();
             let total_size = torrent.info.total_size;
             let mut state = state.write().unwrap();
             state.downloaded += data.len() as u64;

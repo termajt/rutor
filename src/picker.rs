@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -178,8 +178,9 @@ impl PiecePicker {
         total_size: u64,
         piece_length: usize,
         config: PickerConfig,
-        torrent: Arc<Torrent>,
+        torrent: Arc<RwLock<Torrent>>,
     ) -> Self {
+        let torrent = torrent.read().unwrap();
         let piece_count = ((total_size + piece_length as u64 - 1) / piece_length as u64) as usize;
         let mut pieces = HashMap::with_capacity(piece_count);
         for i in 0..piece_count {
@@ -199,6 +200,7 @@ impl PiecePicker {
                 ),
             );
         }
+        drop(torrent);
         Self {
             pieces: pieces,
             piece_count: piece_count,

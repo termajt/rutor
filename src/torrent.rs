@@ -5,7 +5,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufReader, Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::{Mutex, RwLock},
+    sync::Mutex,
 };
 
 use crate::{
@@ -70,12 +70,25 @@ impl FileHandleCache {
     {
         let mut handles = self.handles.lock().unwrap();
         if !handles.contains_key(path) {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             let file = OpenOptions::new().write(true).create(true).open(path)?;
             handles.insert(path.to_path_buf(), file);
         }
 
         let file = handles.get_mut(path).unwrap();
         f(file)
+    }
+
+    fn close(&self) {
+        let mut handles = self.handles.lock().unwrap();
+        for (k, f) in handles.iter_mut() {
+            if let Err(e) = f.flush() {
+                eprintln!("failed to flush file {k:?}: {e}");
+            }
+        }
+        handles.clear();
     }
 }
 
@@ -89,7 +102,30 @@ pub struct FileSlice {
 #[derive(Debug, Clone)]
 pub struct TorrentFile {
     length: u64,
-    pub path: Vec<String>,
+    path: PathBuf,
+    written: u64,
+}
+
+impl TorrentFile {
+    fn new(length: u64, path: PathBuf) -> Self {
+        Self {
+            length: length,
+            path: path,
+            written: 0,
+        }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.path.clone()
+    }
+
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    pub fn length(&self) -> u64 {
+        self.length
+    }
 }
 
 #[derive(Debug)]
@@ -99,8 +135,7 @@ pub struct TorrentInfo {
     pub piece_hashes: Vec<[u8; 20]>,
     pub total_size: u64,
     pub files: Vec<TorrentFile>,
-    bitfield: RwLock<Bitfield>,
-    destination: Option<PathBuf>,
+    bitfield: Bitfield,
     file_handle_cache: FileHandleCache,
 }
 
@@ -152,7 +187,7 @@ impl TorrentInfo {
                     .ok_or_else(|| Error::LoadError("file missing path".into()))?
                     .list()?;
 
-                let path = path_list
+                let path_list = path_list
                     .iter()
                     .map(|p| {
                         let bytes = p.bytes()?;
@@ -160,18 +195,26 @@ impl TorrentInfo {
                     })
                     .collect::<Result<Vec<_>, Error>>()?;
 
+                let mut path = PathBuf::new();
+                if let Some(ref dest) = destination {
+                    path.push(dest);
+                }
+                path.push(&name);
+                for inner_path in path_list {
+                    path.push(inner_path);
+                }
+
                 total_size += length;
-                files.push(TorrentFile {
-                    length: length,
-                    path: path,
-                });
+                files.push(TorrentFile::new(length, path));
             }
         } else if let Some(blength) = map.get(&b"length".to_vec()) {
             total_size = blength.int()? as u64;
-            files.push(TorrentFile {
-                length: total_size,
-                path: vec![name.clone()],
-            });
+            let mut path = PathBuf::new();
+            if let Some(ref dest) = destination {
+                path.push(dest);
+            }
+            path.push(&name);
+            files.push(TorrentFile::new(total_size, path));
         } else {
             return Err(Error::LoadError(
                 "neither 'length' nor 'files' present in info dict".into(),
@@ -184,129 +227,94 @@ impl TorrentInfo {
             piece_hashes: piece_hashes,
             total_size: total_size,
             files: files,
-            bitfield: RwLock::new(Bitfield::new(total_pieces)),
-            destination: destination,
+            bitfield: Bitfield::new(total_pieces),
             file_handle_cache: FileHandleCache::new(),
         })
     }
 
-    pub fn piece_file_slices(&self, piece_index: usize) -> Vec<FileSlice> {
-        let piece_length = self.piece_length as u64;
-        let piece_start = piece_index as u64 * piece_length;
-        let piece_end = ((piece_index + 1) as u64 * piece_length).min(self.total_size);
+    pub fn write_data_to_disk(
+        &mut self,
+        piece_index: usize,
+        block_offset: usize,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let piece_size = if piece_index as usize == self.piece_hashes.len() - 1 {
+            let remainder = self.total_size % self.piece_length as u64;
+            if remainder == 0 {
+                self.piece_length as u64
+            } else {
+                remainder
+            }
+        } else {
+            self.piece_length as u64
+        };
 
-        let mut slices = Vec::new();
-        let mut remaining = piece_end - piece_start;
-        let mut global_offset = 0;
-        for (i, file) in self.files.iter().enumerate() {
-            let file_end = global_offset + file.length;
-            if file_end <= piece_start {
-                global_offset = file_end;
+        if (block_offset as u64 + data.len() as u64) > piece_size {
+            return Err("piece overflow".into());
+        }
+
+        let mut offset_in_torrent =
+            piece_index as u64 * self.piece_length as u64 + block_offset as u64;
+        let mut remaining = data;
+
+        for file in self.files.iter_mut() {
+            if offset_in_torrent >= file.length {
+                offset_in_torrent -= file.length;
                 continue;
             }
 
-            if global_offset >= piece_end {
-                break;
-            }
-
-            let start_in_file = piece_start.saturating_sub(global_offset);
-            let length = (file_end.min(piece_end) - (global_offset + start_in_file)).min(remaining);
-            slices.push(FileSlice {
-                file_index: i,
-                offset_in_file: start_in_file,
-                length: length,
-            });
-            remaining -= length;
-            global_offset = file_end;
-            if remaining == 0 {
+            let write_start = offset_in_torrent as usize;
+            let write_len = std::cmp::min(file.length as usize - write_start, remaining.len());
+            self.file_handle_cache.with_file(&file.path, |f| {
+                f.seek(SeekFrom::Start(write_start as u64))?;
+                f.write_all(&remaining[..write_len])?;
+                Ok(())
+            })?;
+            file.written += write_len as u64;
+            remaining = &remaining[write_len..];
+            offset_in_torrent = 0;
+            if remaining.is_empty() {
                 break;
             }
         }
-        slices
-    }
 
-    pub fn write_data_to_disk(
-        &self,
-        piece_index: usize,
-        offset: usize,
-        data: &[u8],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut data_offset = 0;
-        for slice in self.piece_file_slices(piece_index) {
-            let file = &self.files[slice.file_index];
-            let path_str = file.path.join(&std::path::MAIN_SEPARATOR.to_string());
-            let path: PathBuf = if let Some(dest) = &self.destination {
-                dest.join(path_str)
-            } else {
-                PathBuf::from(path_str)
-            };
-
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-
-            let slice_start_offset = if offset as u64 > slice.offset_in_file {
-                offset as u64 - slice.offset_in_file
-            } else {
-                0
-            };
-
-            let write_len = std::cmp::min(
-                slice.length - slice_start_offset,
-                (data.len() - data_offset) as u64,
-            );
-
-            if write_len == 0 {
-                continue;
-            }
-
-            self.file_handle_cache.with_file(&path, |f| {
-                f.seek(SeekFrom::Start(slice.offset_in_file + slice_start_offset))?;
-                f.write_all(&data[data_offset..data_offset + write_len as usize])?;
-                Ok(())
-            })?;
-            data_offset += write_len as usize;
-            if data_offset >= data.len() {
-                break;
-            }
+        if !remaining.is_empty() {
+            return Err("block exceeds torrent total size".into());
         }
 
         Ok(())
     }
 
     pub fn has_any_pieces(&self) -> bool {
-        let bitfield = self.bitfield.read().unwrap();
-        bitfield.has_any()
+        self.bitfield.has_any()
     }
 
-    pub fn set_bitfield_index(&self, index: usize) {
-        let mut bitfield = self.bitfield.write().unwrap();
-        bitfield.set(&index, true);
+    pub fn set_bitfield_index(&mut self, index: usize) {
+        self.bitfield.set(&index, true);
     }
 
     pub fn bitfield(&self) -> Bitfield {
-        let bitfield = self.bitfield.read().unwrap();
-        bitfield.clone()
+        self.bitfield.clone()
     }
 
     pub fn is_complete(&self) -> bool {
-        let bitfield = self.bitfield.read().unwrap();
-        bitfield.count_ones() == self.piece_hashes.len()
+        self.bitfield.count_ones() == self.piece_hashes.len()
     }
 
     pub fn pieces_left(&self) -> usize {
-        let bitfield = self.bitfield.read().unwrap();
-        bitfield.count_zeros()
+        self.bitfield.count_zeros()
     }
 
     pub fn pieces_verified(&self) -> usize {
-        let bitfield = self.bitfield.read().unwrap();
-        bitfield.count_ones()
+        self.bitfield.count_ones()
     }
 
     pub fn bitfield_differs(&self, other: &Bitfield) -> bool {
-        let bitfield = self.bitfield.read().unwrap();
-        bitfield.differs_from(other)
+        self.bitfield.differs_from(other)
+    }
+
+    fn close(&self) {
+        self.file_handle_cache.close();
     }
 }
 
@@ -374,12 +382,16 @@ impl Torrent {
     }
 
     pub fn write_to_disk(
-        &self,
+        &mut self,
         piece_index: usize,
         offset: usize,
         data: &[u8],
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.info.write_data_to_disk(piece_index, offset, data)
+    }
+
+    pub fn close(&self) {
+        self.info.close();
     }
 }
 

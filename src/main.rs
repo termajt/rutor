@@ -22,7 +22,7 @@ struct ProgressTracker {
     pid: Pid,
     show_consumption: bool,
     thread_workers: usize,
-    files: Vec<String>,
+    files: Vec<(PathBuf, u64, u64)>,
 }
 
 impl ProgressTracker {
@@ -33,7 +33,7 @@ impl ProgressTracker {
         pid: Pid,
         show_consumption: bool,
         thread_workers: usize,
-        files: Vec<String>,
+        files: Vec<(PathBuf, u64, u64)>,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -124,6 +124,7 @@ impl ProgressTracker {
         pieces_verified: usize,
         system: &System,
         thread_workers: usize,
+        files: Vec<(PathBuf, u64, u64)>,
     ) {
         let remaining = self.total_size.saturating_sub(state.downloaded) as f64;
         self.eta = if state.download_speed.avg > 0.0 {
@@ -137,6 +138,7 @@ impl ProgressTracker {
         self.pieces_verified = pieces_verified;
         self.thread_workers = thread_workers;
         self.download_speed = state.download_speed.avg;
+        self.files = files;
         if let Some(process) = system.process(self.pid) {
             self.cpu_usage = process.cpu_usage();
             self.mem_usage_kb = process.memory();
@@ -161,8 +163,15 @@ impl ProgressTracker {
         let reset = "\x1b[0m";
 
         println!("{}{}:{}", cyan, self.name, reset);
-        for file in self.files.iter() {
-            println!("  {}•{} {}", gray, reset, file);
+        for (path, written, total_size) in &self.files {
+            println!(
+                "  {}•{}{} {} / {}",
+                gray,
+                path.file_name().unwrap().to_str().unwrap(),
+                reset,
+                self.human_bytes(*written),
+                self.human_bytes(*total_size)
+            );
         }
         println!(
             "{}Downloaded:{} {} / {} at {}{}/s{}, ETA: {}{}{}",
@@ -202,9 +211,10 @@ impl ProgressTracker {
         pieces_verified: usize,
         system: &System,
         thread_workers: usize,
+        files: Vec<(PathBuf, u64, u64)>,
         first_draw: bool,
     ) {
-        self.update(state, pieces_verified, system, thread_workers);
+        self.update(state, pieces_verified, system, thread_workers, files);
         self.display(first_draw);
     }
 }
@@ -302,16 +312,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let file = File::open(filename)?;
         torrent::Torrent::from_file(&file, destination)?
     };
-    let files: Vec<String> = torrent
-        .info
-        .files
-        .iter()
-        .map(|f| {
-            let path_str = f.path.join(&std::path::MAIN_SEPARATOR.to_string());
-            let path = PathBuf::from(path_str);
-            path.file_name().unwrap().to_str().unwrap().to_string()
-        })
-        .collect();
     let name = torrent.info.name.clone();
     let total_size = torrent.info.total_size;
     let client = TorrentClient::new(torrent)?;
@@ -324,7 +324,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pid,
         show_consumption,
         client.get_thread_worker_count(),
-        files,
+        client.file_status(),
     );
     while !client.is_complete() {
         system.refresh_all();
@@ -334,6 +334,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             client.pieces_verified(),
             &system,
             client.get_thread_worker_count(),
+            client.file_status(),
             first_draw,
         );
         first_draw = false;
@@ -347,6 +348,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.pieces_verified(),
         &system,
         client.get_thread_worker_count(),
+        client.file_status(),
         first_draw,
     );
     println!("\nDownload complete!");

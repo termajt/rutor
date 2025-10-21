@@ -1,5 +1,6 @@
 use std::fmt::Write;
 use std::net::UdpSocket;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs},
@@ -133,9 +134,9 @@ impl AnnounceManager {
     /// Creates a new `AnnounceManager` for a given torrent.
     ///
     /// If the torrent has an `announce_list`, it is used; otherwise, the single `announce` URL is used.
-    pub fn new(torrent: &Torrent) -> Self {
+    pub fn new(torrent: Arc<RwLock<Torrent>>) -> Self {
         let mut tiers = Vec::new();
-
+        let torrent = torrent.read().unwrap();
         if !torrent.announce_list.is_empty() {
             for tier_urls in &torrent.announce_list {
                 let tier = tier_urls
@@ -147,6 +148,7 @@ impl AnnounceManager {
         } else if let Some(url) = &torrent.announce {
             tiers.push(vec![TrackerState::new(url.clone())]);
         }
+        drop(torrent);
 
         AnnounceManager { tiers: tiers }
     }

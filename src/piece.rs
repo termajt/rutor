@@ -1,6 +1,6 @@
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     usize,
 };
 
@@ -25,13 +25,14 @@ pub struct PieceManager {
 impl PieceManager {
     /// Creates a new `PieceManager` from the given torrent metadata.
     pub fn new(
-        torrent: Arc<Torrent>,
+        torrent: Arc<RwLock<Torrent>>,
         peer_manager: Arc<PeerManager>,
         peer_event_tx: Arc<PubSub<PeerEvent>>,
         client_event_tx: Arc<PubSub<ClientEvent>>,
     ) -> Self {
-        let total_size = torrent.info.total_size;
-        let piece_length = torrent.info.piece_length;
+        let guard = torrent.read().unwrap();
+        let total_size = guard.info.total_size;
+        let piece_length = guard.info.piece_length;
         let picker_config = PickerConfig::default();
         let blocks_per_piece = piece_length as usize / picker_config.block_size;
         let picker = Mutex::new(PiecePicker::new(

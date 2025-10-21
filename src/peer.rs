@@ -431,7 +431,7 @@ impl PeerManagerState {
 #[derive(Debug, Clone)]
 pub struct PeerManager {
     tpool: Arc<ThreadPool>,
-    torrent: Arc<Torrent>,
+    torrent: Arc<RwLock<Torrent>>,
     peer_event_tx: Arc<PubSub<PeerEvent>>,
     piece_event_tx: Arc<PubSub<PieceEvent>>,
     client_event_tx: Arc<PubSub<ClientEvent>>,
@@ -446,7 +446,7 @@ impl PeerManager {
     pub fn new(
         max_connections: usize,
         tpool: Arc<ThreadPool>,
-        torrent: Arc<Torrent>,
+        torrent: Arc<RwLock<Torrent>>,
         peer_event_tx: Arc<PubSub<PeerEvent>>,
         piece_event_tx: Arc<PubSub<PieceEvent>>,
         client_event_tx: Arc<PubSub<ClientEvent>>,
@@ -489,12 +489,13 @@ impl PeerManager {
         piece_events: &mut Vec<PieceEvent>,
         peer_events: &mut Vec<PeerEvent>,
     ) {
-        let total_pieces = self.torrent.info.piece_hashes.len();
+        let torrent = self.torrent.read().unwrap();
+        let total_pieces = torrent.info.piece_hashes.len();
         while let Some(message) = pc.parse_messages(total_pieces) {
             pc.handle_message(&message);
             match message {
                 PeerMessage::Bitfield(_) | PeerMessage::Have(_) => {
-                    let am_interested_now = self.torrent.info.bitfield_differs(&pc.bitfield);
+                    let am_interested_now = torrent.info.bitfield_differs(&pc.bitfield);
                     if am_interested_now != pc.am_interested {
                         pc.am_interested = am_interested_now;
                         let message = if am_interested_now {
@@ -555,13 +556,10 @@ impl PeerManager {
         let mut changed = false;
         if !state.connected.contains_key(&addr) {
             changed = true;
+            let torrent = self.torrent.read().unwrap();
             state.connected.insert(
                 *addr,
-                PeerConnection::new(
-                    *addr,
-                    peer_id.to_vec(),
-                    self.torrent.info.piece_hashes.len(),
-                ),
+                PeerConnection::new(*addr, peer_id.to_vec(), torrent.info.piece_hashes.len()),
             );
         }
         drop(state);
@@ -686,10 +684,11 @@ impl PeerManager {
         let mut event_opt = None;
         let state = self.state.read().unwrap();
         if let Some(pc) = state.connected.get(addr) {
-            if self.torrent.info.has_any_pieces() {
+            let torrent = self.torrent.read().unwrap();
+            if torrent.info.has_any_pieces() {
                 event_opt = Some(PeerEvent::Send {
                     addr: pc.addr,
-                    message: PeerMessage::Bitfield(self.torrent.info.bitfield()),
+                    message: PeerMessage::Bitfield(torrent.info.bitfield()),
                 });
             }
         }
@@ -741,22 +740,30 @@ impl PeerManager {
             }
             PeerEvent::SocketDisconnect { addr } => {
                 self.mark_disconnected(addr);
-                let info_hash = self.torrent.info_hash;
+                let torrent = self.torrent.read().unwrap();
+                let info_hash = torrent.info_hash;
+                drop(torrent);
                 self.attempt_connect_peers(info_hash, my_peer_id);
             }
             PeerEvent::ConnectFailure { addr } => {
                 self.mark_failed(addr);
-                let info_hash = self.torrent.info_hash;
+                let torrent = self.torrent.read().unwrap();
+                let info_hash = torrent.info_hash;
+                drop(torrent);
                 self.attempt_connect_peers(info_hash, my_peer_id);
             }
             PeerEvent::NewPeers { peers } => {
                 self.add_peers(peers);
-                let info_hash = self.torrent.info_hash;
+                let torrent = self.torrent.read().unwrap();
+                let info_hash = torrent.info_hash;
+                drop(torrent);
                 self.attempt_connect_peers(info_hash, my_peer_id);
             }
             PeerEvent::PeerConnected { addr, peer_id } => {
                 self.mark_connected(addr, peer_id);
-                let info_hash = self.torrent.info_hash;
+                let torrent = self.torrent.read().unwrap();
+                let info_hash = torrent.info_hash;
+                drop(torrent);
                 self.attempt_connect_peers(info_hash, my_peer_id);
             }
         }
