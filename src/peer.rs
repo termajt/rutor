@@ -704,8 +704,7 @@ impl PeerManager {
         pcon: &PeerConnection,
         message: &PeerMessage,
     ) -> Option<Command> {
-        let check_choked = !matches!(message, PeerMessage::Interested);
-        if check_choked && pcon.is_choked() {
+        if pcon.is_choked() && matches!(message, PeerMessage::Request(_) | PeerMessage::Cancel(_)) {
             return None;
         }
         let encoded = message.encode();
