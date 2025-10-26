@@ -214,7 +214,7 @@ impl SocketManager {
                 continue;
             };
             let Some(mut conn) = self.conns.remove(&addr) else {
-                self.remove_socket(addr);
+                self.remove_fd(fd);
                 continue;
             };
 
