@@ -149,6 +149,30 @@ impl SocketManager {
         }
     }
 
+    fn process_commands(&mut self, rx: &Receiver<Command>, max_commands: usize) -> io::Result<()> {
+        for _ in 0..max_commands {
+            match rx.try_recv() {
+                Ok(cmd) => match cmd {
+                    Command::Add((socket, addr, max_send_queue_size)) => {
+                        self.add_socket(addr, socket, max_send_queue_size)?;
+                    }
+                    Command::Send(addr, data, is_critical) => {
+                        self.queue_message(addr, data, is_critical);
+                    }
+                    Command::Close(addr) => {
+                        self.remove_socket(addr);
+                    }
+                    Command::CloseSocket((_socket, addr)) => {
+                        self.remove_socket(addr);
+                    }
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        Ok(())
+    }
+
     /// Runs a single iteration of the event loop.
     ///
     /// Processes epoll events and applies any queued commands received from other threads.
@@ -166,22 +190,8 @@ impl SocketManager {
         rx: &Receiver<Command>,
         sender: &Sender<(Vec<u8>, SocketAddr)>,
     ) -> io::Result<Vec<SocketAddr>> {
-        while let Ok(cmd) = rx.try_recv() {
-            match cmd {
-                Command::Send(addr, data, is_critical) => {
-                    self.queue_message(addr, data, is_critical);
-                }
-                Command::Close(addr) => {
-                    self.remove_socket(addr);
-                }
-                Command::Add((socket, addr, max_send_queue_size)) => {
-                    self.add_socket(addr, socket, max_send_queue_size)?;
-                }
-                Command::CloseSocket((_socket, addr)) => {
-                    self.remove_socket(addr);
-                }
-            }
-        }
+        const MAX_COMMANDS_PER_TICK: usize = 64;
+        self.process_commands(rx, MAX_COMMANDS_PER_TICK)?;
 
         let mut disconnected_sockets = Vec::new();
         const MAX_EVENTS: usize = 32;
