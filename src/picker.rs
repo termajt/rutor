@@ -80,6 +80,7 @@ struct Piece {
     hasher: Sha1,
     next_hash_index: usize,
     verified: bool,
+    expected_hash_string: String
 }
 
 impl Piece {
@@ -95,6 +96,7 @@ impl Piece {
             hasher: Sha1::new(),
             next_hash_index: 0,
             verified: false,
+            expected_hash_string: bytes_to_hex(&expected_hash)
         }
     }
 
@@ -135,14 +137,14 @@ impl Piece {
         }
     }
 
-    fn verify_and_reset(&mut self) -> bool {
+    fn verify_and_reset(&mut self) -> PieceVerification {
         self.hash_contiguous_blocks();
         if self.next_hash_index != self.blocks.len() {
-            return false;
+            return PieceVerification::new(self.length, false, &self.expected_hash_string, "".to_string(), self.index);
         }
         let hasher = std::mem::take(&mut self.hasher);
-        let result = hasher.finalize();
-        let ok = result[..] == self.expected_hash;
+        let result = &hasher.finalize()[..];
+        let ok = result == self.expected_hash;
 
         self.received_blocks.clear();
         self.hasher = Sha1::new();
@@ -154,7 +156,7 @@ impl Piece {
                 *b = BlockState::Missing;
             }
         }
-        ok
+        PieceVerification::new(self.length, ok, &self.expected_hash_string, bytes_to_hex(result), self.index)
     }
 }
 
@@ -291,19 +293,19 @@ impl PiecePicker {
         (cancel_peers, received)
     }
 
-    pub fn verify_piece(&mut self, piece_index: usize) -> Result<bool, Box<dyn std::error::Error>> {
+    pub fn verify_piece(&mut self, piece_index: usize) -> Result<PieceVerification, Box<dyn std::error::Error>> {
         let Some(p) = self.pieces.get_mut(&piece_index) else {
             return Err(format!("no piece {}, already verified", piece_index).into());
         };
         if !p.is_complete() {
             return Err(format!("piece {} is not complete yet", piece_index).into());
         }
-        let valid = p.verify_and_reset();
-        if valid {
+        let verification = p.verify_and_reset();
+        if verification.verified {
             self.pieces.remove(&piece_index);
         }
         self.rarity_dirty = true;
-        Ok(valid)
+        Ok(verification)
     }
 
     pub fn total_remaining_blocks(&self) -> usize {
@@ -542,4 +544,23 @@ impl PiecePicker {
 
         results
     }
+}
+
+#[derive(Debug)]
+pub struct PieceVerification {
+    pub length: usize,
+    pub verified: bool,
+    pub expected_hash: String,
+    pub actual_hash: String,
+    pub piece_index: usize
+}
+
+impl PieceVerification {
+    pub fn new(length: usize, verified: bool, expected_hash: &String, actual_hash: String, piece_index: usize) -> Self {
+        PieceVerification { length, verified, expected_hash: expected_hash.to_string(), actual_hash, piece_index }
+    }
+}
+
+fn bytes_to_hex(data: &[u8]) -> String {
+    data.iter().map(|b| format!("{:02x}", b)).collect()
 }

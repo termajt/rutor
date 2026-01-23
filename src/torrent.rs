@@ -103,7 +103,6 @@ pub struct FileSlice {
 pub struct TorrentFile {
     length: u64,
     path: PathBuf,
-    written: u64,
 }
 
 impl TorrentFile {
@@ -111,16 +110,11 @@ impl TorrentFile {
         Self {
             length: length,
             path: path,
-            written: 0,
         }
     }
 
     pub fn path(&self) -> PathBuf {
         self.path.clone()
-    }
-
-    pub fn written(&self) -> u64 {
-        self.written
     }
 
     pub fn length(&self) -> u64 {
@@ -270,7 +264,6 @@ impl TorrentInfo {
                 f.write_all(&remaining[..write_len])?;
                 Ok(())
             })?;
-            file.written += write_len as u64;
             remaining = &remaining[write_len..];
             offset_in_torrent = 0;
             if remaining.is_empty() {
@@ -315,6 +308,51 @@ impl TorrentInfo {
 
     fn close(&self) {
         self.file_handle_cache.close();
+    }
+
+    fn piece_range(&self, piece_index: usize) -> (u64, u64) {
+        let start = piece_index as u64 * self.piece_length as u64;
+        let mut len = self.piece_length as u64;
+
+        if piece_index == self.piece_hashes.len() - 1 {
+            let remainder = self.total_size % self.piece_length as u64;
+            if remainder != 0 {
+                len = remainder;
+            }
+        }
+
+        (start, start + len)
+    }
+
+    fn file_range(&self, file_index: usize) -> (u64, u64) {
+        let start = self.files[..file_index]
+            .iter()
+            .map(|f| f.length)
+            .sum::<u64>();
+
+        let end = start + self.files[file_index].length;
+        (start, end)
+    }
+
+    pub fn verified_bytes_for_file(&self, file_index: usize) -> u64 {
+        let (file_start, file_end) = self.file_range(file_index);
+        let mut verified = 0;
+        for piece_index in 0..self.piece_hashes.len() {
+            if !self.bitfield.get(&piece_index) {
+                continue;
+            }
+
+            let (piece_start, piece_end) = self.piece_range(piece_index);
+
+            let overlap_start = file_start.max(piece_start);
+            let overlap_end = file_end.min(piece_end);
+
+            if overlap_start < overlap_end {
+                verified += overlap_end - overlap_start;
+            }
+        }
+
+        verified
     }
 }
 

@@ -1,4 +1,5 @@
-use rutor::client::{TorrentClient, TorrentState};
+use rutor::bytespeed::ByteSpeed;
+use rutor::client::{DownloadInfo, TorrentClient};
 use rutor::torrent;
 use std::env;
 use std::fs::File;
@@ -10,11 +11,7 @@ use sysinfo::{Pid, System};
 struct ProgressTracker {
     name: String,
     total_size: u64,
-    prev_downloaded: u64,
     eta: f64,
-    connected_peers: usize,
-    all_peers: usize,
-    pieces_verified: usize,
     total_pieces: usize,
     download_speed: f64,
     cpu_usage: f32,
@@ -22,7 +19,9 @@ struct ProgressTracker {
     pid: Pid,
     show_consumption: bool,
     thread_workers: usize,
-    files: Vec<(PathBuf, u64, u64)>,
+    download_info: DownloadInfo,
+    speed: ByteSpeed,
+    last_downloaded: u64
 }
 
 impl ProgressTracker {
@@ -33,16 +32,13 @@ impl ProgressTracker {
         pid: Pid,
         show_consumption: bool,
         thread_workers: usize,
-        files: Vec<(PathBuf, u64, u64)>,
+        download_info: DownloadInfo,
     ) -> Self {
+        let last_downloaded = download_info.downloaded;
         Self {
             name: name.to_string(),
             total_size: total_size,
-            prev_downloaded: 0,
             eta: f64::INFINITY,
-            connected_peers: 0,
-            all_peers: 0,
-            pieces_verified: 0,
             total_pieces: total_pieces,
             download_speed: 0.0,
             cpu_usage: 0.0,
@@ -50,7 +46,9 @@ impl ProgressTracker {
             pid: pid,
             show_consumption: show_consumption,
             thread_workers: thread_workers,
-            files: files,
+            download_info: download_info,
+            speed: ByteSpeed::new(Duration::from_secs(20), Duration::from_secs(1)),
+            last_downloaded: last_downloaded
         }
     }
 
@@ -107,7 +105,7 @@ impl ProgressTracker {
     }
 
     fn format_eta(&self, seconds: f64) -> String {
-        if !seconds.is_finite() || seconds < 0.0 {
+        if seconds.is_infinite() || seconds <= 0.0 {
             return "--:--:--".to_string();
         }
         let hours = (seconds / 3600.0).floor() as u64;
@@ -118,36 +116,37 @@ impl ProgressTracker {
 
     fn update(
         &mut self,
-        state: &TorrentState,
-        pieces_verified: usize,
+        download_info: DownloadInfo,
         system: &System,
         thread_workers: usize,
-        files: Vec<(PathBuf, u64, u64)>,
     ) {
-        let remaining = self.total_size.saturating_sub(state.downloaded) as f64;
-        self.eta = if state.download_speed.avg > 0.0 {
-            remaining / state.download_speed.avg
+        let downloaded_now = download_info.downloaded;
+        let delta = downloaded_now.saturating_sub(self.last_downloaded);
+
+        self.speed.update(delta as usize);
+        self.last_downloaded = downloaded_now;
+        self.download_speed = self.speed.avg;
+
+        let remaining = self.total_size.saturating_sub(downloaded_now) as f64;
+        self.eta = if self.download_speed > 0.0 {
+            remaining / self.download_speed
         } else {
             f64::INFINITY
         };
-        self.prev_downloaded = state.downloaded;
-        self.connected_peers = state.connected_peers;
-        self.all_peers = state.peers;
-        self.pieces_verified = pieces_verified;
+
         self.thread_workers = thread_workers;
-        self.download_speed = state.download_speed.avg;
-        self.files = files;
         if let Some(process) = system.process(self.pid) {
             self.cpu_usage = process.cpu_usage();
             self.mem_usage_kb = process.memory();
         }
+        self.download_info = download_info;
     }
 
     fn display(&self, first_draw: bool) {
         if !first_draw {
             let mut max = if self.show_consumption { 6 } else { 5 };
-            if self.files.len() > 1 {
-                max += self.files.len();
+            if self.download_info.files.len() > 1 {
+                max += self.download_info.files.len();
             }
             for _ in 0..max {
                 print!("\r\x1B[1A\x1b[2K");
@@ -163,11 +162,11 @@ impl ProgressTracker {
         let white = "\x1b[97m";
         let reset = "\x1b[0m";
 
-        if self.files.len() == 1 {
+        if self.download_info.files.len() == 1 {
             println!("📦 {}{}{}", cyan, self.name, reset);
         } else {
             println!("📦 {}{}{}", cyan, self.name, reset);
-            for (path, written, total_size) in &self.files {
+            for (path, written, total_size) in &self.download_info.files {
                 let file_name = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -187,7 +186,7 @@ impl ProgressTracker {
             green,
             "Downloaded",
             reset,
-            self.human_bytes(self.prev_downloaded),
+            self.human_bytes(self.download_info.downloaded),
             self.human_bytes(self.total_size),
             yellow,
             self.human_bytes(self.download_speed as u64),
@@ -198,13 +197,13 @@ impl ProgressTracker {
         );
         println!(
             "{0}{1:<10}:{2} {3} (C) / {4} (A)",
-            blue, "Peers", reset, self.connected_peers, self.all_peers
+            blue, "Peers", reset, self.download_info.connected_peers, self.download_info.available_peers
         );
         println!(
             "{0}{1:<10}:{2} {3} / {4}",
-            white, "Pieces", reset, self.pieces_verified, self.total_pieces
+            white, "Pieces", reset, self.download_info.pieces_verified, self.total_pieces
         );
-        println!("{}", self.format_bar(self.prev_downloaded));
+        println!("{}", self.format_bar(self.download_info.downloaded));
         if self.show_consumption {
             println!(
                 "CPU: {:.1}% | Memory: {} | Threads: {}",
@@ -217,14 +216,12 @@ impl ProgressTracker {
 
     fn update_and_display(
         &mut self,
-        state: &TorrentState,
-        pieces_verified: usize,
+        download_info: DownloadInfo,
         system: &System,
         thread_workers: usize,
-        files: Vec<(PathBuf, u64, u64)>,
         first_draw: bool,
     ) {
-        self.update(state, pieces_verified, system, thread_workers, files);
+        self.update(download_info, system, thread_workers);
         self.display(first_draw);
     }
 }
@@ -322,6 +319,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let file = File::open(filename)?;
         torrent::Torrent::from_file(&file, destination)?
     };
+    let total_pieces = torrent.info.piece_hashes.len();
     let name = torrent.info.name.clone();
     let total_size = torrent.info.total_size;
     let client = TorrentClient::new(torrent)?;
@@ -330,7 +328,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut progress_tracker = ProgressTracker::new(
         &name,
         total_size,
-        client.total_pieces(),
+        total_pieces,
         pid,
         show_consumption,
         client.get_thread_worker_count(),
@@ -338,13 +336,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     while !client.is_complete() {
         system.refresh_all();
-        let state = client.get_state();
         progress_tracker.update_and_display(
-            &state,
-            client.pieces_verified(),
+            client.file_status(),
             &system,
             client.get_thread_worker_count(),
-            client.file_status(),
             first_draw,
         );
         first_draw = false;
@@ -352,13 +347,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     client.stop();
     system.refresh_all();
-    let state = client.get_state();
     progress_tracker.update_and_display(
-        &state,
-        client.pieces_verified(),
+        client.file_status(),
         &system,
         client.get_thread_worker_count(),
-        client.file_status(),
         first_draw,
     );
     println!("\nDownload complete!");

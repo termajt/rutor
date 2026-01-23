@@ -98,8 +98,9 @@ impl PieceManager {
                         },
                     );
                 }
-                if let Ok(verified) = verified_result {
-                    if verified {
+                if let Ok(verification) = verified_result {
+                    if verification.verified {
+                        eprintln!("✅ Piece {} verified! (size: {})", piece_index, verification.length);
                         let _ = self.peer_event_tx.publish(
                             consts::TOPIC_PEER_EVENT,
                             PeerEvent::SendToAll {
@@ -108,12 +109,10 @@ impl PieceManager {
                         );
                         let _ = self.client_event_tx.publish(
                             consts::TOPIC_CLIENT_EVENT,
-                            ClientEvent::PieceVerified {
-                                piece_index: *piece_index as usize,
-                            },
+                            ClientEvent::PieceVerified(verification),
                         );
                     } else {
-                        eprintln!("❌ Piece {} failed verification", piece_index);
+                        eprintln!("❌ Piece {} failed verification (size: {}, expected: {}, actual: {})", piece_index, verification.length, verification.expected_hash, verification.actual_hash);
                         let _ = self.client_event_tx.publish(
                             consts::TOPIC_CLIENT_EVENT,
                             ClientEvent::PieceVerificationFailure {

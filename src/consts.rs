@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use crate::{bitfield::Bitfield, peer::PeerMessage};
+use crate::{bitfield::Bitfield, peer::PeerMessage, picker::PieceVerification};
 
 pub const TOPIC_CLIENT_EVENT: &str = &"client_event";
 pub const TOPIC_PIECE_EVENT: &str = &"piece_event";
@@ -61,9 +61,7 @@ pub enum ClientEvent {
         data_size: usize,
     },
     PeersChanged,
-    PieceVerified {
-        piece_index: usize,
-    },
+    PieceVerified(PieceVerification),
     WriteToDisk {
         piece_index: usize,
         begin: usize,

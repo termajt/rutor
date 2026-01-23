@@ -13,7 +13,6 @@ use threadpool::ThreadPool;
 
 use crate::{
     announce::{self, AnnounceManager},
-    bytespeed::ByteSpeed,
     consts::{self, ClientEvent, PeerEvent, PieceEvent},
     event::ManualResetEvent,
     peer::PeerManager,
@@ -23,48 +22,6 @@ use crate::{
     torrent::Torrent,
 };
 
-/// Represents the current state of a torrent download.
-///
-/// Tracks total and current transfer statistics, as well as
-/// timing and progress information. Used for reporting and coordination
-/// between threads in the [`TorrentClient`].
-#[derive(Debug, Clone)]
-pub struct TorrentState {
-    /// Total number of bytes downloaded so far.
-    pub downloaded: u64,
-
-    /// Total number of bytes left so far.
-    pub left: u64,
-
-    /// Total number of bytes uploaded so far.
-    pub uploaded: u64,
-
-    /// Total number of peers.
-    pub peers: usize,
-
-    /// Total number of connected peers.
-    pub connected_peers: usize,
-
-    /// The download byte speed.
-    pub download_speed: ByteSpeed,
-}
-
-impl TorrentState {
-    /// Creates a new [`TorrentState`] with the given total size and listening port.
-    ///
-    /// All counters are initialized to zero, and `left` is set equal to `total_size`.
-    pub fn new() -> Self {
-        TorrentState {
-            downloaded: 0,
-            left: 0,
-            uploaded: 0,
-            peers: 0,
-            connected_peers: 0,
-            download_speed: ByteSpeed::new(Duration::from_secs(20), Duration::from_secs(1)),
-        }
-    }
-}
-
 /// Represents a running torrent client instance.
 ///
 /// The [`TorrentClient`] coordinates downloading and uploading pieces of
@@ -73,7 +30,6 @@ impl TorrentState {
 pub struct TorrentClient {
     /// Shared reference to the [`Torrent`] metadata and info.
     torrent: Arc<RwLock<Torrent>>,
-    state: Arc<RwLock<TorrentState>>,
     tpool: Arc<ThreadPool>,
     peer_id: [u8; 20],
     peer_manager: Arc<PeerManager>,
@@ -124,7 +80,6 @@ impl TorrentClient {
         let socket_manager = Arc::new(Mutex::new(SocketManager::new()?));
         Ok(Self {
             torrent: torrent,
-            state: Arc::new(RwLock::new(TorrentState::new())),
             tpool: tpool,
             peer_id: peer_id,
             peer_manager: peer_manager,
@@ -139,13 +94,31 @@ impl TorrentClient {
         })
     }
 
-    pub fn file_status(&self) -> Vec<(PathBuf, u64, u64)> {
-        let torrent = self.torrent.read().unwrap();
-        let mut results = Vec::new();
-        for f in &torrent.info.files {
-            results.push((f.path(), f.written(), f.length()))
+    pub fn file_status(&self) -> DownloadInfo {
+        let mut total_downloaded = 0;
+        let pieces_verified;
+        let files;
+        {
+            let torrent = self.torrent.read().unwrap();
+            pieces_verified = torrent.info.bitfield().count_ones();
+            files = torrent.info.files
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let downloaded = torrent.info.verified_bytes_for_file(i);
+                    total_downloaded += downloaded;
+
+                    (
+                        f.path(),
+                        downloaded,
+                        f.length()
+                    )
+                })
+                .collect();
         }
-        results
+        let connected_peers = self.peer_manager.connected_peers();
+        let available_peers = self.peer_manager.peer_count();
+        DownloadInfo { downloaded: total_downloaded, files: files, connected_peers: connected_peers, available_peers: available_peers, pieces_verified }
     }
 
     /// Starts the torrent client's background processes.
@@ -157,8 +130,6 @@ impl TorrentClient {
         *started = true;
         drop(started);
         self.start_threads()?;
-        let state = self.state.clone();
-        let peer_manager = self.peer_manager.clone();
         let client_event_rx = self.client_event.subscribe(consts::TOPIC_CLIENT_EVENT)?;
         let torrent = self.torrent.clone();
         let shutdown_ev = self.shutdown_ev.clone();
@@ -168,7 +139,7 @@ impl TorrentClient {
             while !shutdown_ev.is_set() {
                 match client_event_rx.recv_timeout(delay) {
                     Ok(ev) => {
-                        handle_client_event(&ev, torrent.clone(), &state, &peer_manager);
+                        handle_client_event(&ev, torrent.clone());
                         delay = Duration::from_millis(5);
                     }
                     Err(_) => delay = (delay * 2).min(max_delay),
@@ -177,23 +148,10 @@ impl TorrentClient {
             // Drain events
             eprintln!("draining client events...");
             while let Ok(ev) = client_event_rx.try_recv() {
-                handle_client_event(&ev, torrent.clone(), &state, &peer_manager);
+                handle_client_event(&ev, torrent.clone());
             }
             eprintln!("client events drained!");
             eprintln!("client events thread returning!");
-        });
-        let state = self.state.clone();
-        let shutdown_ev = self.shutdown_ev.clone();
-        self.tpool.execute(move || {
-            let mut prev_downloaded = 0;
-            while !shutdown_ev.wait_timeout(Duration::from_millis(500)) {
-                let mut state = state.write().unwrap();
-                let downloaded_now = state.downloaded.saturating_sub(prev_downloaded);
-                prev_downloaded = state.downloaded;
-                state.download_speed.update(downloaded_now as usize);
-                drop(state);
-            }
-            eprintln!("download speed thread returning!");
         });
         Ok(())
     }
@@ -212,10 +170,10 @@ impl TorrentClient {
         let info_hash = torrent.info_hash;
         drop(torrent);
         let peer_id = self.peer_id;
-        let state = self.state.clone();
         let announce_manager = self.announce_manager.clone();
         let peer_event_tx = self.peer_event.clone();
         let shutdown_ev = self.shutdown_ev.clone();
+        let torrent = self.torrent.clone();
         self.tpool.execute(move || {
             loop {
                 let mut manager = announce_manager.lock().unwrap();
@@ -240,8 +198,7 @@ impl TorrentClient {
                 };
                 tracker.announced();
                 let (uploaded, downloaded, left) = {
-                    let state = state.read().unwrap();
-                    (state.uploaded, state.downloaded, state.left)
+                    (0, 0, torrent.read().unwrap().info.total_size)
                 };
                 if let Ok(response) = announce::announce(
                     &tracker.url,
@@ -461,25 +418,6 @@ impl TorrentClient {
     pub fn get_thread_worker_count(&self) -> usize {
         self.tpool.active_count()
     }
-
-    pub fn get_state(&self) -> TorrentState {
-        self.state.read().unwrap().clone()
-    }
-
-    pub fn pieces_left(&self) -> usize {
-        let torrent = self.torrent.read().unwrap();
-        torrent.info.pieces_left()
-    }
-
-    pub fn total_pieces(&self) -> usize {
-        let torrent = self.torrent.read().unwrap();
-        torrent.info.piece_hashes.len()
-    }
-
-    pub fn pieces_verified(&self) -> usize {
-        let torrent = self.torrent.read().unwrap();
-        torrent.info.pieces_verified()
-    }
 }
 
 fn generate_peer_id() -> [u8; 20] {
@@ -500,45 +438,32 @@ fn generate_peer_id() -> [u8; 20] {
 fn handle_client_event(
     ev: &ClientEvent,
     torrent: Arc<RwLock<Torrent>>,
-    state: &RwLock<TorrentState>,
-    peer_manager: &PeerManager,
 ) {
     match ev {
         ClientEvent::PieceVerificationFailure {
             piece_index: _,
-            data_size,
+            data_size: _,
         } => {
-            let torrent = torrent.read().unwrap();
-            let total_size = torrent.info.total_size;
-            drop(torrent);
-            let mut state = state.write().unwrap();
-            state.downloaded = state.downloaded.saturating_sub(*data_size as u64);
-            state.left = total_size.saturating_sub(state.downloaded);
+            
         }
         ClientEvent::PeersChanged => {
-            let mut state = state.write().unwrap();
-            state.connected_peers = peer_manager.connected_peers();
-            state.peers = peer_manager.peer_count();
+            // Unused, remove?
         }
-        ClientEvent::PieceVerified { piece_index } => {
-            let mut torrent = torrent.write().unwrap();
-            torrent.info.set_bitfield_index(*piece_index);
+        ClientEvent::PieceVerified(verification) => {
+            if verification.verified {
+                let mut torrent = torrent.write().unwrap();
+                torrent.info.set_bitfield_index(verification.piece_index);
+            }
         }
         ClientEvent::WriteToDisk {
             piece_index,
             begin,
             data,
         } => {
-            let mut guard = torrent.write().unwrap();
-            if let Err(e) = guard.write_to_disk(*piece_index, *begin, data) {
+            let mut torrent = torrent.write().unwrap();
+            if let Err(e) = torrent.write_to_disk(*piece_index, *begin, data) {
                 eprintln!("failed to write block to disk: {e}");
             }
-            drop(guard);
-            let torrent = torrent.read().unwrap();
-            let total_size = torrent.info.total_size;
-            let mut state = state.write().unwrap();
-            state.downloaded += data.len() as u64;
-            state.left = total_size.saturating_sub(state.downloaded);
         }
     }
 }
@@ -632,4 +557,12 @@ fn handle_piece_event(
         let mut piece_manager = piece_manager.write().unwrap();
         piece_manager.handle_event(ev);
     }
+}
+
+pub struct DownloadInfo {
+    pub downloaded: u64,
+    pub files: Vec<(PathBuf, u64, u64)>,
+    pub connected_peers: usize,
+    pub available_peers: usize,
+    pub pieces_verified: usize
 }
