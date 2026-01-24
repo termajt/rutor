@@ -12,6 +12,8 @@ use libc::{
     epoll_create1, epoll_ctl, epoll_event, epoll_wait, fcntl,
 };
 
+use crate::consts::SocketDataEvent;
+
 /// Commands sent to the `SocketManager` from other threads.
 #[derive(Debug)]
 pub enum Command {
@@ -188,7 +190,7 @@ impl SocketManager {
     pub fn run_once(
         &mut self,
         rx: &Receiver<Command>,
-        sender: &Sender<(Vec<u8>, SocketAddr)>,
+        sender: &Sender<SocketDataEvent>,
     ) -> io::Result<Vec<SocketAddr>> {
         const MAX_COMMANDS_PER_TICK: usize = 64;
         self.process_commands(rx, MAX_COMMANDS_PER_TICK)?;
@@ -231,7 +233,7 @@ impl SocketManager {
                     if (ev.events & EPOLLIN as u32) != 0 {
                         match self.handle_read(stream) {
                             Ok(data) => {
-                                if let Err(e) = sender.send((data, *addr)) {
+                                if let Err(e) = sender.send(SocketDataEvent::Data((*addr, data))) {
                                     eprintln!("failed to notify data received: {e}");
                                 }
                             }

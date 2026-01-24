@@ -100,7 +100,6 @@ impl PieceManager {
                 }
                 if let Ok(verification) = verified_result {
                     if verification.verified {
-                        eprintln!("✅ Piece {} verified! (size: {})", piece_index, verification.length);
                         let _ = self.peer_event_tx.publish(
                             consts::TOPIC_PEER_EVENT,
                             PeerEvent::SendToAll {
@@ -112,7 +111,13 @@ impl PieceManager {
                             ClientEvent::PieceVerified(verification),
                         );
                     } else {
-                        eprintln!("❌ Piece {} failed verification (size: {}, expected: {}, actual: {})", piece_index, verification.length, verification.expected_hash, verification.actual_hash);
+                        eprintln!(
+                            "❌ Piece {} failed verification (size: {}, expected: {}, actual: {})",
+                            piece_index,
+                            verification.length,
+                            verification.expected_hash,
+                            verification.actual_hash
+                        );
                         let _ = self.client_event_tx.publish(
                             consts::TOPIC_CLIENT_EVENT,
                             ClientEvent::PieceVerificationFailure {
@@ -135,6 +140,7 @@ impl PieceManager {
                 let mut picker = self.picker.lock().unwrap();
                 picker.peer_disconnected(peer);
             }
+            PieceEvent::Shutdown => return,
         }
     }
 

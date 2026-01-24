@@ -3,7 +3,7 @@ use std::{
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Sender},
+        mpsc::{self, Receiver, Sender},
     },
     time::Duration,
 };
@@ -13,7 +13,7 @@ use threadpool::ThreadPool;
 
 use crate::{
     announce::{self, AnnounceManager},
-    consts::{self, ClientEvent, PeerEvent, PieceEvent},
+    consts::{self, ClientEvent, PeerEvent, PieceEvent, SocketDataEvent},
     event::ManualResetEvent,
     peer::PeerManager,
     piece::PieceManager,
@@ -41,6 +41,10 @@ pub struct TorrentClient {
     piece_event: Arc<PubSub<PieceEvent>>,
     shutdown_ev: Arc<ManualResetEvent>,
     started: Mutex<bool>,
+    socket_ev: (
+        Sender<SocketDataEvent>,
+        Mutex<Option<Receiver<SocketDataEvent>>>,
+    ),
 }
 
 impl TorrentClient {
@@ -78,6 +82,7 @@ impl TorrentClient {
         )));
         let announce_manager = Arc::new(Mutex::new(AnnounceManager::new(torrent.clone())));
         let socket_manager = Arc::new(Mutex::new(SocketManager::new()?));
+        let socket_ev = mpsc::channel();
         Ok(Self {
             torrent: torrent,
             tpool: tpool,
@@ -91,6 +96,7 @@ impl TorrentClient {
             piece_event: piece_event,
             shutdown_ev: Arc::new(ManualResetEvent::new(false)),
             started: Mutex::new(false),
+            socket_ev: (socket_ev.0, Mutex::new(Option::Some(socket_ev.1))),
         })
     }
 
@@ -101,24 +107,28 @@ impl TorrentClient {
         {
             let torrent = self.torrent.read().unwrap();
             pieces_verified = torrent.info.bitfield().count_ones();
-            files = torrent.info.files
+            files = torrent
+                .info
+                .files
                 .iter()
                 .enumerate()
                 .map(|(i, f)| {
                     let downloaded = torrent.info.verified_bytes_for_file(i);
                     total_downloaded += downloaded;
 
-                    (
-                        f.path(),
-                        downloaded,
-                        f.length()
-                    )
+                    (f.path(), downloaded, f.length())
                 })
                 .collect();
         }
         let connected_peers = self.peer_manager.connected_peers();
         let available_peers = self.peer_manager.peer_count();
-        DownloadInfo { downloaded: total_downloaded, files: files, connected_peers: connected_peers, available_peers: available_peers, pieces_verified }
+        DownloadInfo {
+            downloaded: total_downloaded,
+            files: files,
+            connected_peers: connected_peers,
+            available_peers: available_peers,
+            pieces_verified,
+        }
     }
 
     /// Starts the torrent client's background processes.
@@ -132,26 +142,22 @@ impl TorrentClient {
         self.start_threads()?;
         let client_event_rx = self.client_event.subscribe(consts::TOPIC_CLIENT_EVENT)?;
         let torrent = self.torrent.clone();
-        let shutdown_ev = self.shutdown_ev.clone();
         self.tpool.execute(move || {
-            let mut delay = Duration::from_millis(5);
-            let max_delay = Duration::from_secs(1);
-            while !shutdown_ev.is_set() {
-                match client_event_rx.recv_timeout(delay) {
+            loop {
+                match client_event_rx.recv() {
                     Ok(ev) => {
                         handle_client_event(&ev, torrent.clone());
-                        delay = Duration::from_millis(5);
+                        if matches!(*ev, ClientEvent::Shutdown) {
+                            eprintln!("client_event::shutdown, breaking loop");
+                            break;
+                        }
                     }
-                    Err(_) => delay = (delay * 2).min(max_delay),
+                    Err(e) => {
+                        eprintln!("client_event::error, {}", e);
+                    }
                 }
             }
-            // Drain events
-            eprintln!("draining client events...");
-            while let Ok(ev) = client_event_rx.try_recv() {
-                handle_client_event(&ev, torrent.clone());
-            }
-            eprintln!("client events drained!");
-            eprintln!("client events thread returning!");
+            eprintln!("client_event::returning");
         });
         Ok(())
     }
@@ -197,9 +203,8 @@ impl TorrentClient {
                     }
                 };
                 tracker.announced();
-                let (uploaded, downloaded, left) = {
-                    (0, 0, torrent.read().unwrap().info.total_size)
-                };
+                let (uploaded, downloaded, left) =
+                    { (0, 0, torrent.read().unwrap().info.total_size) };
                 if let Ok(response) = announce::announce(
                     &tracker.url,
                     &info_hash,
@@ -230,7 +235,7 @@ impl TorrentClient {
         let peer_event_tx = self.peer_event.clone();
         let shutdown_ev = self.shutdown_ev.clone();
         let (socket_tx, socket_rx) = mpsc::channel();
-        let (data_tx, data_rx) = mpsc::channel();
+        let data_tx = self.socket_ev.0.clone();
         self.tpool.execute(move || {
             while !shutdown_ev.is_set() {
                 let mut socket_manager = socket_manager.lock().unwrap();
@@ -252,22 +257,34 @@ impl TorrentClient {
             }
             eprintln!("socket manager thread returning!");
         });
-        // let peer_event_tx = self.peer_event.clone();
-        let shutdown_ev = self.shutdown_ev.clone();
+        // let shutdown_ev = self.shutdown_ev.clone();
         let peer_manager = self.peer_manager.clone();
+        let data_rx = self
+            .socket_ev
+            .1
+            .lock()
+            .unwrap()
+            .take()
+            .expect("socket already taken");
         self.tpool.execute(move || {
-            let mut delay = Duration::from_millis(5);
-            let max_delay = Duration::from_millis(500);
-            while !shutdown_ev.is_set() {
-                match data_rx.recv_timeout(delay) {
-                    Ok((data, addr)) => {
-                        peer_manager.data_received(&addr, &data);
-                        delay = Duration::from_millis(5);
+            loop {
+                match data_rx.recv() {
+                    Ok(ev) => match ev {
+                        SocketDataEvent::Data((addr, data)) => {
+                            peer_manager.data_received(&addr, &data);
+                        }
+                        SocketDataEvent::Shutdown => {
+                            eprintln!("data_recv::shutdown, breaking loop");
+                            break;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("data_recv::error, {}", e);
+                        break;
                     }
-                    Err(_) => delay = (delay * 2).min(max_delay),
                 }
             }
-            eprintln!("socket data thread returning!");
+            eprintln!("data_recv::returning");
         });
         Ok(Arc::new(socket_tx))
     }
@@ -284,11 +301,13 @@ impl TorrentClient {
         let inflight = Arc::new(AtomicUsize::new(0));
         let tpool = self.tpool.clone();
         self.tpool.execute(move || {
-            let mut delay = Duration::from_millis(5);
-            let max_delay = Duration::from_secs(1);
-            while !shutdown_ev.is_set() {
-                match peer_event_rx.recv_timeout(delay) {
+            loop {
+                match peer_event_rx.recv() {
                     Ok(ev) => {
+                        if matches!(*ev, PeerEvent::Shutdown) {
+                            eprintln!("peer_event::shutdown, breaking loop");
+                            break;
+                        }
                         handle_peer_event(
                             ev,
                             inflight.clone(),
@@ -301,27 +320,13 @@ impl TorrentClient {
                             false,
                         );
                     }
-                    Err(_) => delay = (delay * 2).min(max_delay),
+                    Err(e) => {
+                        eprintln!("peer_event::error, {}", e);
+                        break;
+                    }
                 }
             }
-
-            // Drain events
-            eprintln!("draining peer events...");
-            while let Ok(ev) = peer_event_rx.try_recv() {
-                handle_peer_event(
-                    ev,
-                    inflight.clone(),
-                    max_handlers,
-                    peer_manager.clone(),
-                    shutdown_ev.clone(),
-                    tpool.clone(),
-                    peer_id,
-                    socket_tx.clone(),
-                    true,
-                );
-            }
-            eprintln!("peer events drained!");
-            eprintln!("peer events thread returning!");
+            eprintln!("peer_event::returning");
         });
         Ok(())
     }
@@ -334,11 +339,13 @@ impl TorrentClient {
             let shutdown_ev = self.shutdown_ev.clone();
             let tpool = self.tpool.clone();
             self.tpool.execute(move || {
-                let mut delay = Duration::from_millis(5);
-                let max_delay = Duration::from_secs(1);
-                while !shutdown_ev.is_set() {
-                    match rx.recv_timeout(delay) {
+                loop {
+                    match rx.recv() {
                         Ok(ev) => {
+                            if matches!(*ev, PieceEvent::Shutdown) {
+                                eprintln!("piece_event::shutdown, breaking loop");
+                                break;
+                            }
                             handle_piece_event(
                                 ev,
                                 inflight.clone(),
@@ -349,25 +356,13 @@ impl TorrentClient {
                                 false,
                             );
                         }
-                        Err(_) => delay = (delay * 2).min(max_delay),
+                        Err(e) => {
+                            eprintln!("piece_event::error, {}", e);
+                            break;
+                        }
                     }
                 }
-
-                // Drain events
-                eprintln!("draining piece events...");
-                while let Ok(ev) = rx.try_recv() {
-                    handle_piece_event(
-                        ev,
-                        inflight.clone(),
-                        max_handlers,
-                        piece_manager.clone(),
-                        shutdown_ev.clone(),
-                        tpool.clone(),
-                        true,
-                    );
-                }
-                eprintln!("piece events drained!");
-                eprintln!("piece events thread returning!");
+                eprintln!("piece_event::returning");
             });
         }
         {
@@ -379,7 +374,7 @@ impl TorrentClient {
                     piece_manager.run_piece_selection_once();
                     drop(piece_manager);
                 }
-                eprintln!("piece selection thread returning!");
+                eprintln!("piece_selection::returning");
             });
         }
         Ok(())
@@ -402,17 +397,32 @@ impl TorrentClient {
             return;
         }
         self.shutdown_ev.set();
-        let mut socket_manger = self.socket_manager.lock().unwrap();
-        socket_manger.close();
-        drop(socket_manger);
-        eprintln!("socket manager closed!");
-        eprintln!("closing threadpool...");
-        self.tpool.join();
-        eprintln!("threadpool closed and joined!");
+        {
+            let mut socket_manger = self.socket_manager.lock().unwrap();
+            socket_manger.close();
+        }
+
+        let _ = self
+            .peer_event
+            .publish(consts::TOPIC_PEER_EVENT, PeerEvent::Shutdown);
+        let _ = self
+            .piece_event
+            .publish(consts::TOPIC_PIECE_EVENT, PieceEvent::Shutdown);
+        let _ = self
+            .client_event
+            .publish(consts::TOPIC_CLIENT_EVENT, ClientEvent::Shutdown);
+        let _ = self.socket_ev.0.send(SocketDataEvent::Shutdown);
+
         eprintln!("closing torrent...");
         let torrent = self.torrent.read().unwrap();
         torrent.close();
-        eprintln!("torrent closed and flushed!");
+        eprintln!("torrent closed!");
+    }
+
+    pub fn join(&self) {
+        eprintln!("joining threadpool...");
+        self.tpool.join();
+        eprintln!("threadpool joined!");
     }
 
     pub fn get_thread_worker_count(&self) -> usize {
@@ -435,17 +445,12 @@ fn generate_peer_id() -> [u8; 20] {
     peer_id
 }
 
-fn handle_client_event(
-    ev: &ClientEvent,
-    torrent: Arc<RwLock<Torrent>>,
-) {
+fn handle_client_event(ev: &ClientEvent, torrent: Arc<RwLock<Torrent>>) {
     match ev {
         ClientEvent::PieceVerificationFailure {
             piece_index: _,
             data_size: _,
-        } => {
-            
-        }
+        } => {}
         ClientEvent::PeersChanged => {
             // Unused, remove?
         }
@@ -465,6 +470,7 @@ fn handle_client_event(
                 eprintln!("failed to write block to disk: {e}");
             }
         }
+        ClientEvent::Shutdown => return,
     }
 }
 
@@ -479,6 +485,9 @@ fn handle_peer_event(
     socket_tx: Arc<Sender<Command>>,
     sync: bool,
 ) {
+    if matches!(*ev, PeerEvent::Shutdown) || shutdown_ev.is_set() {
+        return;
+    }
     if sync {
         eprintln!("handling peer event: {ev:?}");
         peer_manager.handle_event(ev, peer_id, socket_tx);
@@ -528,6 +537,9 @@ fn handle_piece_event(
     tpool: Arc<ThreadPool>,
     sync: bool,
 ) {
+    if matches!(*ev, PieceEvent::Shutdown) || shutdown_ev.is_set() {
+        return;
+    }
     if sync {
         eprintln!("handling piece event: {ev:?}");
         let mut piece_manager = piece_manager.write().unwrap();
@@ -564,5 +576,5 @@ pub struct DownloadInfo {
     pub files: Vec<(PathBuf, u64, u64)>,
     pub connected_peers: usize,
     pub available_peers: usize,
-    pub pieces_verified: usize
+    pub pieces_verified: usize,
 }

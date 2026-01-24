@@ -80,7 +80,7 @@ struct Piece {
     hasher: Sha1,
     next_hash_index: usize,
     verified: bool,
-    expected_hash_string: String
+    expected_hash_string: String,
 }
 
 impl Piece {
@@ -96,7 +96,7 @@ impl Piece {
             hasher: Sha1::new(),
             next_hash_index: 0,
             verified: false,
-            expected_hash_string: bytes_to_hex(&expected_hash)
+            expected_hash_string: bytes_to_hex(&expected_hash),
         }
     }
 
@@ -140,7 +140,13 @@ impl Piece {
     fn verify_and_reset(&mut self) -> PieceVerification {
         self.hash_contiguous_blocks();
         if self.next_hash_index != self.blocks.len() {
-            return PieceVerification::new(self.length, false, &self.expected_hash_string, "".to_string(), self.index);
+            return PieceVerification::new(
+                self.length,
+                false,
+                &self.expected_hash_string,
+                "".to_string(),
+                self.index,
+            );
         }
         let hasher = std::mem::take(&mut self.hasher);
         let result = &hasher.finalize()[..];
@@ -156,7 +162,13 @@ impl Piece {
                 *b = BlockState::Missing;
             }
         }
-        PieceVerification::new(self.length, ok, &self.expected_hash_string, bytes_to_hex(result), self.index)
+        PieceVerification::new(
+            self.length,
+            ok,
+            &self.expected_hash_string,
+            bytes_to_hex(result),
+            self.index,
+        )
     }
 }
 
@@ -293,7 +305,10 @@ impl PiecePicker {
         (cancel_peers, received)
     }
 
-    pub fn verify_piece(&mut self, piece_index: usize) -> Result<PieceVerification, Box<dyn std::error::Error>> {
+    pub fn verify_piece(
+        &mut self,
+        piece_index: usize,
+    ) -> Result<PieceVerification, Box<dyn std::error::Error>> {
         let Some(p) = self.pieces.get_mut(&piece_index) else {
             return Err(format!("no piece {}, already verified", piece_index).into());
         };
@@ -552,12 +567,24 @@ pub struct PieceVerification {
     pub verified: bool,
     pub expected_hash: String,
     pub actual_hash: String,
-    pub piece_index: usize
+    pub piece_index: usize,
 }
 
 impl PieceVerification {
-    pub fn new(length: usize, verified: bool, expected_hash: &String, actual_hash: String, piece_index: usize) -> Self {
-        PieceVerification { length, verified, expected_hash: expected_hash.to_string(), actual_hash, piece_index }
+    pub fn new(
+        length: usize,
+        verified: bool,
+        expected_hash: &String,
+        actual_hash: String,
+        piece_index: usize,
+    ) -> Self {
+        PieceVerification {
+            length,
+            verified,
+            expected_hash: expected_hash.to_string(),
+            actual_hash,
+            piece_index,
+        }
     }
 }
 

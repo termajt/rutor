@@ -7,9 +7,6 @@ pub const TOPIC_PIECE_EVENT: &str = &"piece_event";
 pub const TOPIC_PEER_EVENT: &str = &"peer_event";
 
 #[derive(Debug)]
-pub enum TorrentEvent {}
-
-#[derive(Debug)]
 pub enum PieceEvent {
     BlockData {
         peer: SocketAddr,
@@ -28,6 +25,7 @@ pub enum PieceEvent {
     PeerDisconnected {
         peer: SocketAddr,
     },
+    Shutdown,
 }
 
 #[derive(Debug)]
@@ -52,6 +50,7 @@ pub enum PeerEvent {
         addr: SocketAddr,
         peer_id: Vec<u8>,
     },
+    Shutdown,
 }
 
 #[derive(Debug)]
@@ -67,4 +66,11 @@ pub enum ClientEvent {
         begin: usize,
         data: Vec<u8>,
     },
+    Shutdown,
+}
+
+#[derive(Debug)]
+pub enum SocketDataEvent {
+    Data((SocketAddr, Vec<u8>)),
+    Shutdown,
 }

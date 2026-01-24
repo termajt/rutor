@@ -21,7 +21,7 @@ struct ProgressTracker {
     thread_workers: usize,
     download_info: DownloadInfo,
     speed: ByteSpeed,
-    last_downloaded: u64
+    last_downloaded: u64,
 }
 
 impl ProgressTracker {
@@ -48,7 +48,7 @@ impl ProgressTracker {
             thread_workers: thread_workers,
             download_info: download_info,
             speed: ByteSpeed::new(Duration::from_secs(20), Duration::from_secs(1)),
-            last_downloaded: last_downloaded
+            last_downloaded: last_downloaded,
         }
     }
 
@@ -114,12 +114,7 @@ impl ProgressTracker {
         format!("{:02}:{:02}:{:02}", hours, minutes, secs)
     }
 
-    fn update(
-        &mut self,
-        download_info: DownloadInfo,
-        system: &System,
-        thread_workers: usize,
-    ) {
+    fn update(&mut self, download_info: DownloadInfo, system: &System, thread_workers: usize) {
         let downloaded_now = download_info.downloaded;
         let delta = downloaded_now.saturating_sub(self.last_downloaded);
 
@@ -197,7 +192,11 @@ impl ProgressTracker {
         );
         println!(
             "{0}{1:<10}:{2} {3} (C) / {4} (A)",
-            blue, "Peers", reset, self.download_info.connected_peers, self.download_info.available_peers
+            blue,
+            "Peers",
+            reset,
+            self.download_info.connected_peers,
+            self.download_info.available_peers
         );
         println!(
             "{0}{1:<10}:{2} {3} / {4}",
@@ -279,8 +278,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "-d" | "--destination" => {
                 i += 1;
                 if i >= args.len() {
-                    eprintln!("ERROR: destination path not provided");
-                    std::process::exit(1);
+                    return Err("destination path not provided".into());
                 }
                 destination = Some(PathBuf::from(&args[i]));
             }
@@ -296,20 +294,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 filename = arg.to_string();
             }
             _ => {
-                eprintln!("ERROR: unknown argument '{}'", args[i]);
                 let mut stderr = std::io::stderr();
                 print_usage_header(&mut stderr, &program);
-                std::process::exit(1);
+                return Err(format!("unknown argument '{}'", args[i]).into());
             }
         }
         i += 1;
     }
 
     if filename.is_empty() {
-        eprintln!("ERROR: missing torrent file");
         let mut stderr = std::io::stderr();
         print_usage_header(&mut stderr, &program);
-        std::process::exit(1);
+        return Err("missing torrent file".into());
     }
 
     let pid = sysinfo::get_current_pid()?;
@@ -345,7 +341,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         first_draw = false;
         std::thread::sleep(Duration::from_secs(1));
     }
-    client.stop();
     system.refresh_all();
     progress_tracker.update_and_display(
         client.file_status(),
@@ -353,6 +348,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         client.get_thread_worker_count(),
         first_draw,
     );
-    println!("\nDownload complete!");
+    client.stop();
+    eprintln!("✅ Download complete!");
+    println!("✅ Download complete!");
+    client.join();
+    eprintln!("main returning!");
     Ok(())
 }

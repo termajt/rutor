@@ -772,6 +772,7 @@ impl PeerManager {
                 drop(torrent);
                 self.attempt_connect_peers(info_hash, my_peer_id, socket_tx);
             }
+            PeerEvent::Shutdown => return,
         }
     }
 }
