@@ -1,6 +1,5 @@
 use std::fmt::Write;
 use std::net::UdpSocket;
-use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs},
@@ -134,9 +133,8 @@ impl AnnounceManager {
     /// Creates a new `AnnounceManager` for a given torrent.
     ///
     /// If the torrent has an `announce_list`, it is used; otherwise, the single `announce` URL is used.
-    pub fn new(torrent: Arc<RwLock<Torrent>>) -> Self {
+    pub fn new(torrent: &Torrent) -> Self {
         let mut tiers = Vec::new();
-        let torrent = torrent.read().unwrap();
         if !torrent.announce_list.is_empty() {
             for tier_urls in &torrent.announce_list {
                 let tier = tier_urls
@@ -148,7 +146,6 @@ impl AnnounceManager {
         } else if let Some(url) = &torrent.announce {
             tiers.push(vec![TrackerState::new(url.clone())]);
         }
-        drop(torrent);
 
         AnnounceManager { tiers: tiers }
     }
@@ -260,7 +257,7 @@ pub fn announce(
     uploaded: u64,
     downloaded: u64,
     left: u64,
-    event: Option<&str>,
+    event: Option<String>,
     timeout: Option<Duration>,
 ) -> Result<TrackerResponse, Box<dyn std::error::Error>> {
     if tracker_url.starts_with("http") {
@@ -300,7 +297,7 @@ fn announce_http(
     uploaded: u64,
     downloaded: u64,
     left: u64,
-    event: Option<&str>,
+    event: Option<String>,
     timeout: Option<Duration>,
 ) -> Result<TrackerResponse, Box<dyn std::error::Error>> {
     let mut url = String::new();
@@ -344,7 +341,7 @@ fn announce_udp(
     uploaded: u64,
     downloaded: u64,
     left: u64,
-    event: Option<&str>,
+    event: Option<String>,
     timeout: Option<Duration>,
 ) -> Result<TrackerResponse, Box<dyn std::error::Error>> {
     let timeout = timeout.unwrap_or(Duration::from_secs(15));
@@ -379,12 +376,20 @@ fn announce_udp(
 
     let action_announce: u32 = 1;
     let transaction_id = rand::rng().next_u32();
-    let event_code: u32 = match event {
-        Some("completed") => 1,
-        Some("started") => 2,
-        Some("stopped") => 3,
-        _ => 0,
-    };
+    let event_code: u32;
+    if let Some(e) = event {
+        if "completed".to_string() == e {
+            event_code = 1;
+        } else if "started".to_string() == e {
+            event_code = 2;
+        } else if "stopped".to_string() == e {
+            event_code = 3;
+        } else {
+            event_code = 0;
+        }
+    } else {
+        event_code = 0;
+    }
 
     let mut req = Vec::with_capacity(98);
     req.extend_from_slice(&connection_id.to_be_bytes());

@@ -1,22 +1,15 @@
 use std::{
-    collections::HashMap,
     fmt,
-    hash::Hash,
-    io::{Read, Write},
+    io::{self, ErrorKind, Read, Write},
     net::{SocketAddr, TcpStream},
-    sync::{Arc, RwLock, mpsc::Sender},
+    sync::mpsc::{Receiver, Sender},
     time::{Duration, Instant},
 };
 
-use threadpool::ThreadPool;
+use crate::{bitfield::Bitfield, engine::Event, picker::PiecePicker};
 
-use crate::{
-    bitfield::Bitfield,
-    consts::{self, ClientEvent, PeerEvent, PieceEvent},
-    pubsub::PubSub,
-    socketmanager::{Command, Socket},
-    torrent::Torrent,
-};
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
+const MAX_READ_BUF: usize = 512 * 1024;
 
 /// Represents a message exchanged between BitTorrent peers
 /// according to the standard peer wire protocol.
@@ -51,8 +44,7 @@ pub enum PeerMessage {
     /// Sends the bitfield of the pieces the sending peer has.
     ///
     /// # Fields
-    ///
-    /// * `bitfield` - A `Bitfield` struct representing which pieces
+    ///    /// * `bitfield` - A `Bitfield` struct representing which pieces
     ///   the peer has.
     Bitfield(Bitfield),
 
@@ -118,73 +110,6 @@ impl fmt::Display for PeerMessage {
 }
 
 impl PeerMessage {
-    /// Parses a peer wire protocol message from a byte buffer.
-    ///
-    /// Returns:
-    /// - `Ok(Some(msg))` when a full message was parsed.
-    /// - `Ok(None)` if more data is needed.
-    /// - `Err` if the buffer contains invalid or incomplete data.
-    pub fn parse(
-        buf: &mut Vec<u8>,
-        total_pieces: usize,
-    ) -> Result<Option<PeerMessage>, Box<dyn std::error::Error>> {
-        if buf.len() < 4 {
-            return Ok(None);
-        }
-
-        let msg_len = u32::from_be_bytes(buf[..4].try_into()?) as usize;
-
-        if msg_len == 0 {
-            buf.drain(..4);
-            return Ok(Some(PeerMessage::KeepAlive));
-        }
-
-        if buf.len() < 4 + msg_len {
-            return Err("not enough data".into());
-        }
-
-        let msg_id = buf[4];
-        let payload = &buf[5..4 + msg_len];
-        let msg = match msg_id {
-            0 => Some(PeerMessage::Choke),
-            1 => Some(PeerMessage::Unchoke),
-            2 => Some(PeerMessage::Interested),
-            3 => Some(PeerMessage::NotInterested),
-            4 => Some(PeerMessage::Have(u32::from_be_bytes(
-                payload[..4].try_into()?,
-            ))),
-            5 => Some(PeerMessage::Bitfield(Bitfield::from_bytes(
-                payload.to_vec(),
-                total_pieces,
-            ))),
-            6 => {
-                let index = u32::from_be_bytes(payload[0..4].try_into()?);
-                let begin = u32::from_be_bytes(payload[4..8].try_into()?);
-                let length = u32::from_be_bytes(payload[8..12].try_into()?);
-                Some(PeerMessage::Request((index, begin, length)))
-            }
-            7 => {
-                let index = u32::from_be_bytes(payload[0..4].try_into()?);
-                let begin = u32::from_be_bytes(payload[4..8].try_into()?);
-                let block = payload[8..].to_vec();
-                Some(PeerMessage::Piece((index, begin, block)))
-            }
-            8 => {
-                let index = u32::from_be_bytes(payload[0..4].try_into()?);
-                let begin = u32::from_be_bytes(payload[4..8].try_into()?);
-                let length = u32::from_be_bytes(payload[8..12].try_into()?);
-                Some(PeerMessage::Cancel((index, begin, length)))
-            }
-            9 => Some(PeerMessage::Port(u16::from_be_bytes(
-                payload[0..2].try_into()?,
-            ))),
-            _ => None,
-        };
-        buf.drain(..4 + msg_len);
-
-        Ok(msg)
-    }
-
     pub fn encode(&self) -> Vec<u8> {
         match self {
             PeerMessage::Choke => Self::encode_simple(0),
@@ -246,544 +171,235 @@ impl PeerMessage {
     fn encode_simple(id: u8) -> Vec<u8> {
         vec![0, 0, 0, 1, id]
     }
-
-    pub fn is_critical(&self) -> bool {
-        matches!(
-            self,
-            PeerMessage::Piece(_) | PeerMessage::Request(_) | PeerMessage::Cancel(_)
-        )
-    }
 }
 
-/// Represents the connection status of a peer in the swarm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PeerStatus {
-    New,
-    Connecting,
-    Connected,
-    Failed,
-    Disconnected,
+#[derive(Debug)]
+pub struct PeerStats {
+    pub bytes_received: usize,
+    pub avg_speed: f64,
+    pub last_update: Instant,
 }
 
-/// Contains identifying and connection metadata for a single peer.
-///
-/// Tracks its address, last seen time, status, and optional peer ID
-/// (set after a successful handshake).
-#[derive(Debug, Clone)]
-pub struct PeerInfo {
-    addr: SocketAddr,
-    last_seen: Instant,
-    status: PeerStatus,
-    failures: u8,
-    peer_id: Option<Vec<u8>>,
-}
-
-impl PartialEq for PeerInfo {
-    fn eq(&self, other: &Self) -> bool {
-        self.addr == other.addr && self.peer_id == other.peer_id
-    }
-}
-
-impl Eq for PeerInfo {}
-
-impl PeerInfo {
-    /// Creates a new peer entry with status `PeerStatus::New`.
-    fn new(addr: SocketAddr) -> Self {
+impl PeerStats {
+    pub fn new() -> Self {
         Self {
-            addr: addr,
-            last_seen: Instant::now(),
-            status: PeerStatus::New,
-            failures: 0,
-            peer_id: None,
+            bytes_received: 0,
+            avg_speed: 0.0,
+            last_update: Instant::now(),
+        }
+    }
+
+    pub fn update(&mut self, bytes: usize) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update).as_secs_f64();
+
+        if elapsed >= 1.0 {
+            let instant_rate = self.bytes_received as f64 / elapsed;
+
+            const ALPHA: f64 = 0.1;
+            if self.avg_speed == 0.0 {
+                self.avg_speed = instant_rate;
+            } else {
+                self.avg_speed = self.avg_speed * (1.0 - ALPHA) + instant_rate * ALPHA;
+            }
+            self.bytes_received = 0;
+            self.last_update = now;
+        } else {
+            self.bytes_received += bytes;
         }
     }
 }
 
-impl Hash for PeerInfo {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.addr.hash(state);
-        self.peer_id.hash(state);
+#[derive(Debug)]
+pub struct PeerIoState {
+    read_buf: Vec<u8>,
+    write_buf: Vec<u8>,
+}
+
+impl PeerIoState {
+    pub fn new() -> Self {
+        Self {
+            read_buf: Vec::with_capacity(8 * 1024),
+            write_buf: Vec::with_capacity(8 * 1024),
+        }
     }
 }
 
 #[derive(Debug)]
-pub struct PeerConnection {
-    addr: SocketAddr,
-    peer_id: [u8; 20],
-    buffer: Vec<u8>,
+pub struct Peer {
     pub bitfield: Bitfield,
+    pub addr: SocketAddr,
     pub choked: bool,
-    interested: bool,
+    pub am_choked: bool,
+    pub interested: bool,
     pub am_interested: bool,
+    pub inflight_requests: usize,
+    pub max_pipeline: usize,
+    pub outbound_queue: Sender<PeerMessage>,
+    pub stats: PeerStats,
 }
 
-impl PeerConnection {
-    fn new(addr: SocketAddr, id: Vec<u8>, total_pieces: usize) -> Self {
-        let mut peer_id = [0u8; 20];
-        peer_id[0..20].copy_from_slice(&id[..20]);
+impl Peer {
+    pub fn new(
+        addr: SocketAddr,
+        total_pieces: usize,
+        outbound_queue: Sender<PeerMessage>,
+        max_pipeline: usize,
+    ) -> Self {
         Self {
-            addr: addr,
-            peer_id: peer_id,
-            buffer: Vec::new(),
             bitfield: Bitfield::new(total_pieces),
+            addr,
             choked: true,
+            am_choked: true,
             interested: false,
             am_interested: false,
+            inflight_requests: 0,
+            max_pipeline,
+            outbound_queue,
+            stats: PeerStats::new(),
         }
     }
 
-    fn handle_message(&mut self, msg: &PeerMessage) {
-        match msg {
-            PeerMessage::Choke => {
-                self.choked = true;
-            }
-            PeerMessage::Unchoke => {
-                self.choked = false;
-            }
-            PeerMessage::Interested => {
-                self.interested = true;
-            }
-            PeerMessage::NotInterested => {
-                self.interested = false;
-            }
-            PeerMessage::Have(index) => {
-                self.bitfield.set(&(*index as usize), true);
-            }
-            PeerMessage::Bitfield(new_bitfield) => {
-                self.bitfield.merge(new_bitfield);
-            }
-            _ => return,
+    pub fn desired_pipeline(&self, block_size: usize) -> usize {
+        if self.stats.avg_speed <= f64::EPSILON {
+            // Brand-new or stalled peer: probe gently
+            return 4;
         }
+        let blocks_per_sec = self.stats.avg_speed / block_size as f64;
+
+        blocks_per_sec.ceil().clamp(1.0, 32.0) as usize
     }
 
-    fn on_recv(&mut self, data: &[u8]) {
-        self.buffer.extend_from_slice(data);
-    }
-
-    fn parse_messages(&mut self, total_pieces: usize) -> Option<PeerMessage> {
-        if self.buffer.len() == 0 {
-            return None;
-        }
-        if let Ok(v) = PeerMessage::parse(&mut self.buffer, total_pieces) {
-            v
-        } else {
-            None
-        }
-    }
-
-    fn is_choked(&self) -> bool {
-        self.choked
-    }
-}
-
-impl PartialEq for PeerConnection {
-    fn eq(&self, other: &Self) -> bool {
-        self.addr == other.addr && self.peer_id == other.peer_id
-    }
-}
-
-impl Eq for PeerConnection {}
-
-impl Hash for PeerConnection {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.addr.hash(state);
-        self.peer_id.hash(state);
-    }
-}
-
-#[derive(Debug)]
-struct PeerManagerState {
-    peers: HashMap<SocketAddr, PeerInfo>,
-    connected: HashMap<SocketAddr, PeerConnection>,
-    pending: usize,
-}
-
-impl PeerManagerState {
-    fn new() -> Self {
-        Self {
-            peers: HashMap::new(),
-            connected: HashMap::new(),
-            pending: 0,
-        }
-    }
-
-    fn available_capacity(&self, max_connections: usize) -> usize {
-        max_connections.saturating_sub(self.connected.len() + self.pending)
-    }
-
-    fn next_peer(&mut self) -> Option<SocketAddr> {
-        self.peers.values_mut().find_map(|p| {
-            if matches!(p.status, PeerStatus::New | PeerStatus::Failed) {
-                p.status = PeerStatus::Connecting;
-                Some(p.addr)
-            } else {
-                None
-            }
-        })
-    }
-}
-
-/// Manages all peers in the swarm for a single torrent.
-///
-/// The `PeerManager` handles discovering peers, initiating connections,
-/// maintaining active sockets, and dispatching messages between threads.
-/// It is shared between background worker threads and the main client.
-#[derive(Debug, Clone)]
-pub struct PeerManager {
-    tpool: Arc<ThreadPool>,
-    torrent: Arc<RwLock<Torrent>>,
-    peer_event_tx: Arc<PubSub<PeerEvent>>,
-    piece_event_tx: Arc<PubSub<PieceEvent>>,
-    client_event_tx: Arc<PubSub<ClientEvent>>,
-    max_connections: Arc<usize>,
-    state: Arc<RwLock<PeerManagerState>>,
-}
-
-impl PeerManager {
-    /// Creates a new `PeerManager` with the given maximum connection limit,
-    /// thread pool, shutdown flag, and torrent metadata.
-    pub fn new(
-        max_connections: usize,
-        tpool: Arc<ThreadPool>,
-        torrent: Arc<RwLock<Torrent>>,
-        peer_event_tx: Arc<PubSub<PeerEvent>>,
-        piece_event_tx: Arc<PubSub<PieceEvent>>,
-        client_event_tx: Arc<PubSub<ClientEvent>>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {
-            tpool: tpool,
-            torrent: torrent,
-            peer_event_tx: peer_event_tx,
-            piece_event_tx: piece_event_tx,
-            client_event_tx: client_event_tx,
-            max_connections: Arc::new(max_connections),
-            state: Arc::new(RwLock::new(PeerManagerState::new())),
-        })
-    }
-
-    pub fn data_received(&self, addr: &SocketAddr, data: &[u8]) {
-        let mut state = self.state.write().unwrap();
-        let mut piece_events = Vec::new();
-        let mut peer_events = Vec::new();
-        if let Some(pc) = state.connected.get_mut(addr) {
-            pc.on_recv(data);
-            self.parse_handle_messages(pc, &mut piece_events, &mut peer_events);
-        }
-        drop(state);
-        for event in piece_events {
-            let _ = self
-                .piece_event_tx
-                .publish(consts::TOPIC_PIECE_EVENT, event);
-        }
-        for event in peer_events {
-            let _ = self.peer_event_tx.publish(consts::TOPIC_PEER_EVENT, event);
-        }
-    }
-
-    fn parse_handle_messages(
-        &self,
-        pc: &mut PeerConnection,
-        piece_events: &mut Vec<PieceEvent>,
-        peer_events: &mut Vec<PeerEvent>,
+    pub fn try_request_from_peer(
+        &mut self,
+        picker: &mut PiecePicker,
+        torrent_bitfield: &Bitfield,
+        event_tx: &Sender<Event>,
     ) {
-        let torrent = self.torrent.read().unwrap();
-        let total_pieces = torrent.info.piece_hashes.len();
-        while let Some(message) = pc.parse_messages(total_pieces) {
-            pc.handle_message(&message);
-            match message {
-                PeerMessage::Bitfield(_) | PeerMessage::Have(_) => {
-                    let am_interested_now = torrent.info.bitfield_differs(&pc.bitfield);
-                    if am_interested_now != pc.am_interested {
-                        pc.am_interested = am_interested_now;
-                        let message = if am_interested_now {
-                            PeerMessage::Interested
-                        } else {
-                            PeerMessage::NotInterested
-                        };
-                        peer_events.push(PeerEvent::Send {
-                            addr: pc.addr,
-                            message: message,
-                        });
-                    }
-                    piece_events.push(PieceEvent::PieceAvailabilityChange {
-                        peer: pc.addr,
-                        bitfield: pc.bitfield.clone(),
-                    });
-                }
-                PeerMessage::Choke | PeerMessage::Unchoke => {
-                    piece_events.push(PieceEvent::PeerChokeChanged {
-                        addr: pc.addr,
-                        choked: matches!(message, PeerMessage::Choke),
-                    });
-                }
-                PeerMessage::Piece((index, begin, data)) => {
-                    piece_events.push(PieceEvent::BlockData {
-                        peer: pc.addr,
-                        piece_index: index,
-                        begin: begin,
-                        data: data,
-                    });
-                }
-                _ => {}
-            }
+        if self.am_choked || !self.am_interested {
+            return;
         }
-    }
-
-    fn add_peers(&self, new_peers: &[SocketAddr]) {
-        let mut state = self.state.write().unwrap();
-        for addr in new_peers {
-            if state.peers.contains_key(addr) || state.connected.contains_key(addr) {
-                continue;
-            }
-            state.peers.insert(*addr, PeerInfo::new(*addr));
+        let free = self.max_pipeline.saturating_sub(self.inflight_requests);
+        if free == 0 {
+            return;
         }
-        drop(state);
-        self.send_peers_changed();
-    }
-
-    /// Marks a peer as successfully connected and initializes a `PeerConnection`.
-    fn mark_connected(&self, addr: &SocketAddr, peer_id: &[u8]) {
-        let mut state = self.state.write().unwrap();
-        state.pending = state.pending.saturating_sub(1);
-        if let Some(p) = state.peers.get_mut(&addr) {
-            p.status = PeerStatus::Connected;
-            p.last_seen = Instant::now();
-            p.failures = 0;
-        }
-        let mut changed = false;
-        if !state.connected.contains_key(&addr) {
-            changed = true;
-            let torrent = self.torrent.read().unwrap();
-            state.connected.insert(
-                *addr,
-                PeerConnection::new(*addr, peer_id.to_vec(), torrent.info.piece_hashes.len()),
-            );
-        }
-        drop(state);
-        if changed {
-            self.send_peers_changed();
-            self.maybe_send_bitfield(addr);
-        }
-    }
-
-    /// Marks a peer as having failed to connect, possibly removing it if it failed repeatedly.
-    fn mark_failed(&self, addr: &SocketAddr) {
-        let mut state = self.state.write().unwrap();
-        state.pending = state.pending.saturating_sub(1);
-        let mut changed = false;
-        if let Some(p) = state.peers.get_mut(&addr) {
-            p.status = PeerStatus::Failed;
-            p.failures += 1;
-            if p.failures >= 1 {
-                state.peers.remove(&addr);
-                changed = true;
-            }
-        }
-        if let Some(_) = state.connected.remove(&addr) {
-            changed = true;
-        }
-        drop(state);
-        if changed {
-            self.send_peers_changed();
-        }
-    }
-
-    /// Removes a peer that has been disconnected.
-    fn mark_disconnected(&self, addr: &SocketAddr) {
-        let mut state = self.state.write().unwrap();
-        let mut changed = false;
-        if let Some(_) = state.peers.remove(addr) {
-            changed = true;
-        }
-
-        if let Some(_) = state.connected.remove(addr) {
-            changed = true;
-        }
-        drop(state);
-        let _ = self.piece_event_tx.publish(
-            consts::TOPIC_PIECE_EVENT,
-            PieceEvent::PeerDisconnected { peer: *addr },
-        );
-        if changed {
-            self.send_peers_changed();
-        }
-    }
-
-    fn send_peers_changed(&self) {
-        let _ = self
-            .client_event_tx
-            .publish(consts::TOPIC_CLIENT_EVENT, ClientEvent::PeersChanged);
-    }
-
-    /// Returns the number of currently connected peers.
-    pub fn connected_peers(&self) -> usize {
-        let state = self.state.read().unwrap();
-        state.connected.len()
-    }
-
-    /// Returns the total number of known peers.
-    pub fn peer_count(&self) -> usize {
-        let state = self.state.read().unwrap();
-        state.peers.len()
-    }
-
-    /// Returns the number of pending (in-progress) connections.
-    pub fn get_pending_connections(&self) -> usize {
-        let state = self.state.read().unwrap();
-        state.pending
-    }
-
-    pub fn get_unchoked_and_interested_peers(&self) -> Vec<SocketAddr> {
-        let state = self.state.read().unwrap();
-        state
-            .connected
-            .iter()
-            .filter(|(_, pcon)| !pcon.choked && pcon.am_interested)
-            .map(|(addr, _)| *addr)
-            .collect()
-    }
-
-    fn attempt_connect_peers(
-        &self,
-        info_hash: [u8; 20],
-        peer_id: [u8; 20],
-        socket_tx: Arc<Sender<Command>>,
-    ) {
-        let to_connect;
-        let peers_to_try: Vec<SocketAddr>;
-        {
-            let mut state = self.state.write().unwrap();
-            to_connect = state.available_capacity(*self.max_connections);
-            peers_to_try = (0..to_connect).filter_map(|_| state.next_peer()).collect();
-            state.pending += peers_to_try.len();
-        }
-        for addr in peers_to_try {
-            let peer_event_tx = self.peer_event_tx.clone();
-            let socket_tx = socket_tx.clone();
-            self.tpool
-                .execute(move || match connect_peer(addr, &info_hash, &peer_id) {
-                    Ok((peer_id, socket)) => {
-                        let _ = socket_tx.send(Command::Add((socket, addr, None)));
-                        let _ = peer_event_tx.publish(
-                            consts::TOPIC_PEER_EVENT,
-                            PeerEvent::PeerConnected {
-                                addr: addr,
-                                peer_id: peer_id,
-                            },
-                        );
-                    }
-                    Err(_) => {
-                        let _ = peer_event_tx.publish(
-                            consts::TOPIC_PEER_EVENT,
-                            PeerEvent::ConnectFailure { addr: addr },
-                        );
-                    }
-                });
-        }
-    }
-
-    fn maybe_send_bitfield(&self, addr: &SocketAddr) {
-        let mut event_opt = None;
-        let state = self.state.read().unwrap();
-        if let Some(pc) = state.connected.get(addr) {
-            let torrent = self.torrent.read().unwrap();
-            if torrent.info.has_any_pieces() {
-                event_opt = Some(PeerEvent::Send {
-                    addr: pc.addr,
-                    message: PeerMessage::Bitfield(torrent.info.bitfield()),
-                });
-            }
-        }
-        drop(state);
-        if let Some(event) = event_opt {
-            let _ = self.peer_event_tx.publish(consts::TOPIC_PEER_EVENT, event);
-        }
-    }
-
-    fn get_message_to_socket(
-        &self,
-        pcon: &PeerConnection,
-        message: &PeerMessage,
-    ) -> Option<Command> {
-        if pcon.is_choked() && matches!(message, PeerMessage::Request(_) | PeerMessage::Cancel(_)) {
-            return None;
-        }
-        let encoded = message.encode();
-        let is_critical = message.is_critical();
-        Some(Command::Send(pcon.addr, encoded, is_critical))
-    }
-
-    pub fn handle_event(
-        &self,
-        ev: Arc<PeerEvent>,
-        my_peer_id: [u8; 20],
-        socket_tx: Arc<Sender<Command>>,
-    ) {
-        match &*ev {
-            PeerEvent::SendToAll { message } => {
-                let mut messages = Vec::new();
-                let state = self.state.read().unwrap();
-                for pcon in state.connected.values() {
-                    if let Some(msg) = self.get_message_to_socket(pcon, message) {
-                        messages.push(msg);
-                    }
-                }
-                drop(state);
-                for msg in messages {
-                    let _ = socket_tx.send(msg);
-                }
-            }
-            PeerEvent::Send { addr, message } => {
-                let mut message_opt = None;
-                let state = self.state.read().unwrap();
-                if let Some(pcon) = state.connected.get(addr) {
-                    message_opt = self.get_message_to_socket(pcon, message);
-                }
-                drop(state);
-                if let Some(msg) = message_opt {
-                    let _ = socket_tx.send(msg);
-                }
-            }
-            PeerEvent::SocketDisconnect { addr } => {
-                self.mark_disconnected(addr);
-                let torrent = self.torrent.read().unwrap();
-                let info_hash = torrent.info_hash;
-                drop(torrent);
-                self.attempt_connect_peers(info_hash, my_peer_id, socket_tx);
-            }
-            PeerEvent::ConnectFailure { addr } => {
-                self.mark_failed(addr);
-                let torrent = self.torrent.read().unwrap();
-                let info_hash = torrent.info_hash;
-                drop(torrent);
-                self.attempt_connect_peers(info_hash, my_peer_id, socket_tx);
-            }
-            PeerEvent::NewPeers { peers } => {
-                self.add_peers(peers);
-                let torrent = self.torrent.read().unwrap();
-                let info_hash = torrent.info_hash;
-                drop(torrent);
-                self.attempt_connect_peers(info_hash, my_peer_id, socket_tx);
-            }
-            PeerEvent::PeerConnected { addr, peer_id } => {
-                self.mark_connected(addr, peer_id);
-                let torrent = self.torrent.read().unwrap();
-                let info_hash = torrent.info_hash;
-                drop(torrent);
-                self.attempt_connect_peers(info_hash, my_peer_id, socket_tx);
-            }
-            PeerEvent::Shutdown => return,
+        for req in picker.pick_blocks_for_peer(&self.addr, &self.bitfield, torrent_bitfield, free) {
+            self.inflight_requests += 1;
+            let _ = event_tx.send(Event::SendPeerMessage {
+                addr: self.addr,
+                message: PeerMessage::Request((
+                    req.piece as u32,
+                    req.offset as u32,
+                    req.length as u32,
+                )),
+            });
         }
     }
 }
 
-fn connect_peer(
+pub fn peer_io_loop(
     addr: SocketAddr,
+    mut stream: TcpStream,
+    event_tx: Sender<Event>,
     info_hash: &[u8; 20],
     peer_id: &[u8; 20],
-) -> Result<(Vec<u8>, Socket), Box<dyn std::error::Error>> {
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+    total_pieces: usize,
+    messages_rx: Receiver<PeerMessage>,
+) {
+    if let Err(e) = send_handshake(&mut stream, info_hash, peer_id) {
+        let _ = event_tx.send(Event::PeerDisconnected {
+            addr,
+            reason: e.to_string(),
+        });
+        return;
+    }
 
+    if let Err(e) = stream.set_nonblocking(true) {
+        eprintln!("failed to set nonblocking for: {}", addr);
+        let _ = event_tx.send(Event::PeerDisconnected {
+            addr,
+            reason: e.to_string(),
+        });
+        return;
+    }
+    let _ = event_tx.send(Event::PeerHandshakeComplete { addr });
+
+    let mut state = PeerIoState::new();
+    let mut did_work;
+    let mut idle_sleep = Duration::from_millis(1);
+    let mut last_keepalive = Instant::now();
+    loop {
+        did_work = false;
+        // READ
+        match read_peer_messages_nonblocking(&mut stream, &mut state, total_pieces) {
+            Ok(msgs) => {
+                if !msgs.is_empty() {
+                    did_work = true;
+                    for msg in msgs {
+                        let _ = event_tx.send(Event::PeerMessage { addr, message: msg });
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = event_tx.send(Event::PeerDisconnected {
+                    addr,
+                    reason: e.to_string(),
+                });
+                break;
+            }
+        }
+
+        while let Ok(msg) = messages_rx.try_recv() {
+            let mut encoded = msg.encode();
+            state.write_buf.append(&mut encoded);
+        }
+
+        match flush_writes(&mut stream, &mut state) {
+            Ok(written) => {
+                if written > 0 {
+                    did_work = true;
+                }
+            }
+            Err(e) => {
+                let _ = event_tx.send(Event::PeerDisconnected {
+                    addr,
+                    reason: e.to_string(),
+                });
+                break;
+            }
+        }
+
+        if last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+            if state.write_buf.is_empty() {
+                let _ = state
+                    .write_buf
+                    .extend_from_slice(&PeerMessage::KeepAlive.encode());
+            }
+            last_keepalive = Instant::now();
+        }
+
+        if state.read_buf.len() > MAX_READ_BUF {
+            let _ = event_tx.send(Event::PeerDisconnected {
+                addr,
+                reason: "read buffer exceeded maximum allowed size".to_string(),
+            });
+            break;
+        }
+
+        if did_work {
+            idle_sleep = Duration::from_millis(1);
+        } else {
+            std::thread::sleep(idle_sleep);
+            idle_sleep = (idle_sleep * 2).min(Duration::from_millis(20));
+        }
+    }
+}
+
+fn send_handshake(
+    stream: &mut TcpStream,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut handshake = Vec::with_capacity(68);
     handshake.push(19);
     handshake.extend_from_slice(b"BitTorrent protocol");
@@ -802,7 +418,127 @@ fn connect_peer(
     if &buf[28..48] != info_hash {
         return Err("info_hash mismatch".into());
     }
+    Ok(())
+}
 
-    let remote_peer_id = &buf[48..68];
-    Ok((remote_peer_id.to_vec(), Socket::Client((stream, addr))))
+fn flush_writes(
+    stream: &mut TcpStream,
+    state: &mut PeerIoState,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut written = 0;
+    while !state.write_buf.is_empty() {
+        match stream.write(&state.write_buf) {
+            Ok(0) => {
+                return Err(io::Error::new(ErrorKind::WriteZero, "peer closed connection").into());
+            }
+            Ok(n) => {
+                written += n;
+                state.write_buf.drain(0..n);
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(written)
+}
+
+fn read_peer_messages_nonblocking(
+    stream: &mut TcpStream,
+    state: &mut PeerIoState,
+    total_pieces: usize,
+) -> Result<Vec<PeerMessage>, Box<dyn std::error::Error>> {
+    let mut temp = [0u8; 4096];
+
+    loop {
+        match stream.read(&mut temp) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "peer closed connection",
+                )
+                .into());
+            }
+            Ok(n) => {
+                state.read_buf.extend_from_slice(&temp[..n]);
+            }
+            Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    let mut messages = Vec::new();
+
+    loop {
+        if state.read_buf.len() < 4 {
+            break;
+        }
+
+        let len = u32::from_be_bytes(state.read_buf[0..4].try_into()?) as usize;
+
+        if state.read_buf.len() < 4 + len {
+            break;
+        }
+
+        state.read_buf.drain(0..4);
+
+        let payload: Vec<u8> = state.read_buf.drain(0..len).collect();
+
+        let msg = parse_peer_message(&payload, total_pieces)?;
+        messages.push(msg);
+    }
+
+    Ok(messages)
+}
+
+fn parse_peer_message(
+    payload: &[u8],
+    total_pieces: usize,
+) -> Result<PeerMessage, Box<dyn std::error::Error>> {
+    if payload.is_empty() {
+        return Ok(PeerMessage::KeepAlive);
+    }
+
+    let id = payload[0];
+    let data = &payload[1..];
+
+    let msg = match id {
+        0 => PeerMessage::Choke,
+        1 => PeerMessage::Unchoke,
+        2 => PeerMessage::Interested,
+        3 => PeerMessage::NotInterested,
+        4 => PeerMessage::Have(u32::from_be_bytes(data[..4].try_into()?)),
+        5 => PeerMessage::Bitfield(Bitfield::from_bytes(data.to_vec(), total_pieces)),
+        6 => {
+            let index = u32::from_be_bytes(data[0..4].try_into()?);
+            let begin = u32::from_be_bytes(data[4..8].try_into()?);
+            let length = u32::from_be_bytes(data[8..12].try_into()?);
+            PeerMessage::Request((index, begin, length))
+        }
+        7 => {
+            let index = u32::from_be_bytes(data[0..4].try_into()?);
+            let begin = u32::from_be_bytes(data[4..8].try_into()?);
+            let block = data[8..].to_vec();
+            PeerMessage::Piece((index, begin, block))
+        }
+        8 => {
+            let index = u32::from_be_bytes(data[0..4].try_into()?);
+            let begin = u32::from_be_bytes(data[4..8].try_into()?);
+            let length = u32::from_be_bytes(data[8..12].try_into()?);
+            PeerMessage::Cancel((index, begin, length))
+        }
+        9 => PeerMessage::Port(u16::from_be_bytes(data[0..2].try_into()?)),
+        _ => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("unknown message id: {}", id),
+            )
+            .into());
+        }
+    };
+
+    Ok(msg)
 }

@@ -26,6 +26,15 @@ impl Bitfield {
         }
     }
 
+    pub fn is_interesting_to(&self, other: &Bitfield) -> bool {
+        for i in 0..self.length {
+            if self.get(&i) && !other.get(&i) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Constructs a `Bitfield` from raw bytes and a specified number of pieces.
     ///
     /// The `bytes` vector must contain at least `(length + 7) / 8` bytes.

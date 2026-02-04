@@ -1,12 +1,15 @@
 use rutor::bytespeed::ByteSpeed;
-use rutor::client::{DownloadInfo, TorrentClient};
+use rutor::engine::{Engine, Event, MAX_PEER_IO, TorrentStats};
 use rutor::torrent;
 use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
+use threadpool::ThreadPool;
 
 struct ProgressTracker {
     name: String,
@@ -19,7 +22,7 @@ struct ProgressTracker {
     pid: Pid,
     show_consumption: bool,
     thread_workers: usize,
-    download_info: DownloadInfo,
+    stats: TorrentStats,
     speed: ByteSpeed,
     last_downloaded: u64,
 }
@@ -32,9 +35,9 @@ impl ProgressTracker {
         pid: Pid,
         show_consumption: bool,
         thread_workers: usize,
-        download_info: DownloadInfo,
+        stats: TorrentStats,
     ) -> Self {
-        let last_downloaded = download_info.downloaded;
+        let last_downloaded = stats.downloaded;
         Self {
             name: name.to_string(),
             total_size: total_size,
@@ -46,7 +49,7 @@ impl ProgressTracker {
             pid: pid,
             show_consumption: show_consumption,
             thread_workers: thread_workers,
-            download_info: download_info,
+            stats: stats,
             speed: ByteSpeed::new(Duration::from_secs(20), Duration::from_secs(1)),
             last_downloaded: last_downloaded,
         }
@@ -114,8 +117,8 @@ impl ProgressTracker {
         format!("{:02}:{:02}:{:02}", hours, minutes, secs)
     }
 
-    fn update(&mut self, download_info: DownloadInfo, system: &System, thread_workers: usize) {
-        let downloaded_now = download_info.downloaded;
+    fn update(&mut self, stats: TorrentStats, system: &System, thread_workers: usize) {
+        let downloaded_now = stats.downloaded;
         let delta = downloaded_now.saturating_sub(self.last_downloaded);
 
         self.speed.update(delta as usize);
@@ -134,14 +137,14 @@ impl ProgressTracker {
             self.cpu_usage = process.cpu_usage();
             self.mem_usage_kb = process.memory();
         }
-        self.download_info = download_info;
+        self.stats = stats;
     }
 
     fn display(&self, first_draw: bool) {
         if !first_draw {
             let mut max = if self.show_consumption { 6 } else { 5 };
-            if self.download_info.files.len() > 1 {
-                max += self.download_info.files.len();
+            if self.stats.files.len() > 1 {
+                max += self.stats.files.len();
             }
             for _ in 0..max {
                 print!("\r\x1B[1A\x1b[2K");
@@ -157,11 +160,11 @@ impl ProgressTracker {
         let white = "\x1b[97m";
         let reset = "\x1b[0m";
 
-        if self.download_info.files.len() == 1 {
+        if self.stats.files.len() == 1 {
             println!("📦 {}{}{}", cyan, self.name, reset);
         } else {
             println!("📦 {}{}{}", cyan, self.name, reset);
-            for (path, written, total_size) in &self.download_info.files {
+            for (path, written, total_size) in &self.stats.files {
                 let file_name = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -181,7 +184,7 @@ impl ProgressTracker {
             green,
             "Downloaded",
             reset,
-            self.human_bytes(self.download_info.downloaded),
+            self.human_bytes(self.stats.downloaded),
             self.human_bytes(self.total_size),
             yellow,
             self.human_bytes(self.download_speed as u64),
@@ -191,18 +194,14 @@ impl ProgressTracker {
             magenta,
         );
         println!(
-            "{0}{1:<10}:{2} {3} (C) / {4} (A)",
-            blue,
-            "Peers",
-            reset,
-            self.download_info.connected_peers,
-            self.download_info.available_peers
+            "{0}{1:<10}:{2} {3} / {4} (C) {5} (A)",
+            blue, "Peers", reset, self.stats.peers, MAX_PEER_IO, self.stats.available_peers
         );
         println!(
             "{0}{1:<10}:{2} {3} / {4}",
-            white, "Pieces", reset, self.download_info.pieces_verified, self.total_pieces
+            white, "Pieces", reset, self.stats.pieces_verified, self.total_pieces
         );
-        println!("{}", self.format_bar(self.download_info.downloaded));
+        println!("{}", self.format_bar(self.stats.downloaded));
         if self.show_consumption {
             println!(
                 "CPU: {:.1}% | Memory: {} | Threads: {}",
@@ -215,12 +214,12 @@ impl ProgressTracker {
 
     fn update_and_display(
         &mut self,
-        download_info: DownloadInfo,
+        stats: TorrentStats,
         system: &System,
         thread_workers: usize,
         first_draw: bool,
     ) {
-        self.update(download_info, system, thread_workers);
+        self.update(stats, system, thread_workers);
         self.display(first_draw);
     }
 }
@@ -310,48 +309,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pid = sysinfo::get_current_pid()?;
     let mut system = System::new_all();
-
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let workers = std::env::var("RUTOR_MAX_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(cores);
+    let tpool = Arc::new(threadpool::ThreadPool::new((workers * 2).min(64)));
     let torrent: torrent::Torrent = {
         let file = File::open(filename)?;
         torrent::Torrent::from_file(&file, destination)?
     };
-    let total_pieces = torrent.info.piece_hashes.len();
     let name = torrent.info.name.clone();
     let total_size = torrent.info.total_size;
-    let client = TorrentClient::new(torrent)?;
-    client.start()?;
-    let mut first_draw = true;
+    let total_pieces = torrent.info.piece_hashes.len();
+    let (event_tx, event_rx) = mpsc::channel();
+    let (io_tx, io_rx) = mpsc::channel();
+    let mut engine = Engine::new(torrent, event_tx.clone(), event_rx, io_tx, tpool.clone());
+    spawn_tick_handle(tpool.clone(), event_tx.clone());
+    engine.start(io_rx);
+
     let mut progress_tracker = ProgressTracker::new(
         &name,
         total_size,
         total_pieces,
         pid,
         show_consumption,
-        client.get_thread_worker_count(),
-        client.file_status(),
+        tpool.active_count(),
+        engine.get_stats(),
     );
-    while !client.is_complete() {
-        system.refresh_all();
-        progress_tracker.update_and_display(
-            client.file_status(),
-            &system,
-            client.get_thread_worker_count(),
-            first_draw,
-        );
-        first_draw = false;
-        std::thread::sleep(Duration::from_secs(1));
+
+    let mut first_draw = true;
+    let mut last = Instant::now();
+    loop {
+        if last.elapsed() >= Duration::from_secs(1) {
+            progress_tracker.update_and_display(
+                engine.get_stats(),
+                &system,
+                tpool.active_count(),
+                first_draw,
+            );
+            first_draw = false;
+            last = Instant::now();
+        }
+        let ev = engine.poll_event()?;
+        match ev {
+            Event::Tick => {
+                engine.handle_event(ev)?;
+                system.refresh_all();
+            }
+            Event::Complete => {
+                break;
+            }
+            _ => {
+                engine.handle_event(ev)?;
+            }
+        }
     }
-    system.refresh_all();
+    engine.stop();
     progress_tracker.update_and_display(
-        client.file_status(),
+        engine.get_stats(),
         &system,
-        client.get_thread_worker_count(),
+        tpool.active_count(),
         first_draw,
     );
-    client.stop();
-    eprintln!("✅ Download complete!");
-    println!("✅ Download complete!");
-    client.join();
-    eprintln!("main returning!");
+
     Ok(())
+}
+
+fn spawn_tick_handle(tpool: Arc<ThreadPool>, event_tx: Sender<Event>) {
+    tpool.execute(move || {
+        let sleep_duration = Duration::from_millis(500);
+        loop {
+            std::thread::sleep(sleep_duration);
+            let _ = event_tx.send(Event::Tick);
+        }
+    });
 }
