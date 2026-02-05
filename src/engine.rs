@@ -214,7 +214,6 @@ impl Engine {
 
         if self.stats.left == 0 && !self.stats.bitfield.has_any_zero() {
             self.completed = true;
-            eprintln!("sending complete from disk stats, stats: {:?}", self.stats);
             let _ = self.event_tx.send(Event::Complete);
         }
     }
@@ -462,9 +461,10 @@ impl Engine {
                     }
                 }
 
-                if let Err(e) = connection_mgr.poll_peers(total_pieces) {
+                if let Err(e) = connection_mgr.poll_peers() {
                     eprintln!("failed to poll peers: {}", e);
                 }
+                connection_mgr.drain_peer_messages(total_pieces);
             }
         });
     }

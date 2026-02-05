@@ -48,7 +48,7 @@ impl ProgressTracker {
             show_consumption: show_consumption,
             thread_workers: thread_workers,
             stats: stats,
-            speed: ByteSpeed::new(Duration::from_secs(1), false, 0.03),
+            speed: ByteSpeed::new(Duration::from_secs(1), false, 0.25),
             last_downloaded: last_downloaded,
         }
     }

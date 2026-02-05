@@ -28,6 +28,10 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 const INITIAL_RTT: Duration = Duration::from_millis(150);
 const ALPHA: f64 = 0.2;
 const FIRST_PEER_TOKEN: usize = 1;
+const TCP_ATTEMPTS: usize = 3;
+const HANDSHAKE_ATTEMPTS: usize = 3;
+const ATTEMPT_BACKOFF: Duration = Duration::from_millis(300);
+const MAX_MESSAGE_LEN: usize = 1024 * 1024;
 
 #[derive(Debug)]
 struct PeerConnection {
@@ -117,11 +121,7 @@ impl PeerConnection {
         self.write_queue.push_back(msg.encode());
     }
 
-    fn poll_reads(
-        &mut self,
-        peer_io_tx: &Sender<PeerIoTask>,
-        total_pieces: usize,
-    ) -> Result<(), io::Error> {
+    fn poll_reads(&mut self) -> io::Result<()> {
         let mut buf = [0u8; 4096];
         loop {
             match self.stream.read(&mut buf) {
@@ -147,13 +147,26 @@ impl PeerConnection {
             }
         }
 
+        Ok(())
+    }
+
+    fn drain_messages(
+        &mut self,
+        peer_io_tx: &Sender<PeerIoTask>,
+        total_pieces: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         loop {
             if self.read_buf.len() < 4 {
                 break;
             }
 
-            let len = u32::from_be_bytes(self.read_buf[0..4].try_into().unwrap()) as usize;
+            let len = u32::from_be_bytes(self.read_buf[0..4].try_into()?) as usize;
 
+            if len > MAX_MESSAGE_LEN {
+                return Err(
+                    io::Error::new(io::ErrorKind::InvalidData, "peer message too large").into(),
+                );
+            }
             if self.read_buf.len() < 4 + len {
                 break;
             }
@@ -171,7 +184,7 @@ impl PeerConnection {
         Ok(())
     }
 
-    fn poll_writes(&mut self) -> Result<(), io::Error> {
+    fn poll_writes(&mut self) -> io::Result<()> {
         while let Some(front) = self.write_queue.front_mut() {
             match self.stream.write(front) {
                 Ok(0) => {
@@ -451,33 +464,33 @@ impl ConnectionManager {
 
     pub fn connect_peer(&self, addr: SocketAddr, info_hash: [u8; 20], peer_id: [u8; 20]) {
         let peer_io_tx = self.peer_io_tx.clone();
-        self.tpool.execute(
-            move || match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
-                Ok(mut stream) => {
-                    if let Err(e) = send_handshake(&mut stream, &info_hash, &peer_id) {
-                        let _ = peer_io_tx.send(PeerIoTask::PeerConnectFailed {
-                            addr,
-                            reason: e.to_string(),
-                        });
-                        return;
-                    }
-                    if let Err(e) = stream.set_nonblocking(true) {
-                        let _ = peer_io_tx.send(PeerIoTask::PeerConnectFailed {
-                            addr,
-                            reason: e.to_string(),
-                        });
-                        return;
-                    }
-                    let _ = peer_io_tx.send(PeerIoTask::PeerConnected { addr, stream });
-                }
+        self.tpool.execute(move || {
+            let mut stream = match tcp_connect(&addr) {
+                Ok(s) => s,
                 Err(e) => {
                     let _ = peer_io_tx.send(PeerIoTask::PeerConnectFailed {
                         addr,
                         reason: e.to_string(),
                     });
+                    return;
                 }
-            },
-        );
+            };
+            if let Err(e) = peer_handshake(&addr, &mut stream, &info_hash, &peer_id) {
+                let _ = peer_io_tx.send(PeerIoTask::PeerConnectFailed {
+                    addr,
+                    reason: e.to_string(),
+                });
+                return;
+            }
+            if let Err(e) = stream.set_nonblocking(true) {
+                let _ = peer_io_tx.send(PeerIoTask::PeerConnectFailed {
+                    addr,
+                    reason: format!("set_nonblocking failed: {}", e),
+                });
+                return;
+            }
+            let _ = peer_io_tx.send(PeerIoTask::PeerConnected { addr, stream });
+        });
     }
 
     pub fn enqueue_peer_message(&mut self, addr: &SocketAddr, msg: PeerMessage) {
@@ -558,7 +571,7 @@ impl ConnectionManager {
         Ok(())
     }
 
-    pub fn poll_peers(&mut self, total_pieces: usize) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn poll_peers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.poll
             .poll(&mut self.events, Some(Duration::from_millis(5)))?;
 
@@ -576,7 +589,7 @@ impl ConnectionManager {
             };
 
             if ev.is_readable() {
-                if let Err(e) = conn.poll_reads(&self.peer_io_tx, total_pieces) {
+                if let Err(e) = conn.poll_reads() {
                     let _ = self.peer_io_tx.send(PeerIoTask::PeerDisconnected {
                         addr: conn.addr,
                         reason: e.to_string(),
@@ -597,6 +610,14 @@ impl ConnectionManager {
         }
 
         Ok(())
+    }
+
+    pub fn drain_peer_messages(&mut self, total_pieces: usize) {
+        for conn in self.connected_peers.values_mut() {
+            if let Err(e) = conn.drain_messages(&self.peer_io_tx, total_pieces) {
+                eprintln!("failed to drain messages for: {} :: {}", conn.addr, e);
+            }
+        }
     }
 
     pub fn handle_peer_message(
@@ -685,4 +706,73 @@ fn send_handshake(
         ));
     }
     Ok(())
+}
+
+fn tcp_connect(addr: &SocketAddr) -> io::Result<TcpStream> {
+    let mut last_err = None;
+
+    for attempt in 1..=TCP_ATTEMPTS {
+        match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => match e.kind() {
+                io::ErrorKind::TimedOut
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::Interrupted => {
+                    last_err = Some(e);
+                    let backoff = ATTEMPT_BACKOFF * attempt as u32;
+                    eprintln!(
+                        "tcp connect failed for {}, trying again in {:?}...",
+                        addr, backoff
+                    );
+                    std::thread::sleep(backoff);
+                    continue;
+                }
+                _ => return Err(e),
+            },
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("tcp connect retries exhausted for {}", addr),
+        )
+    }))
+}
+
+fn peer_handshake(
+    addr: &SocketAddr,
+    stream: &mut TcpStream,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+) -> io::Result<()> {
+    let mut last_err = None;
+
+    for attempt in 1..=HANDSHAKE_ATTEMPTS {
+        match send_handshake(stream, info_hash, peer_id) {
+            Ok(()) => return Ok(()),
+            Err(e) => match e.kind() {
+                io::ErrorKind::TimedOut
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::Interrupted => {
+                    last_err = Some(e);
+                    let backoff = ATTEMPT_BACKOFF * attempt as u32;
+                    eprintln!(
+                        "handshake failed for {}, trying again in {:?}...",
+                        addr, backoff
+                    );
+                    std::thread::sleep(backoff);
+                    continue;
+                }
+                _ => return Err(e),
+            },
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("handshake retries exhausted for {}", addr),
+        )
+    }))
 }
