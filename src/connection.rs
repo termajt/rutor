@@ -276,7 +276,9 @@ impl PeerConnection {
             PeerMessage::Interested => self.interested = true,
             PeerMessage::NotInterested => self.interested = false,
             PeerMessage::Have(piece) => {
-                self.bitfield.set(&(piece as usize), true);
+                let piece = piece as usize;
+                self.bitfield.set(&piece, true);
+                picker.on_peer_have(&piece);
                 let _ = event_tx.send(Event::CompareBitfield {
                     addr: self.addr,
                     bitfield: self.bitfield.clone(),
@@ -284,6 +286,7 @@ impl PeerConnection {
             }
             PeerMessage::Bitfield(bitfield) => {
                 self.bitfield = bitfield;
+                picker.on_peer_bitfield(&self.bitfield);
                 let _ = event_tx.send(Event::CompareBitfield {
                     addr: self.addr,
                     bitfield: self.bitfield.clone(),
@@ -505,10 +508,12 @@ impl ConnectionManager {
         &mut self,
         addr: SocketAddr,
         reason: String,
+        picker: &mut PiecePicker,
     ) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("peer disconnected: {} :: {}", addr, reason);
         self.pending_peers.remove(&addr);
         if let Some(mut conn) = self.connected_peers.remove(&addr) {
+            picker.on_peer_disconnected(&conn.bitfield);
             self.token_to_addr.remove(&conn.token);
             self.poll.registry().deregister(&mut conn.stream)?;
         }

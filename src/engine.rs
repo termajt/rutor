@@ -23,6 +23,8 @@ use rand::{Rng, distr::Alphanumeric};
 use threadpool::ThreadPool;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+const MIN_ENDGAME_THRESHOLD: f64 = 0.01;
+const MAX_ENDGAME_THRESHOLD: f64 = 0.05;
 
 #[derive(Debug)]
 pub enum Event {
@@ -108,7 +110,7 @@ pub enum PeerIoTask {
         timeout: Duration,
     },
     PeriodicReap {
-        endgame: bool,
+        should_enter_endgame: bool,
     },
     PieceVerified {
         piece: usize,
@@ -176,6 +178,7 @@ pub struct Engine {
     peer_id: [u8; 20],
     stats: TorrentStats,
     completed: bool,
+    endgame_threshold: f64,
 }
 
 impl Engine {
@@ -191,6 +194,7 @@ impl Engine {
         let announce_mgr = AnnounceManager::new(&torrent);
         let bitfield = Bitfield::new(torrent.info.piece_hashes.len());
         let stats = TorrentStats::new(torrent.info.total_size, Vec::new(), 0, 0, 0, bitfield);
+        let endgame_threshold = endgame_threshold(torrent.info.total_size);
         Self {
             announce_mgr,
             event_tx,
@@ -204,6 +208,7 @@ impl Engine {
             peer_id: generate_peer_id(),
             stats,
             completed: false,
+            endgame_threshold,
         }
     }
 
@@ -375,9 +380,14 @@ impl Engine {
         let total_size = self.torrent.info.total_size;
         let piece_hashes = self.torrent.info.piece_hashes.clone();
         let io_tx = self.io_tx.clone();
+        let endgame_threshold = self.endgame_threshold;
         self.tpool.execute(move || {
-            let mut picker = match PiecePicker::new(piece_length as usize, total_size, piece_hashes)
-            {
+            let mut picker = match PiecePicker::new(
+                piece_length as usize,
+                total_size,
+                piece_hashes,
+                endgame_threshold,
+            ) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("failed to create piece picker: {}", e);
@@ -421,7 +431,9 @@ impl Engine {
                             }
                         }
                         PeerIoTask::PeerDisconnected { addr, reason } => {
-                            if let Err(e) = connection_mgr.on_peer_disconnected(addr, reason) {
+                            if let Err(e) =
+                                connection_mgr.on_peer_disconnected(addr, reason, &mut picker)
+                            {
                                 eprintln!("failed to handle peer {} disconnect: {}", addr, e);
                             }
                         }
@@ -446,10 +458,14 @@ impl Engine {
                         PeerIoTask::ReapPeerBlocks { addr, timeout } => {
                             picker.reap_timeouts_for_peer(&addr, timeout);
                         }
-                        PeerIoTask::PeriodicReap { endgame } => {
+                        PeerIoTask::PeriodicReap {
+                            should_enter_endgame,
+                        } => {
                             connection_mgr.reap_block_timeouts(&mut picker);
-                            if endgame {
+                            if should_enter_endgame {
                                 picker.enter_endgame();
+                            } else {
+                                picker.update_endgame();
                             }
                         }
                         PeerIoTask::PieceVerified { piece } => {
@@ -518,8 +534,11 @@ impl Engine {
     }
 
     fn handle_peer_io_tick(&self) {
-        let endgame = self.stats.left < 5 * self.torrent.info.piece_length as u64;
-        let _ = self.peer_io_tx.send(PeerIoTask::PeriodicReap { endgame });
+        let percent_left = self.stats.left as f64 / self.torrent.info.total_size as f64;
+        let should_enter_endgame = percent_left < self.endgame_threshold;
+        let _ = self.peer_io_tx.send(PeerIoTask::PeriodicReap {
+            should_enter_endgame,
+        });
         let _ = self.peer_io_tx.send(PeerIoTask::MaybeRequestBlocks);
     }
 
@@ -555,4 +574,12 @@ fn generate_peer_id() -> [u8; 20] {
     }
 
     peer_id
+}
+
+fn endgame_threshold(total_size: u64) -> f64 {
+    let total_mb = total_size as f64 / (1024.0 * 1024.0);
+
+    let threshold = MAX_ENDGAME_THRESHOLD / (1.0 + (total_mb / 100.0).ln());
+
+    threshold.clamp(MIN_ENDGAME_THRESHOLD, MAX_ENDGAME_THRESHOLD)
 }
