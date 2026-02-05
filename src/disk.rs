@@ -6,10 +6,7 @@ use std::{
     sync::Mutex,
 };
 
-use crate::{
-    bitfield::Bitfield,
-    torrent::{Torrent, TorrentFile},
-};
+use crate::{bitfield::Bitfield, torrent::TorrentFile};
 
 #[derive(Debug)]
 struct FileHandleCache {
@@ -58,11 +55,12 @@ pub struct DiskManager {
 }
 
 impl DiskManager {
-    pub fn new(torrent: &Torrent) -> Self {
-        let total_pieces = torrent.info.piece_hashes.len();
-        let total_size = torrent.info.total_size;
-        let piece_length = torrent.info.piece_length as usize;
-        let files = torrent.info.files.clone();
+    pub fn new(
+        total_pieces: usize,
+        total_size: u64,
+        piece_length: usize,
+        files: Vec<TorrentFile>,
+    ) -> Self {
         Self {
             file_handle_cache: FileHandleCache::new(),
             total_pieces,

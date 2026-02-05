@@ -2,6 +2,7 @@ pub mod announce;
 pub mod bencode;
 pub mod bitfield;
 pub mod bytespeed;
+pub mod connection;
 pub mod disk;
 pub mod engine;
 pub mod event;

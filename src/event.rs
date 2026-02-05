@@ -3,6 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Debug)]
 pub struct ManualResetEvent {
     state: Mutex<bool>,
     cvar: Condvar,

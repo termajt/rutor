@@ -1,15 +1,13 @@
 use rutor::bytespeed::ByteSpeed;
-use rutor::engine::{Engine, Event, MAX_PEER_IO, TorrentStats};
-use rutor::torrent;
+use rutor::engine::{Engine, Event, TorrentStats};
+use rutor::{connection, torrent};
 use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
-use threadpool::ThreadPool;
 
 struct ProgressTracker {
     name: String,
@@ -50,7 +48,7 @@ impl ProgressTracker {
             show_consumption: show_consumption,
             thread_workers: thread_workers,
             stats: stats,
-            speed: ByteSpeed::new(Duration::from_secs(20), Duration::from_secs(1)),
+            speed: ByteSpeed::new(Duration::from_secs(1), false, 0.03),
             last_downloaded: last_downloaded,
         }
     }
@@ -123,7 +121,7 @@ impl ProgressTracker {
 
         self.speed.update(delta as usize);
         self.last_downloaded = downloaded_now;
-        self.download_speed = self.speed.avg;
+        self.download_speed = self.speed.avg_speed;
 
         let remaining = self.total_size.saturating_sub(downloaded_now) as f64;
         self.eta = if self.download_speed > 0.0 {
@@ -194,12 +192,20 @@ impl ProgressTracker {
             magenta,
         );
         println!(
-            "{0}{1:<10}:{2} {3} / {4} (C) {5} (A)",
-            blue, "Peers", reset, self.stats.peers, MAX_PEER_IO, self.stats.available_peers
+            "{0}{1:<10}:{2} {3} / {4} (C)",
+            blue,
+            "Peers",
+            reset,
+            self.stats.peers,
+            connection::MAX_PEERS
         );
         println!(
             "{0}{1:<10}:{2} {3} / {4}",
-            white, "Pieces", reset, self.stats.pieces_verified, self.total_pieces
+            white,
+            "Pieces",
+            reset,
+            self.stats.bitfield.count_ones(),
+            self.total_pieces
         );
         println!("{}", self.format_bar(self.stats.downloaded));
         if self.show_consumption {
@@ -326,10 +332,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_pieces = torrent.info.piece_hashes.len();
     let (event_tx, event_rx) = mpsc::channel();
     let (io_tx, io_rx) = mpsc::channel();
-    let mut engine = Engine::new(torrent, event_tx.clone(), event_rx, io_tx, tpool.clone());
-    spawn_tick_handle(tpool.clone(), event_tx.clone());
-    engine.start(io_rx);
-
+    let (peer_io_tx, peer_io_rx) = mpsc::channel();
+    let (announce_io_tx, announce_io_rx) = mpsc::channel();
+    let mut engine = Engine::new(
+        torrent,
+        event_tx.clone(),
+        event_rx,
+        io_tx,
+        peer_io_tx,
+        announce_io_tx,
+        tpool.clone(),
+    );
     let mut progress_tracker = ProgressTracker::new(
         &name,
         total_size,
@@ -339,11 +352,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tpool.active_count(),
         engine.get_stats(),
     );
-
     let mut first_draw = true;
     let mut last = Instant::now();
+    engine.start(io_rx, peer_io_rx, announce_io_rx);
     loop {
         if last.elapsed() >= Duration::from_secs(1) {
+            system.refresh_pids(&vec![pid]);
             progress_tracker.update_and_display(
                 engine.get_stats(),
                 &system,
@@ -353,37 +367,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             first_draw = false;
             last = Instant::now();
         }
-        let ev = engine.poll_event()?;
+        let ev = engine.poll()?;
         match ev {
             Event::Tick => {
                 engine.handle_event(ev)?;
-                system.refresh_all();
             }
-            Event::Complete => {
+            Event::Stop | Event::Complete => {
+                engine.handle_event(ev)?;
                 break;
             }
-            _ => {
-                engine.handle_event(ev)?;
-            }
+            _ => engine.handle_event(ev)?,
         }
     }
-    engine.stop();
     progress_tracker.update_and_display(
         engine.get_stats(),
         &system,
         tpool.active_count(),
         first_draw,
     );
+    engine.stop();
+    tpool.join();
 
     Ok(())
-}
-
-fn spawn_tick_handle(tpool: Arc<ThreadPool>, event_tx: Sender<Event>) {
-    tpool.execute(move || {
-        let sleep_duration = Duration::from_millis(500);
-        loop {
-            std::thread::sleep(sleep_duration);
-            let _ = event_tx.send(Event::Tick);
-        }
-    });
 }

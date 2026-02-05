@@ -1,15 +1,22 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::mpsc::Sender,
     time::{Duration, Instant},
 };
 
 use sha1::{Digest, Sha1};
 
-use crate::{bitfield::Bitfield, disk::DiskManager, engine::Event, torrent::Torrent};
+use crate::{bitfield::Bitfield, disk::DiskManager};
 
 pub const BLOCK_SIZE: usize = 16 * 1024;
+
+#[derive(Debug)]
+pub struct PieceReceiveStatus {
+    pub piece: usize,
+    pub received: bool,
+    pub complete: bool,
+    pub expected_hash: [u8; 20],
+}
 
 #[derive(Debug)]
 pub struct BlockRequest {
@@ -56,34 +63,32 @@ pub struct PiecePicker {
     requested: HashMap<(usize, usize), (Instant, SocketAddr)>,
     endgame: bool,
     pieces: HashMap<usize, Piece>,
-    pub piece_length: usize,
-    event_tx: Sender<Event>,
 }
 
 impl PiecePicker {
-    pub fn new(torrent: &Torrent, event_tx: Sender<Event>) -> Self {
+    pub fn new(
+        piece_length: usize,
+        total_size: u64,
+        piece_hashes: Vec<[u8; 20]>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut pieces = HashMap::new();
 
-        let piece_len = torrent.info.piece_length as usize;
-        let total_size = torrent.info.total_size as usize;
-        let num_pieces = torrent.info.piece_hashes.len();
+        let num_pieces = piece_hashes.len();
 
         for i in 0..num_pieces {
             let len = if i == num_pieces - 1 {
-                total_size - piece_len * (num_pieces - 1)
+                total_size as usize - piece_length * (num_pieces - 1)
             } else {
-                piece_len
+                piece_length
             };
-            let expected_hash = torrent.info.piece_hashes[i];
+            let expected_hash: [u8; 20] = piece_hashes[i].as_slice().try_into()?;
             pieces.insert(i, Piece::new(len, BLOCK_SIZE, expected_hash));
         }
-        Self {
+        Ok(Self {
             requested: HashMap::new(),
             endgame: false,
             pieces,
-            piece_length: piece_len,
-            event_tx,
-        }
+        })
     }
 
     pub fn pick_blocks_for_peer(
@@ -163,31 +168,45 @@ impl PiecePicker {
         piece.received.fill(false);
     }
 
-    pub fn reap_timeouts_for_peer(&mut self, addr: &SocketAddr, timeout: Duration) {
+    pub fn reap_timeouts_for_peer(
+        &mut self,
+        addr: &SocketAddr,
+        timeout: Duration,
+    ) -> Vec<(usize, usize)> {
         let now = Instant::now();
-        self.requested.retain(|&(_, _), &mut (t, owner)| {
+        let mut reaped = Vec::new();
+        self.requested.retain(|(piece, offset), &mut (t, owner)| {
             if owner != *addr {
                 return true; // keep blocks requested from other peers
             }
-            now.duration_since(t) < timeout
+            let keep = now.duration_since(t) < timeout;
+            if !keep {
+                reaped.push((*piece, *offset));
+            }
+            keep
         });
+
+        reaped
     }
 
-    pub fn on_block_received(&mut self, piece_idx: usize, offset: usize) -> bool {
+    pub fn on_block_received(
+        &mut self,
+        piece_idx: usize,
+        offset: usize,
+    ) -> Option<PieceReceiveStatus> {
         self.requested.remove(&(piece_idx, offset));
-        let mut result = false;
         if let Some(piece) = self.pieces.get_mut(&piece_idx) {
             if piece.mark_block(offset) {
-                result = true;
-                if piece.is_complete() {
-                    let _ = self.event_tx.send(Event::VerifyPiece {
-                        piece: piece_idx,
-                        expected_hash: piece.expected_hash,
-                    });
-                }
+                return Some(PieceReceiveStatus {
+                    piece: piece_idx,
+                    received: true,
+                    complete: piece.is_complete(),
+                    expected_hash: piece.expected_hash,
+                });
             }
         }
-        result
+
+        None
     }
 
     pub fn update_endgame(&mut self, remaining_blocks: usize) {

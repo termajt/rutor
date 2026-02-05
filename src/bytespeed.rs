@@ -2,43 +2,48 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub struct ByteSpeed {
+    bytes_received: usize,
+    pub avg_speed: f64,
     last_update: Instant,
-    pub avg: f64,
-    smoothing: f64,
-    bytes: usize,
-    update_interval: Duration,
+    interval: Duration,
+    continous: bool,
+    alpha: f64,
 }
 
 impl ByteSpeed {
-    pub fn new(lookback: Duration, update_interval: Duration) -> Self {
-        let dt = update_interval.as_secs_f64();
-        let t = lookback.as_secs_f64();
-        let n = t / dt;
-        let alpha = 2.0 / (n + 1.0);
+    pub fn new(interval: Duration, continous: bool, alpha: f64) -> Self {
         Self {
+            bytes_received: 0,
+            avg_speed: 0.0,
             last_update: Instant::now(),
-            avg: 0.0,
-            smoothing: alpha,
-            bytes: 0,
-            update_interval: update_interval,
+            interval,
+            continous,
+            alpha,
         }
     }
 
     pub fn update(&mut self, bytes: usize) {
-        self.bytes += bytes;
+        self.bytes_received += bytes;
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last_update);
-        if elapsed >= self.update_interval {
-            let instant_speed = (self.bytes as f64) / elapsed.as_secs_f64();
+        let elapsed = now.duration_since(self.last_update).as_secs_f64();
 
-            if self.avg == 0.0 {
-                self.avg = instant_speed;
+        if elapsed <= 0.0 {
+            return;
+        }
+
+        let alpha = self.alpha;
+        if self.continous || elapsed >= self.interval.as_secs_f64() {
+            let instant_rate = self.bytes_received as f64 / elapsed;
+            if self.avg_speed == 0.0 {
+                self.avg_speed = instant_rate;
             } else {
-                self.avg = self.smoothing * instant_speed + (1.0 - self.smoothing) * self.avg;
+                self.avg_speed = self.avg_speed * (1.0 - alpha) + instant_rate * alpha;
             }
 
-            self.bytes = 0;
-            self.last_update = now;
+            if elapsed >= self.interval.as_secs_f64() {
+                self.bytes_received = 0;
+                self.last_update = now;
+            }
         }
     }
 }

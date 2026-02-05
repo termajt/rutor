@@ -1,20 +1,21 @@
 use std::{
-    collections::{HashMap, HashSet},
     net::{SocketAddr, TcpStream},
     path::PathBuf,
     sync::{
-        Arc, Mutex,
-        mpsc::{self, Receiver, Sender},
+        Arc,
+        mpsc::{Receiver, Sender},
     },
     time::Duration,
 };
 
 use crate::{
-    announce::{self, AnnounceManager, TrackerResponse},
+    announce::{self, AnnounceManager},
     bitfield::Bitfield,
+    connection::ConnectionManager,
     disk::DiskManager,
-    peer::{self, Peer, PeerMessage},
-    picker::{self, BLOCK_SIZE, PiecePicker},
+    event::ManualResetEvent,
+    peer::PeerMessage,
+    picker::{self, PiecePicker},
     torrent::Torrent,
 };
 
@@ -22,71 +23,36 @@ use rand::{Rng, distr::Alphanumeric};
 use threadpool::ThreadPool;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub const MAX_PEER_IO: usize = 32;
-pub const MAX_PEER_PIPELINE: usize = 25;
 
 #[derive(Debug)]
 pub enum Event {
     Tick,
-    TrackerAnnounceDue {
-        tracker_url: String,
-    },
-    TrackerResponse {
-        tracker_url: String,
-        response: TrackerResponse,
-    },
-    TrackerError {
-        tracker_url: String,
-        error: String,
-    },
-    PeerConnected {
+    Complete,
+    Stop,
+    CompareBitfield {
         addr: SocketAddr,
-        stream: TcpStream,
+        bitfield: Bitfield,
     },
-    PeerConnectFailed {
+    PeersUpdated {
+        connected_peers: usize,
+    },
+    DiskStats {
+        total_downloaded: u64,
+        files: Vec<(PathBuf, u64, u64)>,
+    },
+    PeerNeedsBlocks {
         addr: SocketAddr,
-        error: String,
-    },
-    PeerHandshakeComplete {
-        addr: SocketAddr,
-    },
-    PeerDisconnected {
-        addr: SocketAddr,
-        reason: String,
-    },
-    PeerMessage {
-        addr: SocketAddr,
-        message: PeerMessage,
-    },
-    SendPeerMessage {
-        addr: SocketAddr,
-        message: PeerMessage,
-    },
-    VerifyPiece {
-        piece: usize,
-        expected_hash: [u8; 20],
     },
     PieceVerified {
         piece: usize,
     },
-    PieceVerificationFailure {
+    PieceVerificationFailed {
         piece: usize,
     },
-    Complete,
 }
 
 #[derive(Debug)]
 pub enum IoTask {
-    Announce {
-        tracker_url: String,
-        event: Option<String>,
-        info_hash: [u8; 20],
-        peer_id: [u8; 20],
-        stats: TorrentStats,
-    },
-    ConnectPeer {
-        addr: SocketAddr,
-    },
     WriteToDisk {
         piece: usize,
         offset: usize,
@@ -97,6 +63,70 @@ pub enum IoTask {
         expected_hash: [u8; 20],
     },
     Stop,
+    CalculateFileStats {
+        bitfield: Bitfield,
+    },
+}
+
+#[derive(Debug)]
+pub enum PeerIoTask {
+    NewPeers {
+        peers: Vec<SocketAddr>,
+    },
+    ConnectPeer {
+        addr: SocketAddr,
+    },
+    PeerConnected {
+        addr: SocketAddr,
+        stream: TcpStream,
+    },
+    PeerConnectFailed {
+        addr: SocketAddr,
+        reason: String,
+    },
+    MaybeConnectPeers,
+    PeerDisconnected {
+        addr: SocketAddr,
+        reason: String,
+    },
+    PeerMessage {
+        addr: SocketAddr,
+        msg: PeerMessage,
+    },
+    Stop,
+    MaybeUpdateInterest {
+        addr: SocketAddr,
+        bitfield_interested: bool,
+    },
+    SendMessage {
+        addr: SocketAddr,
+        msg: PeerMessage,
+    },
+    RequestBlocksForPeer {
+        addr: SocketAddr,
+        bitfield: Bitfield,
+    },
+    MaybeRequestBlocks,
+    ReapPeerBlocks {
+        addr: SocketAddr,
+        timeout: Duration,
+    },
+    PeriodicReap {
+        endgame: bool,
+    },
+}
+
+#[derive(Debug)]
+pub enum AnnounceIoTask {
+    PerformAnnounce {
+        url: String,
+        info_hash: [u8; 20],
+        peer_id: [u8; 20],
+        uploaded: u64,
+        downloaded: u64,
+        left: u64,
+    },
+    Stop,
 }
 
 #[derive(Debug, Clone)]
@@ -105,10 +135,8 @@ pub struct TorrentStats {
     pub uploaded: u64,
     pub left: u64,
     pub files: Vec<(PathBuf, u64, u64)>,
-    pub pieces_verified: usize,
     pub peers: usize,
     pub bitfield: Bitfield,
-    pub available_peers: usize,
 }
 
 impl TorrentStats {
@@ -117,10 +145,8 @@ impl TorrentStats {
         files: Vec<(PathBuf, u64, u64)>,
         downloaded: u64,
         uploaded: u64,
-        pieces_verified: usize,
         peers: usize,
         bitfield: Bitfield,
-        available_peers: usize,
     ) -> Self {
         let left = total_size.saturating_sub(downloaded);
         Self {
@@ -128,10 +154,8 @@ impl TorrentStats {
             uploaded,
             left,
             files,
-            pieces_verified,
             peers,
             bitfield,
-            available_peers,
         }
     }
 }
@@ -139,19 +163,16 @@ impl TorrentStats {
 #[derive(Debug)]
 pub struct Engine {
     announce_mgr: AnnounceManager,
-    torrent: Torrent,
     event_tx: Sender<Event>,
     event_rx: Receiver<Event>,
     io_tx: Sender<IoTask>,
-    stats: TorrentStats,
-    peer_id: [u8; 20],
-    peers: HashMap<SocketAddr, Peer>,
+    peer_io_tx: Sender<PeerIoTask>,
+    announce_io_tx: Sender<AnnounceIoTask>,
     tpool: Arc<ThreadPool>,
-    pending_peers: HashSet<SocketAddr>,
-    available_peers: HashSet<SocketAddr>,
-    picker: PiecePicker,
-    bitfield: Bitfield,
-    disk_mgr: Arc<Mutex<DiskManager>>,
+    stop_signal: Arc<ManualResetEvent>,
+    torrent: Torrent,
+    peer_id: [u8; 20],
+    stats: TorrentStats,
 }
 
 impl Engine {
@@ -160,328 +181,78 @@ impl Engine {
         event_tx: Sender<Event>,
         event_rx: Receiver<Event>,
         io_tx: Sender<IoTask>,
+        peer_io_tx: Sender<PeerIoTask>,
+        announce_io_tx: Sender<AnnounceIoTask>,
         tpool: Arc<ThreadPool>,
     ) -> Self {
-        let picker = PiecePicker::new(&torrent, event_tx.clone());
+        let announce_mgr = AnnounceManager::new(&torrent);
         let bitfield = Bitfield::new(torrent.info.piece_hashes.len());
-        let disk_mgr = Arc::new(Mutex::new(DiskManager::new(&torrent)));
-        let stats = calculate_stats(&torrent, 0, 0, &bitfield, disk_mgr.clone());
+        let stats = TorrentStats::new(torrent.info.total_size, Vec::new(), 0, 0, 0, bitfield);
         Self {
-            announce_mgr: AnnounceManager::new(&torrent),
-            torrent: torrent,
+            announce_mgr,
             event_tx,
             event_rx,
             io_tx,
-            stats: stats,
-            peer_id: generate_peer_id(),
-            peers: HashMap::new(),
+            peer_io_tx,
+            announce_io_tx,
             tpool,
-            pending_peers: HashSet::new(),
-            available_peers: HashSet::new(),
-            picker,
-            bitfield,
-            disk_mgr,
+            stop_signal: Arc::new(ManualResetEvent::new(false)),
+            torrent,
+            peer_id: generate_peer_id(),
+            stats,
         }
     }
 
-    pub fn poll_event(&self) -> Result<Event> {
-        Ok(self.event_rx.recv()?)
+    pub fn poll(&self) -> Result<Event> {
+        let ev = self.event_rx.recv()?;
+        Ok(ev)
     }
 
     pub fn handle_event(&mut self, ev: Event) -> Result<()> {
         match ev {
             Event::Tick => {
-                self.on_tick()?;
+                self.on_tick();
             }
-            Event::TrackerResponse {
-                tracker_url,
-                response,
-            } => {
-                self.on_tracker_response(&tracker_url, response)?;
-                self.attempt_connect_peers()?;
+            Event::Complete | Event::Stop => {
+                self.stop();
             }
-            Event::TrackerError { tracker_url, error } => {
-                self.on_tracker_error(&tracker_url, &error)?;
-            }
-            Event::TrackerAnnounceDue { tracker_url } => {
-                self.on_tracker_announce_due(tracker_url)?;
-            }
-            Event::PeerConnected { addr, stream } => {
-                self.on_peer_connected(addr, stream)?;
-                self.attempt_connect_peers()?;
-            }
-            Event::PeerConnectFailed { addr, error } => {
-                self.on_peer_connect_failed(addr, error)?;
-                self.attempt_connect_peers()?;
-            }
-            Event::PeerDisconnected { addr, reason } => {
-                self.on_peer_disconnected(addr, reason)?;
-                self.attempt_connect_peers()?;
-            }
-            Event::PeerMessage { addr, message } => {
-                self.on_peer_message(addr, message)?;
-            }
-            Event::SendPeerMessage { addr, message } => {
-                self.on_send_peer_message(addr, message)?;
-            }
-            Event::PeerHandshakeComplete { addr } => {
-                self.on_peer_handshake_complete(addr)?;
-            }
-            Event::PieceVerified { piece } => {
-                self.on_piece_verified(piece)?;
-            }
-            Event::Complete => {}
-            Event::VerifyPiece {
-                piece,
-                expected_hash,
-            } => {
-                let _ = self.io_tx.send(IoTask::DiskVerifyPiece {
-                    piece,
-                    expected_hash,
+            Event::CompareBitfield { addr, bitfield } => {
+                let interested = bitfield.is_interesting_to(&self.stats.bitfield);
+                let _ = self.peer_io_tx.send(PeerIoTask::MaybeUpdateInterest {
+                    addr,
+                    bitfield_interested: interested,
                 });
             }
-            Event::PieceVerificationFailure { piece } => {
-                self.on_piece_verification_failure(piece)?;
+            Event::PeersUpdated { connected_peers } => {
+                self.stats.peers = connected_peers;
             }
-        }
-        Ok(())
-    }
-
-    pub fn emit(&self, ev: Event) -> Result<()> {
-        Ok(self.event_tx.send(ev)?)
-    }
-
-    fn on_piece_verified(&mut self, piece: usize) -> Result<()> {
-        self.bitfield.set(&piece, true);
-        self.picker.on_piece_verified(piece);
-        Ok(())
-    }
-
-    fn on_piece_verification_failure(&mut self, piece: usize) -> Result<()> {
-        self.picker.on_piece_verification_failure(piece);
-        Ok(())
-    }
-
-    fn on_tracker_announce_due(&self, tracker_url: String) -> Result<()> {
-        Ok(self.io_tx.send(IoTask::Announce {
-            tracker_url,
-            event: None,
-            info_hash: self.torrent.info_hash,
-            peer_id: self.peer_id,
-            stats: self.stats.clone(),
-        })?)
-    }
-
-    fn on_send_peer_message(&mut self, addr: SocketAddr, message: PeerMessage) -> Result<()> {
-        if let Some(peer) = self.peers.get(&addr) {
-            let _ = peer.outbound_queue.send(message);
-        }
-        Ok(())
-    }
-
-    fn on_peer_connected(&mut self, addr: SocketAddr, stream: TcpStream) -> Result<()> {
-        self.pending_peers.remove(&addr);
-        if self.peers.contains_key(&addr) {
-            return Ok(());
-        }
-        let (tx, rx) = mpsc::channel();
-        self.peers.insert(
-            addr,
-            Peer::new(
-                addr,
-                self.torrent.info.piece_hashes.len(),
-                tx.clone(),
-                MAX_PEER_PIPELINE,
-            ),
-        );
-        let event_tx = self.event_tx.clone();
-        let info_hash = self.torrent.info_hash;
-        let peer_id = self.peer_id;
-        let total_pieces = self.torrent.info.piece_hashes.len();
-        self.tpool.execute(move || {
-            peer::peer_io_loop(
-                addr,
-                stream,
-                event_tx,
-                &info_hash,
-                &peer_id,
-                total_pieces,
-                rx,
-            );
-        });
-        Ok(())
-    }
-
-    fn on_peer_handshake_complete(&self, addr: SocketAddr) -> Result<()> {
-        self.emit(Event::SendPeerMessage {
-            addr,
-            message: PeerMessage::Bitfield(self.stats.bitfield.clone()),
-        })
-    }
-
-    fn on_peer_connect_failed(&mut self, addr: SocketAddr, error: String) -> Result<()> {
-        eprintln!("peer connect to {} failed: {}", addr, error);
-        self.peers.remove(&addr);
-        self.pending_peers.remove(&addr);
-        self.available_peers.remove(&addr);
-        Ok(())
-    }
-
-    fn on_peer_disconnected(&mut self, addr: SocketAddr, reason: String) -> Result<()> {
-        eprintln!("peer {} disconnected: {}", addr, reason);
-        self.peers.remove(&addr);
-        self.pending_peers.remove(&addr);
-        self.available_peers.remove(&addr);
-        Ok(())
-    }
-
-    fn on_peer_message(&mut self, addr: SocketAddr, message: PeerMessage) -> Result<()> {
-        match message {
-            PeerMessage::Choke => {
-                let peer = match self.peers.get_mut(&addr) {
-                    Some(p) => p,
-                    None => return Ok(()),
-                };
-                peer.am_choked = true;
-            }
-            PeerMessage::Unchoke => {
-                let peer = match self.peers.get_mut(&addr) {
-                    Some(p) => p,
-                    None => return Ok(()),
-                };
-                peer.am_choked = false;
-                peer.try_request_from_peer(&mut self.picker, &self.bitfield, &self.event_tx);
-            }
-            PeerMessage::Interested => {
-                let peer = match self.peers.get_mut(&addr) {
-                    Some(p) => p,
-                    None => return Ok(()),
-                };
-                peer.interested = true;
-            }
-            PeerMessage::NotInterested => {
-                let peer = match self.peers.get_mut(&addr) {
-                    Some(p) => p,
-                    None => return Ok(()),
-                };
-                peer.interested = false;
-            }
-            PeerMessage::Bitfield(bf) => {
-                let peer = match self.peers.get_mut(&addr) {
-                    Some(p) => p,
-                    None => return Ok(()),
-                };
-                if on_bitfield_from_peer(peer, bf, &self.bitfield, &self.event_tx) {
-                    peer.try_request_from_peer(&mut self.picker, &self.bitfield, &self.event_tx);
+            Event::DiskStats {
+                total_downloaded,
+                files,
+            } => {
+                self.stats.downloaded = total_downloaded;
+                self.stats.left = self
+                    .torrent
+                    .info
+                    .total_size
+                    .saturating_sub(total_downloaded);
+                self.stats.files = files;
+                if self.stats.left == 0 && !self.stats.bitfield.has_any_zero() {
+                    let _ = self.event_tx.send(Event::Complete);
                 }
             }
-            PeerMessage::Have(piece_index) => {
-                let peer = match self.peers.get_mut(&addr) {
-                    Some(p) => p,
-                    None => return Ok(()),
-                };
-                if on_have_from_peer(peer, piece_index as usize, &self.bitfield, &self.event_tx) {
-                    peer.try_request_from_peer(&mut self.picker, &self.bitfield, &self.event_tx);
-                }
+            Event::PeerNeedsBlocks { addr } => {
+                let _ = self.peer_io_tx.send(PeerIoTask::RequestBlocksForPeer {
+                    addr,
+                    bitfield: self.stats.bitfield.clone(),
+                });
             }
-            PeerMessage::Piece((piece, begin, data)) => {
-                let peer = match self.peers.get_mut(&addr) {
-                    Some(p) => p,
-                    None => return Ok(()),
-                };
-                on_block_received_from_peer(
-                    peer,
-                    piece as usize,
-                    begin as usize,
-                    data,
-                    &mut self.picker,
-                    &self.io_tx,
-                );
-                peer.try_request_from_peer(&mut self.picker, &self.bitfield, &self.event_tx);
+            Event::PieceVerified { piece } => {
+                self.stats.bitfield.set(&piece, true);
             }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn on_tracker_error(&mut self, tracker_url: &String, error: &String) -> Result<()> {
-        eprintln!("error from tracker {}: {}", tracker_url, error);
-        Ok(())
-    }
-
-    fn on_tracker_response(
-        &mut self,
-        tracker_url: &String,
-        response: TrackerResponse,
-    ) -> Result<()> {
-        eprintln!(
-            "tracker response: {}, {} peers",
-            tracker_url,
-            response.peers.len()
-        );
-        for peer in response.peers {
-            if self.available_peers.contains(&peer)
-                || self.peers.contains_key(&peer)
-                || self.pending_peers.contains(&peer)
-            {
-                continue;
+            Event::PieceVerificationFailed { piece } => {
+                self.stats.bitfield.set(&piece, false);
             }
-            self.available_peers.insert(peer);
-        }
-        Ok(())
-    }
-
-    fn on_tick(&mut self) -> Result<()> {
-        if let Some(tracker) = self.announce_mgr.next_due_tracker() {
-            let url = tracker.url.clone();
-            tracker.announced();
-
-            self.emit(Event::TrackerAnnounceDue { tracker_url: url })?;
-        }
-        self.stats = calculate_stats(
-            &self.torrent,
-            self.peers.len(),
-            self.available_peers.len(),
-            &self.bitfield,
-            self.disk_mgr.clone(),
-        );
-
-        for (addr, peer) in self.peers.iter_mut() {
-            let timeout = block_timeout(peer.stats.avg_speed, BLOCK_SIZE);
-            self.picker.reap_timeouts_for_peer(&addr, timeout);
-            peer.try_request_from_peer(&mut self.picker, &self.bitfield, &self.event_tx);
-        }
-        if self.stats.left < 5 * self.picker.piece_length as u64 {
-            self.picker.enter_endgame();
-        }
-        if self.bitfield.count_ones() == self.torrent.info.piece_hashes.len() {
-            let _ = self.emit(Event::Complete);
-        }
-        Ok(())
-    }
-
-    fn attempt_connect_peers(&mut self) -> Result<()> {
-        if self.available_peers.is_empty() {
-            eprintln!("no available peers!");
-        }
-        if self.peers.len() >= MAX_PEER_IO {
-            return Ok(());
-        }
-        let left_to_connect = MAX_PEER_IO
-            .saturating_sub(self.peers.len())
-            .saturating_sub(self.pending_peers.len());
-        if left_to_connect == 0 {
-            return Ok(());
-        }
-        let mut left = left_to_connect;
-        eprintln!("trying to connect {} peers...", left);
-        for peer in &self.available_peers {
-            if left == 0 {
-                break;
-            }
-            self.pending_peers.insert(*peer);
-            let _ = self.io_tx.send(IoTask::ConnectPeer { addr: *peer });
-            left -= 1;
         }
         Ok(())
     }
@@ -490,118 +261,214 @@ impl Engine {
         self.stats.clone()
     }
 
-    pub fn start(&self, io_rx: Receiver<IoTask>) {
-        self.spawn_io_handle(
-            self.tpool.clone(),
-            io_rx,
-            self.event_tx.clone(),
-            self.disk_mgr.clone(),
-        );
+    pub fn start(
+        &self,
+        io_rx: Receiver<IoTask>,
+        peer_io_rx: Receiver<PeerIoTask>,
+        announce_io_rx: Receiver<AnnounceIoTask>,
+    ) {
+        self.start_disk_thread(io_rx, self.event_tx.clone());
+        self.start_tick_thread();
+        self.start_peer_io_thread(peer_io_rx);
+        self.start_announce_io_thread(announce_io_rx);
     }
 
     pub fn stop(&self) {
+        let _ = self.event_tx.send(Event::Stop);
         let _ = self.io_tx.send(IoTask::Stop);
+        let _ = self.peer_io_tx.send(PeerIoTask::Stop);
+        let _ = self.announce_io_tx.send(AnnounceIoTask::Stop);
+        if !self.stop_signal.is_set() {
+            self.stop_signal.set();
+        }
     }
 
-    fn spawn_io_handle(
-        &self,
-        tpool: Arc<ThreadPool>,
-        io_rx: Receiver<IoTask>,
-        event_tx: Sender<Event>,
-        disk_mgr: Arc<Mutex<DiskManager>>,
-    ) {
-        let tpool_clone = tpool.clone();
-        tpool.execute(move || {
-            loop {
-                if let Ok(ev) = io_rx.recv() {
-                    match ev {
-                        IoTask::Announce {
-                            tracker_url,
-                            event,
-                            info_hash,
-                            peer_id,
-                            stats,
-                        } => {
-                            eprintln!("announcing to: {}", tracker_url);
-                            let event_tx = event_tx.clone();
-                            tpool_clone.execute(move || {
-                                let result = announce::announce(
-                                    &tracker_url,
-                                    &info_hash,
-                                    &peer_id,
-                                    6081,
-                                    stats.uploaded,
-                                    stats.downloaded,
-                                    stats.left,
-                                    event,
-                                    None,
-                                );
-                                match result {
-                                    Ok(response) => {
-                                        let _ = event_tx.send(Event::TrackerResponse {
-                                            tracker_url,
-                                            response,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        let err_msg = format!("{}", e);
-                                        let _ = event_tx.send(Event::TrackerError {
-                                            tracker_url,
-                                            error: err_msg,
-                                        });
-                                    }
-                                }
-                            });
+    fn start_disk_thread(&self, io_rx: Receiver<IoTask>, event_tx: Sender<Event>) {
+        let total_pieces = self.torrent.info.piece_hashes.len();
+        let total_size = self.torrent.info.total_size;
+        let piece_length = self.torrent.info.piece_length as usize;
+        let files = self.torrent.info.files.clone();
+        self.tpool.execute(move || {
+            let mut disk_mgr = DiskManager::new(total_pieces, total_size, piece_length, files);
+            while let Ok(ev) = io_rx.recv() {
+                match ev {
+                    IoTask::WriteToDisk {
+                        piece,
+                        offset,
+                        data,
+                    } => {
+                        if let Err(e) = disk_mgr.write_to_disk(piece, offset, &data) {
+                            eprintln!("failed to write piece data to disk, index: {}, offset: {}, bytes: {} :: {}", piece, offset, data.len(), e);
+                            let _ = event_tx.send(Event::Stop);
+                            return;
                         }
-                        IoTask::ConnectPeer { addr } => {
-                            let event_tx = event_tx.clone();
-                            tpool_clone.execute(move || {
-                                match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
-                                    Ok(stream) => {
-                                        let _ = stream.set_nodelay(true);
-                                        let _ =
-                                            stream.set_read_timeout(Some(Duration::from_secs(10)));
-                                        let _ =
-                                            stream.set_write_timeout(Some(Duration::from_secs(10)));
+                    },
+                    IoTask::DiskVerifyPiece {
+                        piece,
+                        expected_hash,
+                    } => {
+                        if picker::verify_piece(piece, expected_hash, &disk_mgr) {
+                            let _ = event_tx.send(Event::PieceVerified { piece });
+                        } else {
+                            let _ = event_tx.send(Event::PieceVerificationFailed { piece });
+                        }
+                    },
+                    IoTask::Stop => break,
+                    IoTask::CalculateFileStats { bitfield } => {
+                        let mut total_downloaded = 0;
+                        let files: Vec<(PathBuf, u64, u64)> = disk_mgr
+                            .files()
+                            .iter()
+                            .enumerate()
+                            .map(|(i, f)| {
+                                let downloaded = disk_mgr.verified_bytes_for_file(i, &bitfield);
+                                total_downloaded += downloaded;
+                                (f.path.clone(), downloaded, f.length)
+                            })
+                            .collect();
+                        let _ = event_tx.send(Event::DiskStats {
+                            total_downloaded,
+                            files,
+                        });
+                    }
+                }
+            }
+        });
+    }
 
-                                        let _ =
-                                            event_tx.send(Event::PeerConnected { addr, stream });
-                                    }
-                                    Err(e) => {
-                                        let _ = event_tx.send(Event::PeerConnectFailed {
-                                            addr,
-                                            error: e.to_string(),
-                                        });
-                                    }
-                                }
-                            });
+    fn start_tick_thread(&self) {
+        let stop_signal = self.stop_signal.clone();
+        let event_tx = self.event_tx.clone();
+        self.tpool.execute(move || {
+            loop {
+                let _ = event_tx.send(Event::Tick);
+                if stop_signal.wait_timeout(Duration::from_millis(500)) {
+                    return;
+                }
+            }
+        });
+    }
+
+    fn start_peer_io_thread(&self, peer_io_rx: Receiver<PeerIoTask>) {
+        let peer_io_tx = self.peer_io_tx.clone();
+        let tpool_clone = self.tpool.clone();
+        let stop_signal = self.stop_signal.clone();
+        let total_pieces = self.torrent.info.piece_hashes.len();
+        let info_hash = self.torrent.info_hash;
+        let peer_id = self.peer_id;
+        let piece_length = self.torrent.info.piece_length;
+        let event_tx = self.event_tx.clone();
+        let total_size = self.torrent.info.total_size;
+        let piece_hashes = self.torrent.info.piece_hashes.clone();
+        let io_tx = self.io_tx.clone();
+        self.tpool.execute(move || {
+            let mut picker =
+                PiecePicker::new(piece_length as usize, total_size, piece_hashes).unwrap();
+            let mut connection_mgr =
+                ConnectionManager::new(peer_io_tx, tpool_clone, event_tx, io_tx);
+            let mut idle_sleep = Duration::from_millis(1);
+            loop {
+                let mut did_network_io = false;
+                let mut did_control_work = false;
+
+                // Control messages
+                while let Ok(ev) = peer_io_rx.try_recv() {
+                    did_control_work = true;
+                    match ev {
+                        PeerIoTask::Stop => return,
+                        PeerIoTask::NewPeers { peers } => {
+                            connection_mgr.on_new_peers(peers);
                         }
-                        IoTask::WriteToDisk {
-                            piece,
-                            offset,
-                            data,
+                        PeerIoTask::MaybeConnectPeers => {
+                            connection_mgr.maybe_connect_peers();
+                        }
+                        PeerIoTask::ConnectPeer { addr } => {
+                            connection_mgr.connect_peer(addr, info_hash, peer_id);
+                        }
+                        PeerIoTask::PeerConnected { addr, stream } => {
+                            connection_mgr.on_peer_connected(addr, stream, total_pieces);
+                        }
+                        PeerIoTask::PeerConnectFailed { addr, reason } => {
+                            connection_mgr.on_peer_connect_failed(addr, reason);
+                        }
+                        PeerIoTask::PeerDisconnected { addr, reason } => {
+                            connection_mgr.on_peer_disconnected(addr, reason);
+                        }
+                        PeerIoTask::PeerMessage { addr, msg } => {
+                            connection_mgr.handle_peer_message(addr, msg, &mut picker);
+                        }
+                        PeerIoTask::MaybeUpdateInterest {
+                            addr,
+                            bitfield_interested,
                         } => {
-                            let mut disk_mgr = disk_mgr.lock().unwrap();
-                            if let Err(e) = disk_mgr.write_to_disk(piece, offset, &data) {
-                                eprintln!(
-                                    "failed to write data to disk (piece: {}, offset: {}): {}",
-                                    piece,
-                                    offset,
-                                    e.to_string()
-                                );
+                            connection_mgr.maybe_update_interest(addr, bitfield_interested);
+                        }
+                        PeerIoTask::SendMessage { addr, msg } => {
+                            connection_mgr.enqueue_peer_message(&addr, msg);
+                        }
+                        PeerIoTask::RequestBlocksForPeer { addr, bitfield } => {
+                            connection_mgr.request_blocks_for_peer(addr, &mut picker, &bitfield);
+                        }
+                        PeerIoTask::MaybeRequestBlocks => {
+                            connection_mgr.maybe_request_blocks();
+                        }
+                        PeerIoTask::ReapPeerBlocks { addr, timeout } => {
+                            picker.reap_timeouts_for_peer(&addr, timeout);
+                        }
+                        PeerIoTask::PeriodicReap { endgame } => {
+                            connection_mgr.reap_block_timeouts(&mut picker);
+                            if endgame {
+                                picker.enter_endgame();
                             }
                         }
-                        IoTask::Stop => break,
-                        IoTask::DiskVerifyPiece {
-                            piece,
-                            expected_hash,
-                        } => {
-                            let disk_mgr = disk_mgr.lock().unwrap();
-                            let verified = picker::verify_piece(piece, expected_hash, &disk_mgr);
-                            if verified {
-                                let _ = event_tx.send(Event::PieceVerified { piece });
-                            } else {
-                                let _ = event_tx.send(Event::PieceVerificationFailure { piece });
+                    }
+                }
+
+                if connection_mgr.poll_peers(total_pieces) {
+                    did_network_io = true;
+                }
+
+                if did_network_io {
+                    idle_sleep = Duration::from_millis(1);
+                } else if did_control_work {
+                    idle_sleep = idle_sleep.min(Duration::from_millis(5));
+                } else {
+                    if stop_signal.wait_timeout(idle_sleep) {
+                        return;
+                    }
+                    idle_sleep = (idle_sleep * 2).min(Duration::from_millis(20));
+                }
+            }
+        });
+    }
+
+    fn start_announce_io_thread(&self, announce_io_rx: Receiver<AnnounceIoTask>) {
+        let peer_io_tx = self.peer_io_tx.clone();
+        self.tpool.execute(move || {
+            while let Ok(ev) = announce_io_rx.recv() {
+                match ev {
+                    AnnounceIoTask::Stop => return,
+                    AnnounceIoTask::PerformAnnounce {
+                        url,
+                        info_hash,
+                        peer_id,
+                        uploaded,
+                        downloaded,
+                        left,
+                    } => {
+                        match announce::announce(
+                            &url, &info_hash, &peer_id, 6881, uploaded, downloaded, left, None,
+                            None,
+                        ) {
+                            Ok(response) => {
+                                if !response.peers.is_empty() {
+                                    let _ = peer_io_tx.send(PeerIoTask::NewPeers {
+                                        peers: response.peers,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("tracker error for {} :: {}", url, e.to_string());
                             }
                         }
                     }
@@ -609,65 +476,46 @@ impl Engine {
             }
         });
     }
-}
 
-fn on_bitfield_from_peer(
-    peer: &mut Peer,
-    new_bitfield: Bitfield,
-    my_bitfield: &Bitfield,
-    event_tx: &Sender<Event>,
-) -> bool {
-    peer.bitfield = new_bitfield;
-    check_interested(peer, my_bitfield, event_tx)
-}
+    pub fn on_tick(&mut self) {
+        if self.stats.left == 0 && !self.stats.bitfield.has_any_zero() {
+            self.handle_disk_io_tick();
+            return;
+        }
+        self.check_announce();
+        self.maybe_connect_peers();
+        self.handle_disk_io_tick();
+        self.handle_peer_io_tick();
+    }
 
-fn on_have_from_peer(
-    peer: &mut Peer,
-    piece_idx: usize,
-    my_bitfield: &Bitfield,
-    event_tx: &Sender<Event>,
-) -> bool {
-    peer.bitfield.set(&piece_idx, true);
-    check_interested(peer, my_bitfield, event_tx)
-}
-
-fn check_interested(peer: &mut Peer, bitfield: &Bitfield, event_tx: &Sender<Event>) -> bool {
-    let interested = peer.bitfield.is_interesting_to(bitfield);
-    let changed = interested != peer.am_interested;
-    peer.am_interested = interested;
-
-    if changed {
-        let _ = event_tx.send(Event::SendPeerMessage {
-            addr: peer.addr,
-            message: if interested {
-                PeerMessage::Interested
-            } else {
-                PeerMessage::NotInterested
-            },
+    fn handle_disk_io_tick(&self) {
+        let _ = self.io_tx.send(IoTask::CalculateFileStats {
+            bitfield: self.stats.bitfield.clone(),
         });
     }
 
-    interested
-}
+    fn handle_peer_io_tick(&self) {
+        let endgame = self.stats.left < 5 * self.torrent.info.piece_length as u64;
+        let _ = self.peer_io_tx.send(PeerIoTask::PeriodicReap { endgame });
+        let _ = self.peer_io_tx.send(PeerIoTask::MaybeRequestBlocks);
+    }
 
-fn on_block_received_from_peer(
-    peer: &mut Peer,
-    piece_idx: usize,
-    begin: usize,
-    data: Vec<u8>,
-    picker: &mut PiecePicker,
-    io_tx: &Sender<IoTask>,
-) {
-    peer.stats.update(data.len());
-    peer.max_pipeline = peer.desired_pipeline(BLOCK_SIZE);
-    peer.inflight_requests = peer.inflight_requests.saturating_sub(1);
-    let received = picker.on_block_received(piece_idx, begin);
-    if received {
-        let _ = io_tx.send(IoTask::WriteToDisk {
-            piece: piece_idx,
-            offset: begin,
-            data,
-        });
+    fn maybe_connect_peers(&self) {
+        let _ = self.peer_io_tx.send(PeerIoTask::MaybeConnectPeers);
+    }
+
+    fn check_announce(&mut self) {
+        if let Some(tracker) = self.announce_mgr.next_due_tracker() {
+            tracker.announced();
+            let _ = self.announce_io_tx.send(AnnounceIoTask::PerformAnnounce {
+                url: tracker.url.clone(),
+                info_hash: self.torrent.info_hash,
+                peer_id: self.peer_id,
+                uploaded: 0,
+                downloaded: 0,
+                left: self.torrent.info.total_size,
+            });
+        }
     }
 }
 
@@ -684,45 +532,4 @@ fn generate_peer_id() -> [u8; 20] {
     }
 
     peer_id
-}
-
-fn calculate_stats(
-    torrent: &Torrent,
-    peers: usize,
-    available_peers: usize,
-    bitfield: &Bitfield,
-    disk_mgr: Arc<Mutex<DiskManager>>,
-) -> TorrentStats {
-    let mut total_downloaded = 0;
-    let bitfield = bitfield.clone();
-    let pieces_verified = bitfield.count_ones();
-    let files: Vec<(PathBuf, u64, u64)> = {
-        let disk_mgr = disk_mgr.lock().unwrap();
-        disk_mgr
-            .files()
-            .iter()
-            .enumerate()
-            .map(|(i, f)| {
-                let downloaded = disk_mgr.verified_bytes_for_file(i, &bitfield);
-                total_downloaded += downloaded;
-                (f.path.clone(), downloaded, f.length)
-            })
-            .collect()
-    };
-    TorrentStats::new(
-        torrent.info.total_size,
-        files,
-        total_downloaded,
-        0,
-        pieces_verified,
-        peers,
-        bitfield,
-        available_peers,
-    )
-}
-
-fn block_timeout(peer_speed: f64, block_size: usize) -> Duration {
-    let estimated_time = block_size as f64 / peer_speed;
-    let timeout_secs = estimated_time * 2.0;
-    Duration::from_secs_f64(timeout_secs.clamp(1.0, 30.0))
 }

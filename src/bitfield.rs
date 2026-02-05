@@ -26,6 +26,10 @@ impl Bitfield {
         }
     }
 
+    pub fn has_any_zero(&self) -> bool {
+        self.bits.iter().any(|b| *b == 0)
+    }
+
     pub fn is_interesting_to(&self, other: &Bitfield) -> bool {
         for i in 0..self.length {
             if self.get(&i) && !other.get(&i) {
