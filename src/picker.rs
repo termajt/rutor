@@ -53,8 +53,13 @@ impl Piece {
         true
     }
 
-    fn is_complete(&self) -> bool {
-        self.received.iter().all(|&b| b)
+    fn is_complete(&mut self) -> bool {
+        if self.completed {
+            return true;
+        }
+        self.completed = self.received.iter().all(|&b| b);
+
+        self.completed
     }
 }
 
@@ -95,7 +100,6 @@ impl PiecePicker {
         &mut self,
         addr: &SocketAddr,
         peer_bf: &Bitfield,
-        my_bf: &Bitfield,
         mut free: usize,
     ) -> Vec<BlockRequest> {
         let mut out = Vec::new();
@@ -105,19 +109,14 @@ impl PiecePicker {
         }
 
         let now = Instant::now();
-        for piece_idx in peer_bf.get_ones() {
+        for (piece_index, piece) in self.pieces.iter_mut() {
             if free == 0 {
                 break;
             }
 
-            if my_bf.get(&piece_idx) {
+            if !peer_bf.get(piece_index) {
                 continue;
             }
-
-            let piece = match self.pieces.get(&piece_idx) {
-                Some(p) => p,
-                None => continue,
-            };
 
             if piece.completed || piece.is_complete() {
                 continue;
@@ -131,7 +130,7 @@ impl PiecePicker {
                 }
 
                 let offset = block_idx * BLOCK_SIZE;
-                let key = (piece_idx, offset);
+                let key = (*piece_index, offset);
 
                 if self.requested.contains_key(&key) && !self.endgame {
                     continue;
@@ -143,7 +142,7 @@ impl PiecePicker {
                 self.requested.insert(key, (now, addr.clone()));
 
                 out.push(BlockRequest {
-                    piece: piece_idx,
+                    piece: *piece_index,
                     offset,
                     length,
                 });
@@ -166,6 +165,7 @@ impl PiecePicker {
         };
         piece.completed = false;
         piece.received.fill(false);
+        eprintln!("piece {} failed verification", piece_idx);
     }
 
     pub fn reap_timeouts_for_peer(

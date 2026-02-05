@@ -58,6 +58,7 @@ This project uses a few well-established Rust crates:
 | [`sysinfo`](https://crates.io/crates/sysinfo) | System stats for CPU/memory/thread usage in the UI | [Docs](https://docs.rs/sysinfo) |
 | [`threadpool`](https://crates.io/crates/threadpool) | Worker thread pool for concurrent peer handling | [Docs](https://docs.rs/threadpool) |
 | [`libc`](https://crates.io/crates/libc) | Low-level system bindings (for cross-platform support) | [Docs](https://docs.rs/libc) |
+| [`mio`](https://crates.io/crates/mio) | Low-level async IO for efficient peer connections | [Docs](https://docs.rs/mio/latest/mio) |
 
 ## Notes
 

@@ -27,7 +27,13 @@ impl Bitfield {
     }
 
     pub fn has_any_zero(&self) -> bool {
-        self.bits.iter().any(|b| *b == 0)
+        for i in 0..self.length {
+            if !self.get(&i) {
+                return true;
+            }
+        }
+
+        false
     }
 
     pub fn is_interesting_to(&self, other: &Bitfield) -> bool {
@@ -142,7 +148,14 @@ impl Bitfield {
     }
 
     pub fn count_zeros(&self) -> usize {
-        self.bits.iter().map(|b| b.count_zeros() as usize).sum()
+        let mut zeros = 0;
+        for i in 0..self.length {
+            if !self.get(&i) {
+                zeros += 1;
+            }
+        }
+
+        zeros
     }
 
     pub fn has_any(&self) -> bool {

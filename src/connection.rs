@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use mio::{Events, Poll};
+use mio::{Interest, Token, net::TcpStream as MioTcpStream};
 use threadpool::ThreadPool;
 
 use crate::{
@@ -13,22 +15,24 @@ use crate::{
     bytespeed::ByteSpeed,
     engine::{Event, IoTask, PeerIoTask},
     peer::PeerMessage,
-    picker::{self, PiecePicker},
+    picker::{self, BlockRequest, PiecePicker},
 };
 
 pub const MAX_PEERS: usize = 32;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const MAX_READ_BUF: usize = 512 * 1024;
-const MAX_PIPELINE: usize = 32;
-const INITIAL_PIPELINE: usize = 4;
+const MAX_READ_BUF: usize = 2 * 1024 * 1024;
+const INITIAL_READ_BUF: usize = 8 * 1024;
+const MAX_PIPELINE: usize = 128;
+const INITIAL_PIPELINE: usize = 16;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(120);
 const INITIAL_RTT: Duration = Duration::from_millis(150);
 const ALPHA: f64 = 0.2;
+const FIRST_PEER_TOKEN: usize = 1;
 
 #[derive(Debug)]
 struct PeerConnection {
     addr: SocketAddr,
-    stream: TcpStream,
+    stream: MioTcpStream,
     read_buf: Vec<u8>,
     write_queue: VecDeque<Vec<u8>>,
     bitfield: Bitfield,
@@ -40,15 +44,16 @@ struct PeerConnection {
     assumed_rtt: Duration,
     max_pipeline: usize,
     last_keepalive: Instant,
+    token: Token,
 }
 
 impl PeerConnection {
-    fn new(addr: SocketAddr, stream: TcpStream, total_pieces: usize) -> Self {
+    fn new(addr: SocketAddr, stream: MioTcpStream, total_pieces: usize, token: Token) -> Self {
         let speed = ByteSpeed::new(Duration::from_secs(1), true, ALPHA);
         Self {
             addr,
             stream,
-            read_buf: Vec::with_capacity(8 * 1024),
+            read_buf: Vec::with_capacity(INITIAL_READ_BUF),
             write_queue: VecDeque::new(),
             bitfield: Bitfield::new(total_pieces),
             am_choked: true,
@@ -59,6 +64,7 @@ impl PeerConnection {
             assumed_rtt: INITIAL_RTT,
             max_pipeline: INITIAL_PIPELINE,
             last_keepalive: Instant::now(),
+            token,
         }
     }
 
@@ -102,82 +108,79 @@ impl PeerConnection {
     }
 
     fn enqueue_message(&mut self, msg: PeerMessage) {
+        match msg {
+            PeerMessage::Request((piece, offset, _)) => {
+                self.record_request(piece as usize, offset as usize);
+            }
+            _ => {}
+        }
         self.write_queue.push_back(msg.encode());
     }
 
-    fn poll_reads(&mut self, peer_io_tx: &Sender<PeerIoTask>, total_pieces: usize) -> bool {
-        let mut did_work = false;
+    fn poll_reads(
+        &mut self,
+        peer_io_tx: &Sender<PeerIoTask>,
+        total_pieces: usize,
+    ) -> Result<(), io::Error> {
         let mut buf = [0u8; 4096];
         loop {
             match self.stream.read(&mut buf) {
                 Ok(0) => {
-                    let _ = peer_io_tx.send(PeerIoTask::PeerDisconnected {
-                        addr: self.addr,
-                        reason: "peer closed".to_string(),
-                    });
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "peer closed",
+                    ));
                 }
                 Ok(n) => {
-                    did_work = true;
-                    if self.read_buf.len() > MAX_READ_BUF {
-                        let _ = peer_io_tx.send(PeerIoTask::PeerDisconnected {
-                            addr: self.addr,
-                            reason: "read buffer overflow".to_string(),
-                        });
-                        break;
+                    if self.read_buf.len() + n > MAX_READ_BUF {
+                        return Err(io::Error::new(io::ErrorKind::Other, "read buffer overflow"));
+                    }
+                    if self.read_buf.len() + n > self.read_buf.capacity() {
+                        let new_capacity = (self.read_buf.len() + n).min(MAX_READ_BUF);
+                        self.read_buf
+                            .reserve(new_capacity - self.read_buf.capacity());
                     }
                     self.read_buf.extend_from_slice(&buf[..n]);
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    let _ = peer_io_tx.send(PeerIoTask::PeerDisconnected {
-                        addr: self.addr,
-                        reason: e.to_string(),
-                    });
-                    break;
-                }
+                Err(e) => return Err(e),
             }
         }
 
-        if did_work {
-            loop {
-                if self.read_buf.len() < 4 {
-                    break;
-                }
+        loop {
+            if self.read_buf.len() < 4 {
+                break;
+            }
 
-                let len = u32::from_be_bytes(self.read_buf[0..4].try_into().unwrap()) as usize;
+            let len = u32::from_be_bytes(self.read_buf[0..4].try_into().unwrap()) as usize;
 
-                if self.read_buf.len() < 4 + len {
-                    break;
-                }
+            if self.read_buf.len() < 4 + len {
+                break;
+            }
 
-                self.read_buf.drain(0..4);
-                let payload: Vec<u8> = self.read_buf.drain(0..len).collect();
-                if let Ok(msg) = self.parse_peer_message(&payload, total_pieces) {
-                    let _ = peer_io_tx.send(PeerIoTask::PeerMessage {
-                        addr: self.addr,
-                        msg,
-                    });
-                }
+            self.read_buf.drain(0..4);
+            let payload: Vec<u8> = self.read_buf.drain(0..len).collect();
+            if let Ok(msg) = self.parse_peer_message(&payload, total_pieces) {
+                let _ = peer_io_tx.send(PeerIoTask::PeerMessage {
+                    addr: self.addr,
+                    msg,
+                });
             }
         }
 
-        did_work
+        Ok(())
     }
 
-    fn poll_writes(&mut self, peer_io_tx: &Sender<PeerIoTask>) -> bool {
-        let mut did_work = false;
+    fn poll_writes(&mut self) -> Result<(), io::Error> {
         while let Some(front) = self.write_queue.front_mut() {
             match self.stream.write(front) {
                 Ok(0) => {
-                    let _ = peer_io_tx.send(PeerIoTask::PeerDisconnected {
-                        addr: self.addr,
-                        reason: "peer closed".to_string(),
-                    });
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "peer closed",
+                    ));
                 }
                 Ok(n) => {
-                    did_work = true;
                     if n == front.len() {
                         self.write_queue.pop_front();
                     } else {
@@ -186,17 +189,11 @@ impl PeerConnection {
                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    let _ = peer_io_tx.send(PeerIoTask::PeerDisconnected {
-                        addr: self.addr,
-                        reason: e.to_string(),
-                    });
-                    break;
-                }
+                Err(e) => return Err(e),
             }
         }
 
-        did_work
+        Ok(())
     }
 
     fn parse_peer_message(
@@ -303,7 +300,15 @@ impl PeerConnection {
                         });
                     }
                 }
-                let _ = event_tx.send(Event::PeerNeedsBlocks { addr: self.addr });
+                if let Some(requests) = self.request_blocks(picker) {
+                    for req in requests {
+                        self.enqueue_message(PeerMessage::Request((
+                            req.piece as u32,
+                            req.offset as u32,
+                            req.length as u32,
+                        )));
+                    }
+                }
             }
             PeerMessage::Cancel(_) => todo!(),
             PeerMessage::Port(_) => todo!(),
@@ -325,7 +330,6 @@ impl PeerConnection {
         &mut self,
         peer_io_tx: &Sender<PeerIoTask>,
         bitfield_interested: bool,
-        event_tx: &Sender<Event>,
     ) {
         let was_interested = self.am_interested;
         self.am_interested = bitfield_interested;
@@ -343,7 +347,7 @@ impl PeerConnection {
             });
         }
         if self.am_interested {
-            let _ = event_tx.send(Event::PeerNeedsBlocks { addr: self.addr });
+            let _ = peer_io_tx.send(PeerIoTask::RequestBlocksForPeer { addr: self.addr });
         }
     }
 
@@ -362,6 +366,20 @@ impl PeerConnection {
 
         Duration::from_secs_f64(timeout_secs).clamp(MIN_TIMEOUT, MAX_TIMEOUT)
     }
+
+    fn request_blocks(&mut self, picker: &mut PiecePicker) -> Option<Vec<BlockRequest>> {
+        if self.am_choked || !self.am_interested {
+            return None;
+        }
+        let free = self
+            .max_pipeline
+            .saturating_sub(self.in_flight_requests.len());
+        if free == 0 {
+            return None;
+        }
+
+        Some(picker.pick_blocks_for_peer(&self.addr, &self.bitfield, free))
+    }
 }
 
 #[derive(Debug)]
@@ -373,6 +391,10 @@ pub struct ConnectionManager {
     event_tx: Sender<Event>,
     tpool: Arc<ThreadPool>,
     io_tx: Sender<IoTask>,
+    poll: Poll,
+    events: Events,
+    next_token: usize,
+    token_to_addr: HashMap<Token, SocketAddr>,
 }
 
 impl ConnectionManager {
@@ -381,8 +403,8 @@ impl ConnectionManager {
         tpool: Arc<ThreadPool>,
         event_tx: Sender<Event>,
         io_tx: Sender<IoTask>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
             pending_peers: HashSet::new(),
             available_peers: Vec::new(),
             connected_peers: HashMap::new(),
@@ -390,7 +412,11 @@ impl ConnectionManager {
             event_tx,
             tpool,
             io_tx,
-        }
+            poll: Poll::new()?,
+            events: Events::with_capacity(1024),
+            next_token: FIRST_PEER_TOKEN,
+            token_to_addr: HashMap::new(),
+        })
     }
 
     pub fn on_new_peers(&mut self, peers: Vec<SocketAddr>) {
@@ -462,10 +488,17 @@ impl ConnectionManager {
         peer.enqueue_message(msg);
     }
 
-    pub fn on_peer_disconnected(&mut self, addr: SocketAddr, reason: String) {
+    pub fn on_peer_disconnected(
+        &mut self,
+        addr: SocketAddr,
+        reason: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("peer disconnected: {} :: {}", addr, reason);
         self.pending_peers.remove(&addr);
-        self.connected_peers.remove(&addr);
+        if let Some(mut conn) = self.connected_peers.remove(&addr) {
+            self.token_to_addr.remove(&conn.token);
+            self.poll.registry().deregister(&mut conn.stream)?;
+        }
         let _ = self.peer_io_tx.send(PeerIoTask::ReapPeerBlocks {
             addr,
             timeout: Duration::ZERO,
@@ -473,42 +506,97 @@ impl ConnectionManager {
         let _ = self.event_tx.send(Event::PeersUpdated {
             connected_peers: self.connected_peers.len(),
         });
+        Ok(())
     }
 
-    pub fn on_peer_connected(&mut self, addr: SocketAddr, stream: TcpStream, total_pieces: usize) {
+    pub fn on_peer_connected(
+        &mut self,
+        addr: SocketAddr,
+        stream: TcpStream,
+        total_pieces: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         self.pending_peers.remove(&addr);
         if self.connected_peers.contains_key(&addr) {
-            return;
+            return Ok(());
         }
-        self.connected_peers
-            .insert(addr, PeerConnection::new(addr, stream, total_pieces));
+
+        let mut mio_stream = MioTcpStream::from_std(stream);
+        let token = Token(self.next_token);
+        self.next_token += 1;
+
+        self.poll.registry().register(
+            &mut mio_stream,
+            token,
+            Interest::READABLE | Interest::WRITABLE,
+        )?;
+
+        self.token_to_addr.insert(token, addr);
+        self.connected_peers.insert(
+            addr,
+            PeerConnection::new(addr, mio_stream, total_pieces, token),
+        );
         let _ = self.event_tx.send(Event::PeersUpdated {
             connected_peers: self.connected_peers.len(),
         });
+        Ok(())
     }
 
-    pub fn on_peer_connect_failed(&mut self, addr: SocketAddr, reason: String) {
+    pub fn on_peer_connect_failed(
+        &mut self,
+        addr: SocketAddr,
+        reason: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("peer {} connect failure: {}", addr, reason);
         self.pending_peers.remove(&addr);
-        self.connected_peers.remove(&addr);
+        if let Some(mut conn) = self.connected_peers.remove(&addr) {
+            self.token_to_addr.remove(&conn.token);
+            self.poll.registry().deregister(&mut conn.stream)?;
+        }
         let _ = self.event_tx.send(Event::PeersUpdated {
             connected_peers: self.connected_peers.len(),
         });
+        Ok(())
     }
 
-    pub fn poll_peers(&mut self, total_pieces: usize) -> bool {
-        let mut did_work = false;
-        for conn in self.connected_peers.values_mut() {
-            if conn.poll_reads(&self.peer_io_tx, total_pieces) {
-                did_work = true;
+    pub fn poll_peers(&mut self, total_pieces: usize) -> Result<(), Box<dyn std::error::Error>> {
+        self.poll
+            .poll(&mut self.events, Some(Duration::from_millis(5)))?;
+
+        for ev in self.events.iter() {
+            let token = ev.token();
+
+            let addr = match self.token_to_addr.get(&token) {
+                Some(a) => *a,
+                None => continue,
+            };
+
+            let conn = match self.connected_peers.get_mut(&addr) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if ev.is_readable() {
+                if let Err(e) = conn.poll_reads(&self.peer_io_tx, total_pieces) {
+                    let _ = self.peer_io_tx.send(PeerIoTask::PeerDisconnected {
+                        addr: conn.addr,
+                        reason: e.to_string(),
+                    });
+                }
             }
-            if conn.poll_writes(&self.peer_io_tx) {
-                did_work = true;
+
+            if ev.is_writable() {
+                if let Err(e) = conn.poll_writes() {
+                    let _ = self.peer_io_tx.send(PeerIoTask::PeerDisconnected {
+                        addr: conn.addr,
+                        reason: e.to_string(),
+                    });
+                }
             }
+
             conn.maybe_send_keepalive();
         }
 
-        did_work
+        Ok(())
     }
 
     pub fn handle_peer_message(
@@ -529,31 +617,19 @@ impl ConnectionManager {
             Some(p) => p,
             None => return,
         };
-        peer.maybe_update_interest(&self.peer_io_tx, bitfield_interested, &self.event_tx);
+        peer.maybe_update_interest(&self.peer_io_tx, bitfield_interested);
     }
 
-    pub fn request_blocks_for_peer(
-        &mut self,
-        addr: SocketAddr,
-        picker: &mut PiecePicker,
-        bitfield: &Bitfield,
-    ) {
+    pub fn request_blocks_for_peer(&mut self, addr: SocketAddr, picker: &mut PiecePicker) {
         let peer = match self.connected_peers.get_mut(&addr) {
             Some(p) => p,
             None => return,
         };
-        if peer.am_choked || !peer.am_interested {
-            return;
-        }
-        let free = peer
-            .max_pipeline
-            .saturating_sub(peer.in_flight_requests.len());
-        if free == 0 {
-            return;
-        }
-        let requests = picker.pick_blocks_for_peer(&addr, &peer.bitfield, bitfield, free);
+        let requests = match peer.request_blocks(picker) {
+            Some(r) => r,
+            None => return,
+        };
         for req in requests {
-            peer.record_request(req.piece, req.offset);
             let _ = self.peer_io_tx.send(PeerIoTask::SendMessage {
                 addr,
                 msg: PeerMessage::Request((req.piece as u32, req.offset as u32, req.length as u32)),
@@ -564,8 +640,8 @@ impl ConnectionManager {
     pub fn maybe_request_blocks(&mut self) {
         for peer in self.connected_peers.values() {
             let _ = self
-                .event_tx
-                .send(Event::PeerNeedsBlocks { addr: peer.addr });
+                .peer_io_tx
+                .send(PeerIoTask::RequestBlocksForPeer { addr: peer.addr });
         }
     }
 
