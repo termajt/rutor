@@ -1,6 +1,6 @@
 use rutor::bytespeed::ByteSpeed;
 use rutor::engine::{Engine, Event, TorrentStats};
-use rutor::{connection, torrent};
+use rutor::torrent;
 use std::env;
 use std::fs::File;
 use std::io::Write;
@@ -192,20 +192,22 @@ impl ProgressTracker {
             magenta,
         );
         println!(
-            "{0}{1:<10}:{2} {3} / {4} (C)",
+            "{0}{1:<10}:{2} {3} / {4} (C) ({5} available)",
             blue,
             "Peers",
             reset,
             self.stats.peers,
-            connection::MAX_PEERS
+            self.stats.max_peers,
+            self.stats.available_peers
         );
         println!(
-            "{0}{1:<10}:{2} {3} / {4}",
+            "{0}{1:<10}:{2} {3} / {4} ({5} blocks in flight)",
             white,
             "Pieces",
             reset,
             self.stats.bitfield.count_ones(),
-            self.total_pieces
+            self.total_pieces,
+            self.stats.blocks_inflight
         );
         println!("{}", self.format_bar(self.stats.downloaded));
         if self.show_consumption {

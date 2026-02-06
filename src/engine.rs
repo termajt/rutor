@@ -5,7 +5,7 @@ use std::{
         Arc,
         mpsc::{Receiver, Sender},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -35,9 +35,6 @@ pub enum Event {
         addr: SocketAddr,
         bitfield: Bitfield,
     },
-    PeersUpdated {
-        connected_peers: usize,
-    },
     DiskStats {
         total_downloaded: u64,
         files: Vec<(PathBuf, u64, u64)>,
@@ -47,6 +44,12 @@ pub enum Event {
     },
     PieceVerificationFailed {
         piece: usize,
+    },
+    PeerIoStats {
+        connected_peers: usize,
+        max_peers: usize,
+        blocks_inflight: usize,
+        available_peers: usize,
     },
 }
 
@@ -105,10 +108,6 @@ pub enum PeerIoTask {
         addr: SocketAddr,
     },
     MaybeRequestBlocks,
-    ReapPeerBlocks {
-        addr: SocketAddr,
-        timeout: Duration,
-    },
     PeriodicReap {
         should_enter_endgame: bool,
     },
@@ -118,6 +117,7 @@ pub enum PeerIoTask {
     PieceVerificationFailed {
         piece: usize,
     },
+    StatsUpdate,
 }
 
 #[derive(Debug)]
@@ -141,6 +141,9 @@ pub struct TorrentStats {
     pub files: Vec<(PathBuf, u64, u64)>,
     pub peers: usize,
     pub bitfield: Bitfield,
+    pub max_peers: usize,
+    pub blocks_inflight: usize,
+    pub available_peers: usize,
 }
 
 impl TorrentStats {
@@ -151,6 +154,9 @@ impl TorrentStats {
         uploaded: u64,
         peers: usize,
         bitfield: Bitfield,
+        max_peers: usize,
+        blocks_inflight: usize,
+        available_peers: usize,
     ) -> Self {
         let left = total_size.saturating_sub(downloaded);
         Self {
@@ -160,6 +166,9 @@ impl TorrentStats {
             files,
             peers,
             bitfield,
+            max_peers,
+            blocks_inflight,
+            available_peers,
         }
     }
 }
@@ -179,6 +188,8 @@ pub struct Engine {
     stats: TorrentStats,
     completed: bool,
     endgame_threshold: f64,
+    last_peers_adjust: Option<Instant>,
+    endgame: bool,
 }
 
 impl Engine {
@@ -193,7 +204,17 @@ impl Engine {
     ) -> Self {
         let announce_mgr = AnnounceManager::new(&torrent);
         let bitfield = Bitfield::new(torrent.info.piece_hashes.len());
-        let stats = TorrentStats::new(torrent.info.total_size, Vec::new(), 0, 0, 0, bitfield);
+        let stats = TorrentStats::new(
+            torrent.info.total_size,
+            Vec::new(),
+            0,
+            0,
+            0,
+            bitfield,
+            0,
+            0,
+            0,
+        );
         let endgame_threshold = endgame_threshold(torrent.info.total_size);
         Self {
             announce_mgr,
@@ -209,6 +230,8 @@ impl Engine {
             stats,
             completed: false,
             endgame_threshold,
+            last_peers_adjust: None,
+            endgame: false,
         }
     }
 
@@ -243,9 +266,6 @@ impl Engine {
                     bitfield_interested: interested,
                 });
             }
-            Event::PeersUpdated { connected_peers } => {
-                self.stats.peers = connected_peers;
-            }
             Event::DiskStats {
                 total_downloaded,
                 files,
@@ -265,6 +285,17 @@ impl Engine {
             }
             Event::PieceVerificationFailed { piece } => {
                 self.stats.bitfield.set(&piece, false);
+            }
+            Event::PeerIoStats {
+                connected_peers,
+                max_peers,
+                blocks_inflight,
+                available_peers,
+            } => {
+                self.stats.peers = connected_peers;
+                self.stats.max_peers = max_peers;
+                self.stats.blocks_inflight = blocks_inflight;
+                self.stats.available_peers = available_peers;
             }
         }
         Ok(())
@@ -380,14 +411,10 @@ impl Engine {
         let total_size = self.torrent.info.total_size;
         let piece_hashes = self.torrent.info.piece_hashes.clone();
         let io_tx = self.io_tx.clone();
-        let endgame_threshold = self.endgame_threshold;
+        let stop_signal = self.stop_signal.clone();
         self.tpool.execute(move || {
-            let mut picker = match PiecePicker::new(
-                piece_length as usize,
-                total_size,
-                piece_hashes,
-                endgame_threshold,
-            ) {
+            let mut picker = match PiecePicker::new(piece_length as usize, total_size, piece_hashes)
+            {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("failed to create piece picker: {}", e);
@@ -404,19 +431,31 @@ impl Engine {
                         return;
                     }
                 };
+            const MAX_EVENTS_PER_TICK: usize = 100;
             loop {
                 // Control messages
-                while let Ok(ev) = peer_io_rx.try_recv() {
+                let mut processed = 0;
+                while processed < MAX_EVENTS_PER_TICK
+                    && let Ok(ev) = peer_io_rx.try_recv()
+                {
                     match ev {
                         PeerIoTask::Stop => return,
                         PeerIoTask::NewPeers { peers } => {
                             connection_mgr.on_new_peers(peers);
                         }
                         PeerIoTask::MaybeConnectPeers => {
-                            connection_mgr.maybe_connect_peers();
+                            connection_mgr.maybe_adjust_peers(total_size, &mut picker);
                         }
                         PeerIoTask::ConnectPeer { addr } => {
-                            connection_mgr.connect_peer(addr, info_hash, peer_id);
+                            if stop_signal.is_set() {
+                                continue;
+                            }
+                            connection_mgr.connect_peer(
+                                addr,
+                                info_hash,
+                                peer_id,
+                                stop_signal.clone(),
+                            );
                         }
                         PeerIoTask::PeerConnected { addr, stream } => {
                             if let Err(e) =
@@ -426,7 +465,9 @@ impl Engine {
                             }
                         }
                         PeerIoTask::PeerConnectFailed { addr, reason } => {
-                            if let Err(e) = connection_mgr.on_peer_connect_failed(addr, reason) {
+                            if let Err(e) =
+                                connection_mgr.on_peer_connect_failed(addr, reason, &mut picker)
+                            {
                                 eprintln!("failed to handle peer {} connect failure: {}", addr, e);
                             }
                         }
@@ -455,17 +496,12 @@ impl Engine {
                         PeerIoTask::MaybeRequestBlocks => {
                             connection_mgr.maybe_request_blocks();
                         }
-                        PeerIoTask::ReapPeerBlocks { addr, timeout } => {
-                            picker.reap_timeouts_for_peer(&addr, timeout);
-                        }
                         PeerIoTask::PeriodicReap {
                             should_enter_endgame,
                         } => {
                             connection_mgr.reap_block_timeouts(&mut picker);
                             if should_enter_endgame {
                                 picker.enter_endgame();
-                            } else {
-                                picker.update_endgame();
                             }
                         }
                         PeerIoTask::PieceVerified { piece } => {
@@ -474,13 +510,26 @@ impl Engine {
                         PeerIoTask::PieceVerificationFailed { piece } => {
                             picker.on_piece_verification_failure(piece);
                         }
+                        PeerIoTask::StatsUpdate => {
+                            let _ = event_tx.send(Event::PeerIoStats {
+                                connected_peers: connection_mgr.connected_peers(),
+                                max_peers: connection_mgr.max_peers(),
+                                blocks_inflight: picker.in_flight(),
+                                available_peers: connection_mgr.available_peers(),
+                            });
+                        }
                     }
+                    processed += 1;
                 }
 
-                if let Err(e) = connection_mgr.poll_peers() {
-                    eprintln!("failed to poll peers: {}", e);
+                match connection_mgr.poll_peers() {
+                    Ok(addrs) => {
+                        connection_mgr.drain_peer_messages(addrs, total_pieces);
+                    }
+                    Err(e) => {
+                        eprintln!("failed to poll peers: {}", e);
+                    }
                 }
-                connection_mgr.drain_peer_messages(total_pieces);
             }
         });
     }
@@ -499,11 +548,13 @@ impl Engine {
                         downloaded,
                         left,
                     } => {
+                        eprintln!("fetching tracker: {}", url);
                         match announce::announce(
                             &url, &info_hash, &peer_id, 6881, uploaded, downloaded, left, None,
                             None,
                         ) {
                             Ok(response) => {
+                                eprintln!("fetched tracker: {} :: {:?}", url, response);
                                 if !response.peers.is_empty() {
                                     let _ = peer_io_tx.send(PeerIoTask::NewPeers {
                                         peers: response.peers,
@@ -521,8 +572,10 @@ impl Engine {
     }
 
     pub fn on_tick(&mut self) {
+        if self.completed {
+            return;
+        }
         self.check_announce();
-        self.maybe_connect_peers();
         self.handle_disk_io_tick();
         self.handle_peer_io_tick();
     }
@@ -533,30 +586,44 @@ impl Engine {
         });
     }
 
-    fn handle_peer_io_tick(&self) {
-        let percent_left = self.stats.left as f64 / self.torrent.info.total_size as f64;
-        let should_enter_endgame = percent_left < self.endgame_threshold;
+    fn handle_peer_io_tick(&mut self) {
+        let _ = self.peer_io_tx.send(PeerIoTask::StatsUpdate);
+        if !self.endgame {
+            let percent_left = self.stats.left as f64 / self.torrent.info.total_size as f64;
+            let should_enter_endgame = percent_left < self.endgame_threshold;
+            self.endgame = should_enter_endgame;
+        }
         let _ = self.peer_io_tx.send(PeerIoTask::PeriodicReap {
-            should_enter_endgame,
+            should_enter_endgame: self.endgame,
         });
         let _ = self.peer_io_tx.send(PeerIoTask::MaybeRequestBlocks);
-    }
-
-    fn maybe_connect_peers(&self) {
-        let _ = self.peer_io_tx.send(PeerIoTask::MaybeConnectPeers);
+        if self.endgame {
+            return;
+        }
+        if let Some(last_adjust) = self.last_peers_adjust {
+            if last_adjust.elapsed() >= Duration::from_secs(5) {
+                self.last_peers_adjust = Some(Instant::now());
+                let _ = self.peer_io_tx.send(PeerIoTask::MaybeConnectPeers);
+            }
+        } else {
+            self.last_peers_adjust = Some(Instant::now());
+            let _ = self.peer_io_tx.send(PeerIoTask::MaybeConnectPeers);
+        }
     }
 
     fn check_announce(&mut self) {
-        if let Some(tracker) = self.announce_mgr.next_due_tracker() {
-            tracker.announced();
-            let _ = self.announce_io_tx.send(AnnounceIoTask::PerformAnnounce {
-                url: tracker.url.clone(),
-                info_hash: self.torrent.info_hash,
-                peer_id: self.peer_id,
-                uploaded: 0,
-                downloaded: self.stats.downloaded,
-                left: self.stats.left,
-            });
+        if self.stats.available_peers == 0 {
+            if let Some(tracker) = self.announce_mgr.next_due_tracker() {
+                tracker.announced();
+                let _ = self.announce_io_tx.send(AnnounceIoTask::PerformAnnounce {
+                    url: tracker.url.clone(),
+                    info_hash: self.torrent.info_hash,
+                    peer_id: self.peer_id,
+                    uploaded: 0,
+                    downloaded: self.stats.downloaded,
+                    left: self.stats.left,
+                });
+            }
         }
     }
 }
