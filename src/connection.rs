@@ -35,7 +35,6 @@ const MAX_MESSAGE_LEN: usize = 1024 * 1024;
 const BASE_POLL_TIMEOUT: Duration = Duration::from_millis(5);
 const MAX_POLL_TIMEOUT: Duration = Duration::from_millis(100);
 const IDLE_BACKOFF_STEP: Duration = Duration::from_millis(10);
-const MAX_EVENTS_PER_TICK: usize = 128;
 
 #[derive(Debug)]
 enum MessageHandleResult {
@@ -435,6 +434,12 @@ pub struct ConnectionManager {
     poll_timeout: Duration,
     idle_ticks: u32,
     global_in_flight: usize,
+    picker: PiecePicker,
+    torrent_size: u64,
+    stop_signal: Arc<ManualResetEvent>,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+    total_pieces: usize,
 }
 
 impl ConnectionManager {
@@ -443,6 +448,12 @@ impl ConnectionManager {
         tpool: Arc<ThreadPool>,
         event_tx: Sender<Event>,
         io_tx: Sender<IoTask>,
+        picker: PiecePicker,
+        torrent_size: u64,
+        stop_signal: Arc<ManualResetEvent>,
+        info_hash: [u8; 20],
+        peer_id: [u8; 20],
+        total_pieces: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             pending_peers: HashSet::new(),
@@ -460,6 +471,12 @@ impl ConnectionManager {
             poll_timeout: BASE_POLL_TIMEOUT,
             idle_ticks: 0,
             global_in_flight: 0,
+            picker,
+            torrent_size,
+            stop_signal,
+            info_hash,
+            peer_id,
+            total_pieces,
         })
     }
 
@@ -485,16 +502,12 @@ impl ConnectionManager {
         (base_peers + extra_peers).min(100)
     }
 
-    fn cleanup_peer(
-        &mut self,
-        addr: &SocketAddr,
-        picker: &mut PiecePicker,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn cleanup_peer(&mut self, addr: &SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         self.pending_peers.remove(addr);
         if let Some(mut peer) = self.connected_peers.remove(addr) {
-            let freed = peer.reap_block_timeouts(picker, Some(Duration::ZERO));
+            let freed = peer.reap_block_timeouts(&mut self.picker, Some(Duration::ZERO));
             self.global_in_flight = self.global_in_flight.saturating_sub(freed);
-            picker.on_peer_disconnected(&peer.addr, &peer.bitfield);
+            self.picker.on_peer_disconnected(&peer.addr, &peer.bitfield);
             self.token_to_addr.remove(&peer.token);
             self.poll.registry().deregister(&mut peer.stream)?;
         }
@@ -502,8 +515,8 @@ impl ConnectionManager {
         Ok(())
     }
 
-    pub fn maybe_adjust_peers(&mut self, total_size: u64, picker: &mut PiecePicker) {
-        let desired_peers = self.adaptive_max_peers(total_size);
+    fn maybe_adjust_peers(&mut self) {
+        let desired_peers = self.adaptive_max_peers(self.torrent_size);
         self.max_peers = desired_peers;
         let active_peers = self.connected_peers.len() + self.pending_peers.len();
 
@@ -535,7 +548,7 @@ impl ConnectionManager {
                 if to_drop == 0 {
                     break;
                 }
-                match self.cleanup_peer(&addr, picker) {
+                match self.cleanup_peer(&addr) {
                     Ok(()) => {
                         to_drop -= 1;
                     }
@@ -551,7 +564,7 @@ impl ConnectionManager {
         self.max_peers
     }
 
-    pub fn on_new_peers(&mut self, peers: Vec<SocketAddr>) {
+    fn on_new_peers(&mut self, peers: Vec<SocketAddr>) {
         for peer in peers {
             if self.pending_peers.contains(&peer) || self.connected_peers.contains_key(&peer) {
                 continue;
@@ -560,15 +573,14 @@ impl ConnectionManager {
         }
     }
 
-    pub fn connect_peer(
-        &self,
-        addr: SocketAddr,
-        info_hash: [u8; 20],
-        peer_id: [u8; 20],
-        stop_signal: Arc<ManualResetEvent>,
-    ) {
+    fn connect_peer(&self, addr: SocketAddr) {
+        if self.stop_signal.is_set() {
+            return;
+        }
         let peer_io_tx = self.peer_io_tx.clone();
-        let stop_signal = stop_signal.clone();
+        let stop_signal = self.stop_signal.clone();
+        let info_hash = self.info_hash;
+        let peer_id = self.peer_id;
         self.tpool.execute(move || {
             let mut stream = match tcp_connect(&addr, stop_signal.clone()) {
                 Ok(s) => s,
@@ -610,7 +622,7 @@ impl ConnectionManager {
         });
     }
 
-    pub fn enqueue_peer_message(&mut self, addr: &SocketAddr, msg: PeerMessage) {
+    fn enqueue_peer_message(&mut self, addr: &SocketAddr, msg: PeerMessage) {
         let peer = match self.connected_peers.get_mut(addr) {
             Some(p) => p,
             None => return,
@@ -618,23 +630,22 @@ impl ConnectionManager {
         peer.enqueue_message(msg);
     }
 
-    pub fn on_peer_disconnected(
+    fn on_peer_disconnected(
         &mut self,
         addr: SocketAddr,
         _reason: String,
-        picker: &mut PiecePicker,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Err(e) = self.cleanup_peer(&addr, picker) {
+        if let Err(e) = self.cleanup_peer(&addr) {
             eprintln!("failed to cleanup peer: {} :: {}", addr, e);
+            return Err(e);
         }
         Ok(())
     }
 
-    pub fn on_peer_connected(
+    fn on_peer_connected(
         &mut self,
         addr: SocketAddr,
         stream: TcpStream,
-        total_pieces: usize,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.pending_peers.remove(&addr);
         if self.connected_peers.contains_key(&addr) {
@@ -654,20 +665,20 @@ impl ConnectionManager {
         self.token_to_addr.insert(token, addr);
         self.connected_peers.insert(
             addr,
-            PeerConnection::new(addr, mio_stream, total_pieces, token),
+            PeerConnection::new(addr, mio_stream, self.total_pieces, token),
         );
 
         Ok(())
     }
 
-    pub fn on_peer_connect_failed(
+    fn on_peer_connect_failed(
         &mut self,
         addr: SocketAddr,
         _reason: String,
-        picker: &mut PiecePicker,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Err(e) = self.cleanup_peer(&addr, picker) {
+        if let Err(e) = self.cleanup_peer(&addr) {
             eprintln!("failed to cleanup peer: {} :: {}", addr, e);
+            return Err(e);
         }
         Ok(())
     }
@@ -676,14 +687,8 @@ impl ConnectionManager {
         self.poll.poll(&mut self.events, Some(self.poll_timeout))?;
 
         let mut activity = false;
-        let mut processed = 0;
         let mut drains_needed = Vec::new();
         for ev in self.events.iter() {
-            if processed >= MAX_EVENTS_PER_TICK {
-                break;
-            }
-            processed += 1;
-
             let token = ev.token();
 
             let addr = match self.token_to_addr.get(&token) {
@@ -755,17 +760,14 @@ impl ConnectionManager {
         }
     }
 
-    pub fn handle_peer_message(
-        &mut self,
-        addr: SocketAddr,
-        msg: PeerMessage,
-        picker: &mut PiecePicker,
-    ) {
+    fn handle_peer_message(&mut self, addr: SocketAddr, msg: PeerMessage) {
         let peer = match self.connected_peers.get_mut(&addr) {
             Some(p) => p,
             None => return,
         };
-        if let Some(result) = peer.handle_message(msg, &self.event_tx, &self.io_tx, picker) {
+        if let Some(result) =
+            peer.handle_message(msg, &self.event_tx, &self.io_tx, &mut self.picker)
+        {
             match result {
                 MessageHandleResult::PieceHandler {
                     request_more,
@@ -775,14 +777,14 @@ impl ConnectionManager {
                         self.global_in_flight = self.global_in_flight.saturating_sub(1);
                     }
                     if request_more {
-                        self.request_blocks_for_peer(addr, picker);
+                        self.request_blocks_for_peer(addr);
                     }
                 }
             }
         }
     }
 
-    pub fn maybe_update_interest(&mut self, addr: SocketAddr, bitfield_interested: bool) {
+    fn maybe_update_interest(&mut self, addr: SocketAddr, bitfield_interested: bool) {
         let peer = match self.connected_peers.get_mut(&addr) {
             Some(p) => p,
             None => return,
@@ -790,7 +792,7 @@ impl ConnectionManager {
         peer.maybe_update_interest(&self.peer_io_tx, bitfield_interested);
     }
 
-    pub fn request_blocks_for_peer(&mut self, addr: SocketAddr, picker: &mut PiecePicker) {
+    fn request_blocks_for_peer(&mut self, addr: SocketAddr) {
         let global_max_inflight = self.calculate_global_max_inflight();
         let free_global = global_max_inflight.saturating_sub(self.global_in_flight);
         let peer = match self.connected_peers.get_mut(&addr) {
@@ -809,7 +811,9 @@ impl ConnectionManager {
             return;
         }
 
-        let requests = picker.pick_blocks_for_peer(&addr, &peer.bitfield, free);
+        let requests = self
+            .picker
+            .pick_blocks_for_peer(&addr, &peer.bitfield, free);
         for req in requests {
             peer.record_request(req.piece, req.offset);
             peer.enqueue_message(PeerMessage::Request((
@@ -839,7 +843,7 @@ impl ConnectionManager {
         inflight.clamp(32, 1024)
     }
 
-    pub fn maybe_request_blocks(&mut self) {
+    fn maybe_request_blocks(&mut self) {
         for peer in self.connected_peers.values() {
             let _ = self
                 .peer_io_tx
@@ -847,18 +851,18 @@ impl ConnectionManager {
         }
     }
 
-    pub fn reap_block_timeouts(&mut self, picker: &mut PiecePicker) {
+    fn reap_block_timeouts(&mut self) {
         let addrs: Vec<_> = self.connected_peers.keys().cloned().collect();
         for addr in addrs {
-            self.reap_block_timeouts_for_peer(&addr, picker);
+            self.reap_block_timeouts_for_peer(&addr);
         }
     }
 
-    pub fn reap_block_timeouts_for_peer(&mut self, addr: &SocketAddr, picker: &mut PiecePicker) {
+    pub fn reap_block_timeouts_for_peer(&mut self, addr: &SocketAddr) {
         let freed = match self.connected_peers.get_mut(addr) {
-            Some(p) => p.reap_block_timeouts(picker, None),
+            Some(p) => p.reap_block_timeouts(&mut self.picker, None),
             None => {
-                let freed = picker.reap_timeouts_for_peer(addr, Duration::ZERO);
+                let freed = self.picker.reap_timeouts_for_peer(addr, Duration::ZERO);
                 freed.len()
             }
         };
@@ -871,6 +875,76 @@ impl ConnectionManager {
 
     pub fn available_peers(&self) -> usize {
         self.available_peers.len()
+    }
+
+    pub fn handle_event(&mut self, ev: PeerIoTask) {
+        match ev {
+            PeerIoTask::NewPeers { peers } => {
+                self.on_new_peers(peers);
+            }
+            PeerIoTask::ConnectPeer { addr } => {
+                self.connect_peer(addr);
+            }
+            PeerIoTask::PeerConnected { addr, stream } => {
+                if let Err(e) = self.on_peer_connected(addr, stream) {
+                    eprintln!("failed to add connected peer {} :: {}", addr, e);
+                }
+            }
+            PeerIoTask::PeerConnectFailed { addr, reason } => {
+                if let Err(e) = self.on_peer_connect_failed(addr, reason) {
+                    eprintln!("failed to handle peer {} connect failure: {}", addr, e);
+                }
+            }
+            PeerIoTask::MaybeConnectPeers => {
+                self.maybe_adjust_peers();
+            }
+            PeerIoTask::PeerDisconnected { addr, reason } => {
+                if let Err(e) = self.on_peer_disconnected(addr, reason) {
+                    eprintln!("failed to handle peer {} disconnect: {}", addr, e);
+                }
+            }
+            PeerIoTask::PeerMessage { addr, msg } => {
+                self.handle_peer_message(addr, msg);
+            }
+            PeerIoTask::Stop => return,
+            PeerIoTask::MaybeUpdateInterest {
+                addr,
+                bitfield_interested,
+            } => {
+                self.maybe_update_interest(addr, bitfield_interested);
+            }
+            PeerIoTask::SendMessage { addr, msg } => {
+                self.enqueue_peer_message(&addr, msg);
+            }
+            PeerIoTask::RequestBlocksForPeer { addr } => {
+                self.request_blocks_for_peer(addr);
+            }
+            PeerIoTask::MaybeRequestBlocks => {
+                self.maybe_request_blocks();
+            }
+            PeerIoTask::PeriodicReap {
+                should_enter_endgame,
+            } => {
+                self.reap_block_timeouts();
+                if should_enter_endgame {
+                    self.picker.enter_endgame();
+                }
+            }
+            PeerIoTask::PieceVerified { piece } => {
+                self.picker.on_piece_verified(piece);
+            }
+            PeerIoTask::PieceVerificationFailed { piece } => {
+                self.picker.on_piece_verification_failure(piece);
+            }
+            PeerIoTask::StatsUpdate => {
+                let _ = self.event_tx.send(Event::PeerIoStats {
+                    connected_peers: self.connected_peers(),
+                    max_peers: self.max_peers(),
+                    blocks_inflight: self.picker.in_flight(),
+                    available_peers: self.available_peers(),
+                });
+            }
+        }
     }
 }
 

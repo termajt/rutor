@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        mpsc::{Receiver, Sender},
+        mpsc::{Receiver, RecvTimeoutError, Sender},
     },
     time::{Duration, Instant},
 };
@@ -339,7 +339,15 @@ impl Engine {
         let files = self.torrent.info.files.clone();
         self.tpool.execute(move || {
             let mut disk_mgr = DiskManager::new(total_pieces, total_size, piece_length, files);
+            let mut last_flush_check = Instant::now();
+            let flush_interval = Duration::from_millis(50);
             while let Ok(ev) = io_rx.recv() {
+                if last_flush_check.elapsed() >= flush_interval {
+                    if let Err(e) = disk_mgr.flush_expired_buffers() {
+                        eprintln!("failed to flush expired buffers: {}", e);
+                    }
+                    last_flush_check = Instant::now();
+                }
                 match ev {
                     IoTask::WriteToDisk {
                         piece,
@@ -349,22 +357,45 @@ impl Engine {
                         if let Err(e) = disk_mgr.write_to_disk(piece, offset, &data) {
                             eprintln!("failed to write piece data to disk, index: {}, offset: {}, bytes: {} :: {}", piece, offset, data.len(), e);
                             let _ = event_tx.send(Event::Stop);
-                            return;
+                            continue;
                         }
                     },
                     IoTask::DiskVerifyPiece {
                         piece,
                         expected_hash,
                     } => {
-                        if picker::verify_piece(piece, expected_hash, &disk_mgr) {
-                            let _ = event_tx.send(Event::PieceVerified { piece });
-                            let _ = peer_io_tx.send(PeerIoTask::PieceVerified { piece });
-                        } else {
-                            let _ = event_tx.send(Event::PieceVerificationFailed { piece });
-                            let _ = peer_io_tx.send(PeerIoTask::PieceVerificationFailed { piece });
+                        if let Err(e) = disk_mgr.flush_piece(piece) {
+                            eprintln!("flush failed before verify: {}", e);
+                            let _ = event_tx.send(Event::Stop);
+                            continue;
+                        }
+                        match disk_mgr.read_piece(piece) {
+                            Ok(data) => {
+                                if picker::verify_piece(expected_hash, &data) {
+                                    let _ = event_tx.send(Event::PieceVerified { piece });
+                                    let _ = peer_io_tx.send(PeerIoTask::PieceVerified { piece });
+                                } else {
+                                    let _ = event_tx.send(Event::PieceVerificationFailed { piece });
+                                    let _ = peer_io_tx.send(PeerIoTask::PieceVerificationFailed { piece });
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("failed to read piece {} data from disk: {}", piece, e);
+                                let _ = event_tx.send(Event::Stop);
+                                continue;
+                            }
                         }
                     },
-                    IoTask::Stop => return,
+                    IoTask::Stop => {
+                        eprintln!("flushing disk manager...");
+                        if let Err(e) = disk_mgr.flush_all() {
+                            eprintln!("failed to flush disk manager: {}", e);
+                        }
+                        if let Err(e) = disk_mgr.close() {
+                            eprintln!("failed to close disk manager: {}", e);
+                        }
+                        return;
+                    },
                     IoTask::CalculateFileStats { bitfield } => {
                         let mut total_downloaded = 0;
                         let files: Vec<(PathBuf, u64, u64)> = disk_mgr
@@ -413,8 +444,7 @@ impl Engine {
         let io_tx = self.io_tx.clone();
         let stop_signal = self.stop_signal.clone();
         self.tpool.execute(move || {
-            let mut picker = match PiecePicker::new(piece_length as usize, total_size, piece_hashes)
-            {
+            let picker = match PiecePicker::new(piece_length as usize, total_size, piece_hashes) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("failed to create piece picker: {}", e);
@@ -422,113 +452,49 @@ impl Engine {
                     return;
                 }
             };
-            let mut connection_mgr =
-                match ConnectionManager::new(peer_io_tx, tpool_clone, event_tx.clone(), io_tx) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("failed to create connection manager: {}", e);
-                        let _ = event_tx.send(Event::Stop);
-                        return;
-                    }
-                };
-            const MAX_EVENTS_PER_TICK: usize = 100;
+            let mut connection_mgr = match ConnectionManager::new(
+                peer_io_tx,
+                tpool_clone,
+                event_tx.clone(),
+                io_tx,
+                picker,
+                total_size,
+                stop_signal.clone(),
+                info_hash,
+                peer_id,
+                total_pieces,
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("failed to create connection manager: {}", e);
+                    let _ = event_tx.send(Event::Stop);
+                    return;
+                }
+            };
+            let timeout = Duration::from_millis(10);
             loop {
-                // Control messages
-                let mut processed = 0;
-                while processed < MAX_EVENTS_PER_TICK
-                    && let Ok(ev) = peer_io_rx.try_recv()
-                {
-                    match ev {
-                        PeerIoTask::Stop => return,
-                        PeerIoTask::NewPeers { peers } => {
-                            connection_mgr.on_new_peers(peers);
-                        }
-                        PeerIoTask::MaybeConnectPeers => {
-                            connection_mgr.maybe_adjust_peers(total_size, &mut picker);
-                        }
-                        PeerIoTask::ConnectPeer { addr } => {
-                            if stop_signal.is_set() {
-                                continue;
-                            }
-                            connection_mgr.connect_peer(
-                                addr,
-                                info_hash,
-                                peer_id,
-                                stop_signal.clone(),
-                            );
-                        }
-                        PeerIoTask::PeerConnected { addr, stream } => {
-                            if let Err(e) =
-                                connection_mgr.on_peer_connected(addr, stream, total_pieces)
-                            {
-                                eprintln!("failed to add connected peer {} :: {}", addr, e);
-                            }
-                        }
-                        PeerIoTask::PeerConnectFailed { addr, reason } => {
-                            if let Err(e) =
-                                connection_mgr.on_peer_connect_failed(addr, reason, &mut picker)
-                            {
-                                eprintln!("failed to handle peer {} connect failure: {}", addr, e);
-                            }
-                        }
-                        PeerIoTask::PeerDisconnected { addr, reason } => {
-                            if let Err(e) =
-                                connection_mgr.on_peer_disconnected(addr, reason, &mut picker)
-                            {
-                                eprintln!("failed to handle peer {} disconnect: {}", addr, e);
-                            }
-                        }
-                        PeerIoTask::PeerMessage { addr, msg } => {
-                            connection_mgr.handle_peer_message(addr, msg, &mut picker);
-                        }
-                        PeerIoTask::MaybeUpdateInterest {
-                            addr,
-                            bitfield_interested,
-                        } => {
-                            connection_mgr.maybe_update_interest(addr, bitfield_interested);
-                        }
-                        PeerIoTask::SendMessage { addr, msg } => {
-                            connection_mgr.enqueue_peer_message(&addr, msg);
-                        }
-                        PeerIoTask::RequestBlocksForPeer { addr } => {
-                            connection_mgr.request_blocks_for_peer(addr, &mut picker);
-                        }
-                        PeerIoTask::MaybeRequestBlocks => {
-                            connection_mgr.maybe_request_blocks();
-                        }
-                        PeerIoTask::PeriodicReap {
-                            should_enter_endgame,
-                        } => {
-                            connection_mgr.reap_block_timeouts(&mut picker);
-                            if should_enter_endgame {
-                                picker.enter_endgame();
-                            }
-                        }
-                        PeerIoTask::PieceVerified { piece } => {
-                            picker.on_piece_verified(piece);
-                        }
-                        PeerIoTask::PieceVerificationFailed { piece } => {
-                            picker.on_piece_verification_failure(piece);
-                        }
-                        PeerIoTask::StatsUpdate => {
-                            let _ = event_tx.send(Event::PeerIoStats {
-                                connected_peers: connection_mgr.connected_peers(),
-                                max_peers: connection_mgr.max_peers(),
-                                blocks_inflight: picker.in_flight(),
-                                available_peers: connection_mgr.available_peers(),
-                            });
-                        }
+                // Block waiting for control OR timeout
+                match peer_io_rx.recv_timeout(timeout) {
+                    Ok(ev) => {
+                        connection_mgr.handle_event(ev);
                     }
-                    processed += 1;
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+                // Drain any extra control messages
+                while let Ok(ev) = peer_io_rx.try_recv() {
+                    connection_mgr.handle_event(ev);
+                }
+
+                if stop_signal.is_set() {
+                    return;
                 }
 
                 match connection_mgr.poll_peers() {
-                    Ok(addrs) => {
+                    Ok(addrs) if !addrs.is_empty() => {
                         connection_mgr.drain_peer_messages(addrs, total_pieces);
                     }
-                    Err(e) => {
-                        eprintln!("failed to poll peers: {}", e);
-                    }
+                    _ => {}
                 }
             }
         });
@@ -554,7 +520,11 @@ impl Engine {
                             None,
                         ) {
                             Ok(response) => {
-                                eprintln!("fetched tracker: {} :: {:?}", url, response);
+                                eprintln!(
+                                    "fetched tracker: {} :: {} peers",
+                                    url,
+                                    response.peers.len()
+                                );
                                 if !response.peers.is_empty() {
                                     let _ = peer_io_tx.send(PeerIoTask::NewPeers {
                                         peers: response.peers,

@@ -7,7 +7,7 @@ use std::{
 use rand::{rngs::ThreadRng, seq::SliceRandom};
 use sha1::{Digest, Sha1};
 
-use crate::{bitfield::Bitfield, disk::DiskManager};
+use crate::bitfield::Bitfield;
 
 pub const BLOCK_SIZE: usize = 16 * 1024;
 
@@ -412,21 +412,9 @@ fn blocks_per_piece(piece_len: usize, block_size: usize) -> usize {
     (piece_len + block_size - 1) / block_size
 }
 
-pub fn verify_piece(piece: usize, expected_hash: [u8; 20], disk_mgr: &DiskManager) -> bool {
-    match disk_mgr.read_piece(piece) {
-        Ok(data) => {
-            let mut hasher = Sha1::new();
-            hasher.update(&data);
-            let result = hasher.finalize();
-            result.as_slice() == expected_hash
-        }
-        Err(e) => {
-            eprintln!(
-                "failed to read piece {} for verification: {}",
-                piece,
-                e.to_string()
-            );
-            false
-        }
-    }
+pub fn verify_piece(expected_hash: [u8; 20], data: &[u8]) -> bool {
+    let mut hasher = Sha1::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    result.as_slice() == expected_hash
 }

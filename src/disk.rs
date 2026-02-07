@@ -1,31 +1,100 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use crate::{bitfield::Bitfield, torrent::TorrentFile};
 
+const WRITE_BUFFER_BYTES: usize = 256 * 1024;
+const FLUSH_TIMEOUT: Duration = Duration::from_millis(200);
+
+#[derive(Debug)]
+struct PieceWriteBuffer {
+    size: usize,
+    buffer: BTreeMap<usize, Vec<u8>>,
+    last_flush: Instant,
+}
+
+impl PieceWriteBuffer {
+    fn new() -> Self {
+        Self {
+            size: 0,
+            buffer: BTreeMap::new(),
+            last_flush: Instant::now(),
+        }
+    }
+
+    fn push(&mut self, offset: usize, data: Vec<u8>) {
+        self.size += data.len();
+        self.buffer.insert(offset, data);
+    }
+
+    fn should_flush(&self) -> bool {
+        self.size >= WRITE_BUFFER_BYTES
+            || (!self.buffer.is_empty() && self.last_flush.elapsed() >= FLUSH_TIMEOUT)
+    }
+
+    fn flush<F>(&mut self, mut write_fn: F) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: FnMut(usize, &[u8]) -> Result<(), Box<dyn std::error::Error>>,
+    {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let mut merged_blocks = Vec::new();
+        let mut current_offset = 0;
+        let mut current_data = Vec::new();
+
+        for (&offset, data) in &self.buffer {
+            if current_data.is_empty() {
+                current_offset = offset;
+                current_data.extend_from_slice(data);
+            } else if current_offset + current_data.len() == offset {
+                current_data.extend_from_slice(data);
+            } else {
+                merged_blocks.push((current_offset, std::mem::take(&mut current_data)));
+                current_offset = offset;
+                current_data.extend_from_slice(data);
+            }
+        }
+
+        if !current_data.is_empty() {
+            merged_blocks.push((current_offset, current_data));
+        }
+
+        for (offset, data) in merged_blocks {
+            write_fn(offset, &data)?;
+        }
+
+        self.buffer.clear();
+        self.size = 0;
+        self.last_flush = Instant::now();
+
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct FileHandleCache {
-    handles: Mutex<HashMap<PathBuf, File>>,
+    handles: HashMap<PathBuf, File>,
 }
 
 impl FileHandleCache {
     fn new() -> Self {
         Self {
-            handles: Mutex::new(HashMap::new()),
+            handles: HashMap::new(),
         }
     }
 
-    pub fn with_file<F, T>(&self, path: &PathBuf, f: F) -> Result<T, Box<dyn std::error::Error>>
+    pub fn with_file<F, T>(&mut self, path: &PathBuf, f: F) -> Result<T, Box<dyn std::error::Error>>
     where
         F: FnOnce(&mut File) -> Result<T, Box<dyn std::error::Error>>,
     {
-        let mut handles = self.handles.lock().unwrap();
-        if !handles.contains_key(path) {
+        if !self.handles.contains_key(path) {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -34,14 +103,23 @@ impl FileHandleCache {
                 .write(true)
                 .create(true)
                 .open(path)?;
-            handles.insert(path.to_path_buf(), file);
+            self.handles.insert(path.to_path_buf(), file);
         }
 
-        let file = handles.get_mut(path).unwrap();
+        let file = self.handles.get_mut(path).unwrap();
         let result = f(file)?;
         file.flush()?;
 
         Ok(result)
+    }
+
+    fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        for handle in self.handles.values_mut() {
+            handle.flush()?;
+        }
+        self.handles.clear();
+
+        Ok(())
     }
 }
 
@@ -52,6 +130,7 @@ pub struct DiskManager {
     total_size: u64,
     piece_length: usize,
     files: Vec<TorrentFile>,
+    write_buffers: HashMap<usize, PieceWriteBuffer>,
 }
 
 impl DiskManager {
@@ -67,10 +146,50 @@ impl DiskManager {
             total_size,
             piece_length,
             files,
+            write_buffers: HashMap::new(),
         }
     }
 
     pub fn write_to_disk(
+        &mut self,
+        piece_index: usize,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let entry = self
+            .write_buffers
+            .entry(piece_index)
+            .or_insert_with(PieceWriteBuffer::new);
+
+        entry.push(offset, data.to_vec());
+
+        if entry.should_flush() {
+            self.flush_piece(piece_index)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn flush_piece(&mut self, piece_index: usize) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(mut entry) = self.write_buffers.remove(&piece_index) {
+            entry.flush(|offset, data| {
+                self.write_block_direct(piece_index, offset, data)?;
+                Ok(())
+            })?;
+        }
+
+        Ok(())
+    }
+
+    pub fn flush_all(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let pieces: Vec<usize> = self.write_buffers.keys().cloned().collect();
+        for p in pieces {
+            self.flush_piece(p)?;
+        }
+        Ok(())
+    }
+
+    fn write_block_direct(
         &mut self,
         piece_index: usize,
         offset: usize,
@@ -114,6 +233,7 @@ impl DiskManager {
         if !remaining.is_empty() {
             return Err("block exceeds torrent total size".into());
         }
+
         Ok(())
     }
 
@@ -142,7 +262,10 @@ impl DiskManager {
         verified
     }
 
-    pub fn read_piece(&self, piece_index: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn read_piece(
+        &mut self,
+        piece_index: usize,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let (piece_start, piece_end) = self.piece_range(piece_index);
         let piece_len = (piece_end - piece_start) as usize;
         let mut buf = vec![0u8; piece_len];
@@ -200,5 +323,26 @@ impl DiskManager {
         }
 
         (start, start + len)
+    }
+
+    pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.file_handle_cache.close()?;
+
+        Ok(())
+    }
+
+    pub fn flush_expired_buffers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let expired: Vec<usize> = self
+            .write_buffers
+            .iter()
+            .filter(|(_, buf)| buf.last_flush.elapsed() >= FLUSH_TIMEOUT)
+            .map(|(piece, _)| *piece)
+            .collect();
+
+        for piece in expired {
+            self.flush_piece(piece)?;
+        }
+
+        Ok(())
     }
 }
