@@ -1,4 +1,3 @@
-use rutor::bytespeed::ByteSpeed;
 use rutor::engine::{Engine, Event, TorrentStats};
 use rutor::torrent;
 use std::env;
@@ -14,15 +13,12 @@ struct ProgressTracker {
     total_size: u64,
     eta: f64,
     total_pieces: usize,
-    download_speed: f64,
     cpu_usage: f32,
     mem_usage_kb: u64,
     pid: Pid,
     show_consumption: bool,
     thread_workers: usize,
     stats: TorrentStats,
-    speed: ByteSpeed,
-    last_downloaded: u64,
 }
 
 impl ProgressTracker {
@@ -35,21 +31,17 @@ impl ProgressTracker {
         thread_workers: usize,
         stats: TorrentStats,
     ) -> Self {
-        let last_downloaded = stats.downloaded;
         Self {
             name: name.to_string(),
             total_size: total_size,
             eta: f64::INFINITY,
             total_pieces: total_pieces,
-            download_speed: 0.0,
             cpu_usage: 0.0,
             mem_usage_kb: 0,
             pid: pid,
             show_consumption: show_consumption,
             thread_workers: thread_workers,
             stats: stats,
-            speed: ByteSpeed::new(Duration::from_secs(1), false, 0.25),
-            last_downloaded: last_downloaded,
         }
     }
 
@@ -116,16 +108,9 @@ impl ProgressTracker {
     }
 
     fn update(&mut self, stats: TorrentStats, system: &System, thread_workers: usize) {
-        let downloaded_now = stats.downloaded;
-        let delta = downloaded_now.saturating_sub(self.last_downloaded);
-
-        self.speed.update(delta as usize);
-        self.last_downloaded = downloaded_now;
-        self.download_speed = self.speed.avg_speed;
-
-        let remaining = self.total_size.saturating_sub(downloaded_now) as f64;
-        self.eta = if self.download_speed > 0.0 {
-            remaining / self.download_speed
+        let remaining = self.total_size.saturating_sub(stats.downloaded) as f64;
+        self.eta = if stats.total_speed_down > 0.0 {
+            remaining / stats.total_speed_down
         } else {
             f64::INFINITY
         };
@@ -185,7 +170,7 @@ impl ProgressTracker {
             self.human_bytes(self.stats.downloaded),
             self.human_bytes(self.total_size),
             yellow,
-            self.human_bytes(self.download_speed as u64),
+            self.human_bytes(self.stats.total_speed_down as u64),
             reset,
             self.format_eta(self.eta),
             reset,
@@ -209,7 +194,10 @@ impl ProgressTracker {
             self.total_pieces,
             self.stats.blocks_inflight
         );
-        println!("{}", self.format_bar(self.stats.downloaded));
+        println!(
+            "{}",
+            self.format_bar(self.stats.downloaded.min(self.total_size))
+        );
         if self.show_consumption {
             println!(
                 "CPU: {:.1}% | Memory: {} | Threads: {}",
@@ -343,7 +331,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         io_tx,
         peer_io_tx,
         announce_io_tx,
-        tpool.clone(),
+        0,
+        0,
     );
     let mut progress_tracker = ProgressTracker::new(
         &name,
@@ -388,6 +377,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         first_draw,
     );
     engine.stop();
+    engine.join();
     tpool.join();
 
     Ok(())

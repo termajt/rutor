@@ -143,6 +143,14 @@ impl Bitfield {
         }
     }
 
+    pub fn merge_safe(&mut self, other: &Bitfield) {
+        let min_bytes = self.bits.len().min(other.bits.len());
+
+        for i in 0..min_bytes {
+            self.bits[i] |= other.bits[i];
+        }
+    }
+
     pub fn count_ones(&self) -> usize {
         self.bits.iter().map(|b| b.count_ones() as usize).sum()
     }

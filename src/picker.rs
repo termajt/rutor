@@ -73,6 +73,11 @@ impl Piece {
         self.received.fill(false);
         self.received_count = 0;
     }
+
+    fn downloaded_bytes(&self) -> usize {
+        let bytes = self.received_count * BLOCK_SIZE;
+        bytes.min(self.length)
+    }
 }
 
 #[derive(Debug)]
@@ -83,7 +88,10 @@ pub struct PiecePicker {
     sorted_pieces: Vec<usize>,
     dirty: bool,
     rng: ThreadRng,
-    last_rebuild: Instant,
+    inflight_per_peer: HashMap<SocketAddr, usize>,
+    max_inflight_per_peer: usize,
+    verified_bytes: usize,
+    total_blocks: u64,
 }
 
 impl PiecePicker {
@@ -91,10 +99,12 @@ impl PiecePicker {
         piece_length: usize,
         total_size: u64,
         piece_hashes: Vec<[u8; 20]>,
+        max_inflight_per_peer: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut pieces = HashMap::new();
 
         let num_pieces = piece_hashes.len();
+        let mut total_blocks = 0u64;
 
         for i in 0..num_pieces {
             let len = if i == num_pieces - 1 {
@@ -104,6 +114,7 @@ impl PiecePicker {
             };
             let expected_hash: [u8; 20] = piece_hashes[i].as_slice().try_into()?;
             let piece = Piece::new(len, BLOCK_SIZE, expected_hash);
+            total_blocks += piece.received.len() as u64;
             pieces.insert(i, piece);
         }
         Ok(Self {
@@ -113,15 +124,15 @@ impl PiecePicker {
             sorted_pieces: Vec::new(),
             dirty: true,
             rng: rand::rng(),
-            last_rebuild: Instant::now(),
+            inflight_per_peer: HashMap::new(),
+            max_inflight_per_peer,
+            verified_bytes: 0,
+            total_blocks,
         })
     }
 
     fn rebuild_if_needed(&mut self) {
         if !self.dirty {
-            return;
-        }
-        if self.last_rebuild.elapsed() < Duration::from_millis(200) {
             return;
         }
 
@@ -139,7 +150,6 @@ impl PiecePicker {
 
         self.sorted_pieces = v.into_iter().map(|(idx, _, _)| idx).collect();
         self.dirty = false;
-        self.last_rebuild = Instant::now();
     }
 
     fn pick_endgame_blocks(
@@ -192,6 +202,7 @@ impl PiecePicker {
                     self.requested.insert(key, block_in_flight);
                 }
             }
+            *self.inflight_per_peer.entry(*addr).or_default() += 1;
             out.push(BlockRequest {
                 piece: piece_idx,
                 offset,
@@ -210,6 +221,7 @@ impl PiecePicker {
         now: Instant,
         mut free: usize,
     ) -> Vec<BlockRequest> {
+        self.rebuild_if_needed();
         let mut out = Vec::new();
         for piece_index in &self.sorted_pieces {
             if free == 0 {
@@ -252,6 +264,7 @@ impl PiecePicker {
                 };
                 block_in_flight.requested_by.insert(*addr);
                 self.requested.insert(key, block_in_flight);
+                *self.inflight_per_peer.entry(*addr).or_default() += 1;
                 out.push(BlockRequest {
                     piece: *piece_index,
                     offset,
@@ -268,25 +281,33 @@ impl PiecePicker {
         &mut self,
         addr: &SocketAddr,
         peer_bf: &Bitfield,
-        free: usize,
     ) -> Vec<BlockRequest> {
+        let inflight = self.inflight_per_peer.get(addr).unwrap_or(&0);
+        if *inflight >= self.max_inflight_per_peer {
+            return Vec::new();
+        }
+
+        let free = self.max_inflight_per_peer.saturating_sub(*inflight);
         if free == 0 {
-            return vec![];
+            eprintln!("no free blocks to pick");
+            return Vec::new();
         }
 
         let now = Instant::now();
 
         if self.endgame {
-            self.pick_endgame_blocks(addr, peer_bf, now, free)
+            return self.pick_endgame_blocks(addr, peer_bf, now, free);
         } else {
-            self.rebuild_if_needed();
             self.pick_rarest_first_blocks(addr, peer_bf, now, free)
         }
     }
 
     pub fn on_piece_verified(&mut self, piece_idx: usize) {
-        self.pieces.remove(&piece_idx);
+        if let Some(piece) = self.pieces.remove(&piece_idx) {
+            self.verified_bytes += piece.length;
+        }
         self.requested.retain(|(p, _), _| *p != piece_idx);
+        self.maybe_enter_endgame();
         self.dirty = true;
     }
 
@@ -317,6 +338,7 @@ impl PiecePicker {
     }
 
     pub fn on_peer_disconnected(&mut self, addr: &SocketAddr, bf: &Bitfield) {
+        self.inflight_per_peer.remove(addr);
         let mut to_remove = Vec::new();
         for (key, inflight) in self.requested.iter_mut() {
             inflight.requested_by.remove(addr);
@@ -346,6 +368,12 @@ impl PiecePicker {
         for (key, inflight) in self.requested.iter_mut() {
             if now.duration_since(inflight.first_requested_at) >= timeout {
                 if inflight.requested_by.remove(addr) {
+                    if let Some(count) = self.inflight_per_peer.get_mut(addr) {
+                        *count = count.saturating_sub(1);
+                        if *count == 0 {
+                            self.inflight_per_peer.remove(addr);
+                        }
+                    }
                     reaped.push(*key);
                 }
             }
@@ -367,14 +395,15 @@ impl PiecePicker {
         offset: usize,
     ) -> Option<PieceReceiveStatus> {
         let key = (piece_idx, offset);
+        let (complete, expected_hash) = {
+            let piece = self.pieces.get_mut(&piece_idx)?;
 
-        let piece = self.pieces.get_mut(&piece_idx)?;
-
-        let was_new = piece.mark_block(offset);
-
-        if !was_new {
-            return None;
-        }
+            let was_new = piece.mark_block(offset);
+            if !was_new {
+                return None;
+            }
+            (piece.is_complete(), piece.expected_hash)
+        };
 
         if let Some(inflight) = self.requested.get_mut(&key) {
             inflight.requested_by.remove(addr);
@@ -382,21 +411,24 @@ impl PiecePicker {
                 self.requested.remove(&key);
             }
         }
+
+        if let Some(count) = self.inflight_per_peer.get_mut(addr) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.inflight_per_peer.remove(addr);
+            }
+        }
+
+        self.maybe_enter_endgame();
+
         self.dirty = true;
 
         Some(PieceReceiveStatus {
             piece: piece_idx,
             received: true,
-            complete: piece.is_complete(),
-            expected_hash: piece.expected_hash,
+            complete: complete,
+            expected_hash: expected_hash,
         })
-    }
-
-    pub fn enter_endgame(&mut self) {
-        if self.endgame {
-            return;
-        }
-        self.endgame = true;
     }
 
     pub fn is_endgame(&self) -> bool {
@@ -404,7 +436,43 @@ impl PiecePicker {
     }
 
     pub fn in_flight(&self) -> usize {
-        self.requested.len()
+        self.inflight_per_peer.values().sum()
+    }
+
+    pub fn opportunistic_downloaded_bytes(&self) -> u64 {
+        let mut bytes = self.verified_bytes as u64;
+        for piece in self.pieces.values() {
+            if piece.is_complete() {
+                bytes += piece.length as u64;
+            } else {
+                bytes += piece.downloaded_bytes() as u64;
+            }
+        }
+
+        bytes
+    }
+
+    fn maybe_enter_endgame(&mut self) {
+        if self.endgame {
+            return;
+        }
+
+        let remaining: u64 = self
+            .pieces
+            .values()
+            .map(|p| p.received.len() as u64 - p.received_count as u64)
+            .sum();
+
+        let remaining_ratio = remaining as f64 / self.total_blocks as f64;
+        if remaining <= 50 || remaining_ratio <= 0.02 {
+            self.endgame = true;
+            eprintln!(
+                "entering endgame: {} / {} blocks remaining ({:.2}%)",
+                remaining,
+                self.total_blocks,
+                remaining_ratio * 100.0
+            );
+        }
     }
 }
 

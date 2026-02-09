@@ -5,6 +5,7 @@ use std::{
         Arc,
         mpsc::{Receiver, RecvTimeoutError, Sender},
     },
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -23,8 +24,6 @@ use rand::{Rng, distr::Alphanumeric};
 use threadpool::ThreadPool;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-const MIN_ENDGAME_THRESHOLD: f64 = 0.01;
-const MAX_ENDGAME_THRESHOLD: f64 = 0.05;
 
 #[derive(Debug)]
 pub enum Event {
@@ -36,7 +35,6 @@ pub enum Event {
         bitfield: Bitfield,
     },
     DiskStats {
-        total_downloaded: u64,
         files: Vec<(PathBuf, u64, u64)>,
     },
     PieceVerified {
@@ -50,6 +48,8 @@ pub enum Event {
         max_peers: usize,
         blocks_inflight: usize,
         available_peers: usize,
+        total_speed_down: f64,
+        opportunistic_downloaded: u64,
     },
 }
 
@@ -91,10 +91,6 @@ pub enum PeerIoTask {
         addr: SocketAddr,
         reason: String,
     },
-    PeerMessage {
-        addr: SocketAddr,
-        msg: PeerMessage,
-    },
     Stop,
     MaybeUpdateInterest {
         addr: SocketAddr,
@@ -108,9 +104,7 @@ pub enum PeerIoTask {
         addr: SocketAddr,
     },
     MaybeRequestBlocks,
-    PeriodicReap {
-        should_enter_endgame: bool,
-    },
+    PeriodicReap,
     PieceVerified {
         piece: usize,
     },
@@ -144,31 +138,22 @@ pub struct TorrentStats {
     pub max_peers: usize,
     pub blocks_inflight: usize,
     pub available_peers: usize,
+    pub total_speed_down: f64,
 }
 
 impl TorrentStats {
-    fn new(
-        total_size: u64,
-        files: Vec<(PathBuf, u64, u64)>,
-        downloaded: u64,
-        uploaded: u64,
-        peers: usize,
-        bitfield: Bitfield,
-        max_peers: usize,
-        blocks_inflight: usize,
-        available_peers: usize,
-    ) -> Self {
-        let left = total_size.saturating_sub(downloaded);
+    fn new(total_size: u64, files: Vec<(PathBuf, u64, u64)>, bitfield: Bitfield) -> Self {
         Self {
-            downloaded,
-            uploaded,
-            left,
+            downloaded: 0,
+            uploaded: 0,
+            left: total_size,
             files,
-            peers,
+            peers: 0,
             bitfield,
-            max_peers,
-            blocks_inflight,
-            available_peers,
+            max_peers: 0,
+            blocks_inflight: 0,
+            available_peers: 0,
+            total_speed_down: 0.0,
         }
     }
 }
@@ -181,15 +166,15 @@ pub struct Engine {
     io_tx: Sender<IoTask>,
     peer_io_tx: Sender<PeerIoTask>,
     announce_io_tx: Sender<AnnounceIoTask>,
-    tpool: Arc<ThreadPool>,
     stop_signal: Arc<ManualResetEvent>,
     torrent: Torrent,
     peer_id: [u8; 20],
     stats: TorrentStats,
     completed: bool,
-    endgame_threshold: f64,
     last_peers_adjust: Option<Instant>,
-    endgame: bool,
+    read_limit_bytes_per_sec: usize,
+    write_limit_bytes_per_sec: usize,
+    join_handles: Vec<JoinHandle<()>>,
 }
 
 impl Engine {
@@ -200,22 +185,12 @@ impl Engine {
         io_tx: Sender<IoTask>,
         peer_io_tx: Sender<PeerIoTask>,
         announce_io_tx: Sender<AnnounceIoTask>,
-        tpool: Arc<ThreadPool>,
+        read_limit_bytes_per_sec: usize,
+        write_limit_bytes_per_sec: usize,
     ) -> Self {
         let announce_mgr = AnnounceManager::new(&torrent);
         let bitfield = Bitfield::new(torrent.info.piece_hashes.len());
-        let stats = TorrentStats::new(
-            torrent.info.total_size,
-            Vec::new(),
-            0,
-            0,
-            0,
-            bitfield,
-            0,
-            0,
-            0,
-        );
-        let endgame_threshold = endgame_threshold(torrent.info.total_size);
+        let stats = TorrentStats::new(torrent.info.total_size, Vec::new(), bitfield);
         Self {
             announce_mgr,
             event_tx,
@@ -223,15 +198,15 @@ impl Engine {
             io_tx,
             peer_io_tx,
             announce_io_tx,
-            tpool,
             stop_signal: Arc::new(ManualResetEvent::new(false)),
             torrent,
             peer_id: generate_peer_id(),
             stats,
             completed: false,
-            endgame_threshold,
             last_peers_adjust: None,
-            endgame: false,
+            read_limit_bytes_per_sec,
+            write_limit_bytes_per_sec,
+            join_handles: Vec::new(),
         }
     }
 
@@ -240,9 +215,17 @@ impl Engine {
             return;
         }
 
-        if self.stats.left == 0 && !self.stats.bitfield.has_any_zero() {
+        if !self.stats.bitfield.has_any_zero() {
             self.completed = true;
             let _ = self.event_tx.send(Event::Complete);
+        }
+    }
+
+    pub fn join(&mut self) {
+        while let Some(handle) = self.join_handles.pop() {
+            if let Err(_) = handle.join() {
+                eprintln!("failed to join thread");
+            }
         }
     }
 
@@ -266,16 +249,7 @@ impl Engine {
                     bitfield_interested: interested,
                 });
             }
-            Event::DiskStats {
-                total_downloaded,
-                files,
-            } => {
-                self.stats.downloaded = total_downloaded;
-                self.stats.left = self
-                    .torrent
-                    .info
-                    .total_size
-                    .saturating_sub(total_downloaded);
+            Event::DiskStats { files } => {
                 self.stats.files = files;
                 self.check_completion();
             }
@@ -291,11 +265,20 @@ impl Engine {
                 max_peers,
                 blocks_inflight,
                 available_peers,
+                total_speed_down,
+                opportunistic_downloaded,
             } => {
                 self.stats.peers = connected_peers;
                 self.stats.max_peers = max_peers;
                 self.stats.blocks_inflight = blocks_inflight;
                 self.stats.available_peers = available_peers;
+                self.stats.total_speed_down = total_speed_down;
+                self.stats.downloaded = opportunistic_downloaded;
+                self.stats.left = self
+                    .torrent
+                    .info
+                    .total_size
+                    .saturating_sub(opportunistic_downloaded);
             }
         }
         Ok(())
@@ -306,15 +289,17 @@ impl Engine {
     }
 
     pub fn start(
-        &self,
+        &mut self,
         io_rx: Receiver<IoTask>,
         peer_io_rx: Receiver<PeerIoTask>,
         announce_io_rx: Receiver<AnnounceIoTask>,
     ) {
-        self.start_disk_thread(io_rx, self.event_tx.clone(), self.peer_io_tx.clone());
-        self.start_tick_thread();
-        self.start_peer_io_thread(peer_io_rx);
-        self.start_announce_io_thread(announce_io_rx);
+        self.join_handles.push(self.start_disk_thread(io_rx));
+        self.join_handles.push(self.start_tick_thread());
+        self.join_handles
+            .push(self.start_peer_io_thread(peer_io_rx));
+        self.join_handles
+            .push(self.start_announce_io_thread(announce_io_rx));
     }
 
     pub fn stop(&self) {
@@ -327,20 +312,18 @@ impl Engine {
         }
     }
 
-    fn start_disk_thread(
-        &self,
-        io_rx: Receiver<IoTask>,
-        event_tx: Sender<Event>,
-        peer_io_tx: Sender<PeerIoTask>,
-    ) {
+    fn start_disk_thread(&self, io_rx: Receiver<IoTask>) -> JoinHandle<()> {
         let total_pieces = self.torrent.info.piece_hashes.len();
         let total_size = self.torrent.info.total_size;
         let piece_length = self.torrent.info.piece_length as usize;
         let files = self.torrent.info.files.clone();
-        self.tpool.execute(move || {
+        let event_tx = self.event_tx.clone();
+        let peer_io_tx = self.peer_io_tx.clone();
+        std::thread::spawn(move || {
             let mut disk_mgr = DiskManager::new(total_pieces, total_size, piece_length, files);
             let mut last_flush_check = Instant::now();
             let flush_interval = Duration::from_millis(50);
+            let verify_pool = ThreadPool::with_name("piece_verify_pool".to_string(), 4);
             while let Ok(ev) = io_rx.recv() {
                 if last_flush_check.elapsed() >= flush_interval {
                     if let Err(e) = disk_mgr.flush_expired_buffers() {
@@ -355,11 +338,17 @@ impl Engine {
                         data,
                     } => {
                         if let Err(e) = disk_mgr.write_to_disk(piece, offset, &data) {
-                            eprintln!("failed to write piece data to disk, index: {}, offset: {}, bytes: {} :: {}", piece, offset, data.len(), e);
+                            eprintln!(
+                                "failed to write piece data to disk, index: {}, offset: {}, bytes: {} :: {}",
+                                piece,
+                                offset,
+                                data.len(),
+                                e
+                            );
                             let _ = event_tx.send(Event::Stop);
                             continue;
                         }
-                    },
+                    }
                     IoTask::DiskVerifyPiece {
                         piece,
                         expected_hash,
@@ -371,13 +360,20 @@ impl Engine {
                         }
                         match disk_mgr.read_piece(piece) {
                             Ok(data) => {
-                                if picker::verify_piece(expected_hash, &data) {
-                                    let _ = event_tx.send(Event::PieceVerified { piece });
-                                    let _ = peer_io_tx.send(PeerIoTask::PieceVerified { piece });
-                                } else {
-                                    let _ = event_tx.send(Event::PieceVerificationFailed { piece });
-                                    let _ = peer_io_tx.send(PeerIoTask::PieceVerificationFailed { piece });
-                                }
+                                let event_tx = event_tx.clone();
+                                let peer_io_tx = peer_io_tx.clone();
+                                verify_pool.execute(move || {
+                                    if picker::verify_piece(expected_hash, &data) {
+                                        let _ = event_tx.send(Event::PieceVerified { piece });
+                                        let _ =
+                                            peer_io_tx.send(PeerIoTask::PieceVerified { piece });
+                                    } else {
+                                        let _ =
+                                            event_tx.send(Event::PieceVerificationFailed { piece });
+                                        let _ = peer_io_tx
+                                            .send(PeerIoTask::PieceVerificationFailed { piece });
+                                    }
+                                });
                             }
                             Err(e) => {
                                 eprintln!("failed to read piece {} data from disk: {}", piece, e);
@@ -385,7 +381,7 @@ impl Engine {
                                 continue;
                             }
                         }
-                    },
+                    }
                     IoTask::Stop => {
                         eprintln!("flushing disk manager...");
                         if let Err(e) = disk_mgr.flush_all() {
@@ -395,45 +391,39 @@ impl Engine {
                             eprintln!("failed to close disk manager: {}", e);
                         }
                         return;
-                    },
+                    }
                     IoTask::CalculateFileStats { bitfield } => {
-                        let mut total_downloaded = 0;
                         let files: Vec<(PathBuf, u64, u64)> = disk_mgr
                             .files()
                             .iter()
                             .enumerate()
                             .map(|(i, f)| {
                                 let downloaded = disk_mgr.verified_bytes_for_file(i, &bitfield);
-                                total_downloaded += downloaded;
                                 (f.path.clone(), downloaded, f.length)
                             })
                             .collect();
-                        let _ = event_tx.send(Event::DiskStats {
-                            total_downloaded,
-                            files,
-                        });
+                        let _ = event_tx.send(Event::DiskStats { files });
                     }
                 }
             }
-        });
+        })
     }
 
-    fn start_tick_thread(&self) {
+    fn start_tick_thread(&self) -> JoinHandle<()> {
         let stop_signal = self.stop_signal.clone();
         let event_tx = self.event_tx.clone();
-        self.tpool.execute(move || {
+        std::thread::spawn(move || {
             loop {
                 let _ = event_tx.send(Event::Tick);
                 if stop_signal.wait_timeout(Duration::from_millis(500)) {
                     return;
                 }
             }
-        });
+        })
     }
 
-    fn start_peer_io_thread(&self, peer_io_rx: Receiver<PeerIoTask>) {
+    fn start_peer_io_thread(&self, peer_io_rx: Receiver<PeerIoTask>) -> JoinHandle<()> {
         let peer_io_tx = self.peer_io_tx.clone();
-        let tpool_clone = self.tpool.clone();
         let total_pieces = self.torrent.info.piece_hashes.len();
         let info_hash = self.torrent.info_hash;
         let peer_id = self.peer_id;
@@ -443,8 +433,11 @@ impl Engine {
         let piece_hashes = self.torrent.info.piece_hashes.clone();
         let io_tx = self.io_tx.clone();
         let stop_signal = self.stop_signal.clone();
-        self.tpool.execute(move || {
-            let picker = match PiecePicker::new(piece_length as usize, total_size, piece_hashes) {
+        let read_limit_bytes_per_sec = self.read_limit_bytes_per_sec;
+        let write_limit_bytes_per_sec = self.write_limit_bytes_per_sec;
+        std::thread::spawn(move || {
+            let picker = match PiecePicker::new(piece_length as usize, total_size, piece_hashes, 5)
+            {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("failed to create piece picker: {}", e);
@@ -454,7 +447,6 @@ impl Engine {
             };
             let mut connection_mgr = match ConnectionManager::new(
                 peer_io_tx,
-                tpool_clone,
                 event_tx.clone(),
                 io_tx,
                 picker,
@@ -463,6 +455,8 @@ impl Engine {
                 info_hash,
                 peer_id,
                 total_pieces,
+                read_limit_bytes_per_sec,
+                write_limit_bytes_per_sec,
             ) {
                 Ok(c) => c,
                 Err(e) => {
@@ -492,17 +486,17 @@ impl Engine {
 
                 match connection_mgr.poll_peers() {
                     Ok(addrs) if !addrs.is_empty() => {
-                        connection_mgr.drain_peer_messages(addrs, total_pieces);
+                        connection_mgr.drain_peer_messages(addrs);
                     }
                     _ => {}
                 }
             }
-        });
+        })
     }
 
-    fn start_announce_io_thread(&self, announce_io_rx: Receiver<AnnounceIoTask>) {
+    fn start_announce_io_thread(&self, announce_io_rx: Receiver<AnnounceIoTask>) -> JoinHandle<()> {
         let peer_io_tx = self.peer_io_tx.clone();
-        self.tpool.execute(move || {
+        std::thread::spawn(move || {
             while let Ok(ev) = announce_io_rx.recv() {
                 match ev {
                     AnnounceIoTask::Stop => return,
@@ -538,11 +532,11 @@ impl Engine {
                     }
                 }
             }
-        });
+        })
     }
 
     pub fn on_tick(&mut self) {
-        if self.completed {
+        if self.completed || self.stop_signal.is_set() {
             return;
         }
         self.check_announce();
@@ -558,18 +552,8 @@ impl Engine {
 
     fn handle_peer_io_tick(&mut self) {
         let _ = self.peer_io_tx.send(PeerIoTask::StatsUpdate);
-        if !self.endgame {
-            let percent_left = self.stats.left as f64 / self.torrent.info.total_size as f64;
-            let should_enter_endgame = percent_left < self.endgame_threshold;
-            self.endgame = should_enter_endgame;
-        }
-        let _ = self.peer_io_tx.send(PeerIoTask::PeriodicReap {
-            should_enter_endgame: self.endgame,
-        });
+        let _ = self.peer_io_tx.send(PeerIoTask::PeriodicReap);
         let _ = self.peer_io_tx.send(PeerIoTask::MaybeRequestBlocks);
-        if self.endgame {
-            return;
-        }
         if let Some(last_adjust) = self.last_peers_adjust {
             if last_adjust.elapsed() >= Duration::from_secs(5) {
                 self.last_peers_adjust = Some(Instant::now());
@@ -611,12 +595,4 @@ fn generate_peer_id() -> [u8; 20] {
     }
 
     peer_id
-}
-
-fn endgame_threshold(total_size: u64) -> f64 {
-    let total_mb = total_size as f64 / (1024.0 * 1024.0);
-
-    let threshold = MAX_ENDGAME_THRESHOLD / (1.0 + (total_mb / 100.0).ln());
-
-    threshold.clamp(MIN_ENDGAME_THRESHOLD, MAX_ENDGAME_THRESHOLD)
 }
