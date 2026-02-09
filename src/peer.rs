@@ -482,6 +482,7 @@ impl Peer {
 
     pub fn maybe_send_keepalive(&mut self) {
         if self.last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
+            eprintln!("sending keepalive to {}", self.addr);
             self.enqueue_message(&PeerMessage::KeepAlive);
             self.last_keepalive = Instant::now();
         }

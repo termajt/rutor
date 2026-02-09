@@ -3,7 +3,8 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        mpsc::{Receiver, RecvTimeoutError, Sender},
+        atomic::{AtomicU8, Ordering},
+        mpsc::{Receiver, Sender},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -14,7 +15,6 @@ use crate::{
     bitfield::Bitfield,
     connection::ConnectionManager,
     disk::DiskManager,
-    event::ManualResetEvent,
     peer::PeerMessage,
     picker::{self, PiecePicker},
     torrent::Torrent,
@@ -158,6 +158,87 @@ impl TorrentStats {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum ShutdownPhase {
+    Running = 0,
+    Completed = 1,
+    Draining = 2,
+    Terminated = 3,
+}
+
+#[derive(Debug)]
+pub struct ShutdownState {
+    phase: AtomicU8,
+}
+
+impl ShutdownState {
+    pub fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(ShutdownPhase::Running as u8),
+        }
+    }
+
+    fn phase(&self) -> ShutdownPhase {
+        match self.phase.load(Ordering::Acquire) {
+            0 => ShutdownPhase::Running,
+            1 => ShutdownPhase::Completed,
+            2 => ShutdownPhase::Draining,
+            3 => ShutdownPhase::Terminated,
+            _ => unreachable!("ShutdownPhase"),
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.phase() == ShutdownPhase::Running
+    }
+
+    pub fn is_completed(&self) -> bool {
+        self.phase() == ShutdownPhase::Completed
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.phase() == ShutdownPhase::Draining
+    }
+
+    pub fn is_terminated(&self) -> bool {
+        self.phase() == ShutdownPhase::Terminated
+    }
+
+    fn mark_completed(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                ShutdownPhase::Running as u8,
+                ShutdownPhase::Completed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn begin_draining(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                ShutdownPhase::Completed as u8,
+                ShutdownPhase::Draining as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn terminate(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                ShutdownPhase::Draining as u8,
+                ShutdownPhase::Terminated as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
 #[derive(Debug)]
 pub struct Engine {
     announce_mgr: AnnounceManager,
@@ -166,11 +247,10 @@ pub struct Engine {
     io_tx: Sender<IoTask>,
     peer_io_tx: Sender<PeerIoTask>,
     announce_io_tx: Sender<AnnounceIoTask>,
-    stop_signal: Arc<ManualResetEvent>,
+    shutdown_state: Arc<ShutdownState>,
     torrent: Torrent,
     peer_id: [u8; 20],
     stats: TorrentStats,
-    completed: bool,
     last_peers_adjust: Option<Instant>,
     read_limit_bytes_per_sec: usize,
     write_limit_bytes_per_sec: usize,
@@ -198,11 +278,10 @@ impl Engine {
             io_tx,
             peer_io_tx,
             announce_io_tx,
-            stop_signal: Arc::new(ManualResetEvent::new(false)),
+            shutdown_state: Arc::new(ShutdownState::new()),
             torrent,
             peer_id: generate_peer_id(),
             stats,
-            completed: false,
             last_peers_adjust: None,
             read_limit_bytes_per_sec,
             write_limit_bytes_per_sec,
@@ -211,20 +290,37 @@ impl Engine {
     }
 
     fn check_completion(&mut self) {
-        if self.completed {
+        if self.shutdown_state.is_completed() || self.shutdown_state.is_draining() {
             return;
         }
 
         if !self.stats.bitfield.has_any_zero() {
-            self.completed = true;
-            let _ = self.event_tx.send(Event::Complete);
+            self.stats.downloaded = self.torrent.info.total_size;
+            self.stats.left = 0;
+
+            if self.shutdown_state.mark_completed() {
+                let _ = self.event_tx.send(Event::Complete);
+
+                let event_tx = self.event_tx.clone();
+                let shutdown_state = self.shutdown_state.clone();
+                let handle = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(2));
+                    if shutdown_state.is_completed() {
+                        let _ = event_tx.send(Event::Stop);
+                    }
+                });
+                self.join_handles.push(handle);
+            }
         }
     }
 
     pub fn join(&mut self) {
-        while let Some(handle) = self.join_handles.pop() {
-            if let Err(_) = handle.join() {
-                eprintln!("failed to join thread");
+        if self.shutdown_state.terminate() {
+            eprintln!("terminating");
+            while let Some(handle) = self.join_handles.pop() {
+                if let Err(_) = handle.join() {
+                    eprintln!("failed to join thread");
+                }
             }
         }
     }
@@ -239,7 +335,8 @@ impl Engine {
             Event::Tick => {
                 self.on_tick();
             }
-            Event::Complete | Event::Stop => {
+            Event::Complete => {}
+            Event::Stop => {
                 self.stop();
             }
             Event::CompareBitfield { addr, bitfield } => {
@@ -303,12 +400,10 @@ impl Engine {
     }
 
     pub fn stop(&self) {
-        let _ = self.event_tx.send(Event::Stop);
-        let _ = self.io_tx.send(IoTask::Stop);
-        let _ = self.peer_io_tx.send(PeerIoTask::Stop);
-        let _ = self.announce_io_tx.send(AnnounceIoTask::Stop);
-        if !self.stop_signal.is_set() {
-            self.stop_signal.set();
+        if self.shutdown_state.begin_draining() {
+            let _ = self.io_tx.send(IoTask::Stop);
+            let _ = self.peer_io_tx.send(PeerIoTask::Stop);
+            let _ = self.announce_io_tx.send(AnnounceIoTask::Stop);
         }
     }
 
@@ -319,105 +414,114 @@ impl Engine {
         let files = self.torrent.info.files.clone();
         let event_tx = self.event_tx.clone();
         let peer_io_tx = self.peer_io_tx.clone();
+        let shutdown_state = self.shutdown_state.clone();
         std::thread::spawn(move || {
             let mut disk_mgr = DiskManager::new(total_pieces, total_size, piece_length, files);
-            let mut last_flush_check = Instant::now();
-            let flush_interval = Duration::from_millis(50);
-            let verify_pool = ThreadPool::with_name("piece_verify_pool".to_string(), 4);
-            while let Ok(ev) = io_rx.recv() {
-                if last_flush_check.elapsed() >= flush_interval {
-                    if let Err(e) = disk_mgr.flush_expired_buffers() {
-                        eprintln!("failed to flush expired buffers: {}", e);
-                    }
-                    last_flush_check = Instant::now();
+            let verify_pool = ThreadPool::with_name("piece_verify_pool".to_string(), 5);
+
+            loop {
+                if shutdown_state.is_draining() || shutdown_state.is_terminated() {
+                    break;
                 }
-                match ev {
-                    IoTask::WriteToDisk {
-                        piece,
-                        offset,
-                        data,
-                    } => {
-                        if let Err(e) = disk_mgr.write_to_disk(piece, offset, &data) {
-                            eprintln!(
-                                "failed to write piece data to disk, index: {}, offset: {}, bytes: {} :: {}",
-                                piece,
-                                offset,
-                                data.len(),
-                                e
-                            );
-                            let _ = event_tx.send(Event::Stop);
-                            continue;
-                        }
-                    }
-                    IoTask::DiskVerifyPiece {
-                        piece,
-                        expected_hash,
-                    } => {
-                        if let Err(e) = disk_mgr.flush_piece(piece) {
-                            eprintln!("flush failed before verify: {}", e);
-                            let _ = event_tx.send(Event::Stop);
-                            continue;
-                        }
-                        match disk_mgr.read_piece(piece) {
-                            Ok(data) => {
-                                let event_tx = event_tx.clone();
-                                let peer_io_tx = peer_io_tx.clone();
-                                verify_pool.execute(move || {
-                                    if picker::verify_piece(expected_hash, &data) {
-                                        let _ = event_tx.send(Event::PieceVerified { piece });
-                                        let _ =
-                                            peer_io_tx.send(PeerIoTask::PieceVerified { piece });
-                                    } else {
-                                        let _ =
-                                            event_tx.send(Event::PieceVerificationFailed { piece });
-                                        let _ = peer_io_tx
-                                            .send(PeerIoTask::PieceVerificationFailed { piece });
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                eprintln!("failed to read piece {} data from disk: {}", piece, e);
+                match io_rx.recv() {
+                    Ok(ev) => match ev {
+                        IoTask::WriteToDisk {
+                            piece,
+                            offset,
+                            data,
+                        } => {
+                            if let Err(e) = disk_mgr.write_to_disk(piece, offset, &data) {
+                                eprintln!(
+                                    "failed to write piece data to disk, index: {}, offset: {}, bytes: {} :: {}",
+                                    piece,
+                                    offset,
+                                    data.len(),
+                                    e
+                                );
                                 let _ = event_tx.send(Event::Stop);
                                 continue;
                             }
                         }
-                    }
-                    IoTask::Stop => {
-                        eprintln!("flushing disk manager...");
-                        if let Err(e) = disk_mgr.flush_all() {
-                            eprintln!("failed to flush disk manager: {}", e);
+                        IoTask::DiskVerifyPiece {
+                            piece,
+                            expected_hash,
+                        } => {
+                            if let Err(e) = disk_mgr.flush_piece(piece) {
+                                eprintln!("flush failed before verify: {}", e);
+                                let _ = event_tx.send(Event::Stop);
+                                continue;
+                            }
+                            match disk_mgr.read_piece(piece) {
+                                Ok(data) => {
+                                    let event_tx = event_tx.clone();
+                                    let peer_io_tx = peer_io_tx.clone();
+                                    verify_pool.execute(move || {
+                                        if picker::verify_piece(expected_hash, &data) {
+                                            let _ = event_tx.send(Event::PieceVerified { piece });
+                                            let _ = peer_io_tx
+                                                .send(PeerIoTask::PieceVerified { piece });
+                                        } else {
+                                            let _ = event_tx
+                                                .send(Event::PieceVerificationFailed { piece });
+                                            let _ = peer_io_tx.send(
+                                                PeerIoTask::PieceVerificationFailed { piece },
+                                            );
+                                        }
+                                    });
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "failed to read piece {} data from disk: {}",
+                                        piece, e
+                                    );
+                                    let _ = event_tx.send(Event::Stop);
+                                    continue;
+                                }
+                            }
                         }
-                        if let Err(e) = disk_mgr.close() {
-                            eprintln!("failed to close disk manager: {}", e);
+                        IoTask::Stop => {
+                            eprintln!("flushing disk manager...");
+                            if let Err(e) = disk_mgr.flush_all() {
+                                eprintln!("failed to flush disk manager: {}", e);
+                            }
+                            if let Err(e) = disk_mgr.close() {
+                                eprintln!("failed to close disk manager: {}", e);
+                            }
+                            return;
                         }
-                        return;
-                    }
-                    IoTask::CalculateFileStats { bitfield } => {
-                        let files: Vec<(PathBuf, u64, u64)> = disk_mgr
-                            .files()
-                            .iter()
-                            .enumerate()
-                            .map(|(i, f)| {
-                                let downloaded = disk_mgr.verified_bytes_for_file(i, &bitfield);
-                                (f.path.clone(), downloaded, f.length)
-                            })
-                            .collect();
-                        let _ = event_tx.send(Event::DiskStats { files });
+                        IoTask::CalculateFileStats { bitfield } => {
+                            let files: Vec<(PathBuf, u64, u64)> = disk_mgr
+                                .files()
+                                .iter()
+                                .enumerate()
+                                .map(|(i, f)| {
+                                    let downloaded = disk_mgr.verified_bytes_for_file(i, &bitfield);
+                                    (f.path.clone(), downloaded, f.length)
+                                })
+                                .collect();
+                            let _ = event_tx.send(Event::DiskStats { files });
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("disk io rx error: {}", e);
+                        break;
                     }
                 }
             }
+
+            verify_pool.join();
         })
     }
 
     fn start_tick_thread(&self) -> JoinHandle<()> {
-        let stop_signal = self.stop_signal.clone();
+        let shutdown_state = self.shutdown_state.clone();
         let event_tx = self.event_tx.clone();
         std::thread::spawn(move || {
-            loop {
-                let _ = event_tx.send(Event::Tick);
-                if stop_signal.wait_timeout(Duration::from_millis(500)) {
-                    return;
+            while !shutdown_state.is_terminated() {
+                if shutdown_state.is_running() || shutdown_state.is_completed() {
+                    let _ = event_tx.send(Event::Tick);
                 }
+                std::thread::sleep(Duration::from_millis(500));
             }
         })
     }
@@ -432,11 +536,11 @@ impl Engine {
         let total_size = self.torrent.info.total_size;
         let piece_hashes = self.torrent.info.piece_hashes.clone();
         let io_tx = self.io_tx.clone();
-        let stop_signal = self.stop_signal.clone();
+        let shutdown_state = self.shutdown_state.clone();
         let read_limit_bytes_per_sec = self.read_limit_bytes_per_sec;
         let write_limit_bytes_per_sec = self.write_limit_bytes_per_sec;
         std::thread::spawn(move || {
-            let picker = match PiecePicker::new(piece_length as usize, total_size, piece_hashes, 5)
+            let picker = match PiecePicker::new(piece_length as usize, total_size, piece_hashes, 8)
             {
                 Ok(p) => p,
                 Err(e) => {
@@ -451,7 +555,7 @@ impl Engine {
                 io_tx,
                 picker,
                 total_size,
-                stop_signal.clone(),
+                shutdown_state.clone(),
                 info_hash,
                 peer_id,
                 total_pieces,
@@ -465,68 +569,72 @@ impl Engine {
                     return;
                 }
             };
-            let timeout = Duration::from_millis(10);
             loop {
-                // Block waiting for control OR timeout
-                match peer_io_rx.recv_timeout(timeout) {
-                    Ok(ev) => {
+                if shutdown_state.is_terminated() {
+                    break;
+                }
+
+                if shutdown_state.is_running() || shutdown_state.is_completed() {
+                    // Block waiting for control OR timeout
+                    while let Ok(ev) = peer_io_rx.try_recv() {
                         connection_mgr.handle_event(ev);
                     }
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => break,
-                }
-                // Drain any extra control messages
-                while let Ok(ev) = peer_io_rx.try_recv() {
-                    connection_mgr.handle_event(ev);
-                }
 
-                if stop_signal.is_set() {
-                    return;
-                }
-
-                match connection_mgr.poll_peers() {
-                    Ok(addrs) if !addrs.is_empty() => {
-                        connection_mgr.drain_peer_messages(addrs);
+                    match connection_mgr.poll_peers() {
+                        Ok(addrs) if !addrs.is_empty() => {
+                            connection_mgr.drain_peer_messages(addrs);
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                } else if shutdown_state.is_draining() {
+                    break;
                 }
+
+                std::thread::sleep(Duration::from_millis(50));
             }
+            connection_mgr.join();
         })
     }
 
     fn start_announce_io_thread(&self, announce_io_rx: Receiver<AnnounceIoTask>) -> JoinHandle<()> {
         let peer_io_tx = self.peer_io_tx.clone();
+        let shutdown_state = self.shutdown_state.clone();
         std::thread::spawn(move || {
-            while let Ok(ev) = announce_io_rx.recv() {
-                match ev {
-                    AnnounceIoTask::Stop => return,
-                    AnnounceIoTask::PerformAnnounce {
-                        url,
-                        info_hash,
-                        peer_id,
-                        uploaded,
-                        downloaded,
-                        left,
-                    } => {
-                        eprintln!("fetching tracker: {}", url);
-                        match announce::announce(
-                            &url, &info_hash, &peer_id, 6881, uploaded, downloaded, left, None,
-                            None,
-                        ) {
-                            Ok(response) => {
-                                eprintln!(
-                                    "fetched tracker: {} :: {} peers",
-                                    url,
-                                    response.peers.len()
-                                );
-                                if !response.peers.is_empty() {
-                                    let _ = peer_io_tx.send(PeerIoTask::NewPeers {
-                                        peers: response.peers,
-                                    });
+            loop {
+                if shutdown_state.is_draining() || shutdown_state.is_terminated() {
+                    break;
+                }
+                if let Ok(ev) = announce_io_rx.recv() {
+                    match ev {
+                        AnnounceIoTask::Stop => return,
+                        AnnounceIoTask::PerformAnnounce {
+                            url,
+                            info_hash,
+                            peer_id,
+                            uploaded,
+                            downloaded,
+                            left,
+                        } => {
+                            eprintln!("fetching tracker: {}", url);
+                            match announce::announce(
+                                &url, &info_hash, &peer_id, 6881, uploaded, downloaded, left, None,
+                                None,
+                            ) {
+                                Ok(response) => {
+                                    eprintln!(
+                                        "fetched tracker: {} :: {} peers",
+                                        url,
+                                        response.peers.len()
+                                    );
+                                    if !response.peers.is_empty() {
+                                        let _ = peer_io_tx.send(PeerIoTask::NewPeers {
+                                            peers: response.peers,
+                                        });
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                eprintln!("tracker error for {} :: {}", url, e.to_string());
+                                Err(e) => {
+                                    eprintln!("tracker error for {} :: {}", url, e.to_string());
+                                }
                             }
                         }
                     }
@@ -536,12 +644,18 @@ impl Engine {
     }
 
     pub fn on_tick(&mut self) {
-        if self.completed || self.stop_signal.is_set() {
-            return;
+        match self.shutdown_state.phase() {
+            ShutdownPhase::Running => {
+                self.check_announce();
+                self.handle_disk_io_tick();
+                self.handle_peer_io_tick();
+            }
+            ShutdownPhase::Completed => {
+                self.handle_disk_io_tick();
+                self.handle_peer_io_tick();
+            }
+            _ => {}
         }
-        self.check_announce();
-        self.handle_disk_io_tick();
-        self.handle_peer_io_tick();
     }
 
     fn handle_disk_io_tick(&self) {

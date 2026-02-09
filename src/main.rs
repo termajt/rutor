@@ -1,10 +1,11 @@
+use rutor::bytespeed::ByteSpeed;
 use rutor::engine::{Engine, Event, TorrentStats};
 use rutor::torrent;
 use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
@@ -17,8 +18,9 @@ struct ProgressTracker {
     mem_usage_kb: u64,
     pid: Pid,
     show_consumption: bool,
-    thread_workers: usize,
     stats: TorrentStats,
+    speed: ByteSpeed,
+    last_downloaded: u64,
 }
 
 impl ProgressTracker {
@@ -28,20 +30,20 @@ impl ProgressTracker {
         total_pieces: usize,
         pid: Pid,
         show_consumption: bool,
-        thread_workers: usize,
         stats: TorrentStats,
     ) -> Self {
         Self {
             name: name.to_string(),
-            total_size: total_size,
+            total_size,
             eta: f64::INFINITY,
-            total_pieces: total_pieces,
+            total_pieces,
             cpu_usage: 0.0,
             mem_usage_kb: 0,
-            pid: pid,
-            show_consumption: show_consumption,
-            thread_workers: thread_workers,
-            stats: stats,
+            pid,
+            show_consumption,
+            stats,
+            speed: ByteSpeed::new(Duration::from_secs(1), false, 0.1),
+            last_downloaded: 0,
         }
     }
 
@@ -107,15 +109,17 @@ impl ProgressTracker {
         format!("{:02}:{:02}:{:02}", hours, minutes, secs)
     }
 
-    fn update(&mut self, stats: TorrentStats, system: &System, thread_workers: usize) {
+    fn update(&mut self, stats: TorrentStats, system: &System) {
+        let delta_downloaded = (stats.downloaded - self.last_downloaded) as usize;
+        self.last_downloaded = stats.downloaded;
+        self.speed.update(delta_downloaded);
         let remaining = self.total_size.saturating_sub(stats.downloaded) as f64;
-        self.eta = if stats.total_speed_down > 0.0 {
-            remaining / stats.total_speed_down
+        self.eta = if self.speed.avg_speed > 0.0 {
+            remaining / self.speed.avg_speed
         } else {
             f64::INFINITY
         };
 
-        self.thread_workers = thread_workers;
         if let Some(process) = system.process(self.pid) {
             self.cpu_usage = process.cpu_usage();
             self.mem_usage_kb = process.memory();
@@ -170,7 +174,7 @@ impl ProgressTracker {
             self.human_bytes(self.stats.downloaded),
             self.human_bytes(self.total_size),
             yellow,
-            self.human_bytes(self.stats.total_speed_down as u64),
+            self.human_bytes(self.speed.avg_speed as u64),
             reset,
             self.format_eta(self.eta),
             reset,
@@ -200,22 +204,15 @@ impl ProgressTracker {
         );
         if self.show_consumption {
             println!(
-                "CPU: {:.1}% | Memory: {} | Threads: {}",
+                "CPU: {:.1}% | Memory: {}",
                 self.cpu_usage,
                 self.human_bytes(self.mem_usage_kb),
-                self.thread_workers
             );
         }
     }
 
-    fn update_and_display(
-        &mut self,
-        stats: TorrentStats,
-        system: &System,
-        thread_workers: usize,
-        first_draw: bool,
-    ) {
-        self.update(stats, system, thread_workers);
+    fn update_and_display(&mut self, stats: TorrentStats, system: &System, first_draw: bool) {
+        self.update(stats, system);
         self.display(first_draw);
     }
 }
@@ -305,14 +302,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pid = sysinfo::get_current_pid()?;
     let mut system = System::new_all();
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let workers = std::env::var("RUTOR_MAX_THREADS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(cores);
-    let tpool = Arc::new(threadpool::ThreadPool::new((workers * 2).min(64)));
     let torrent: torrent::Torrent = {
         let file = File::open(filename)?;
         torrent::Torrent::from_file(&file, destination)?
@@ -340,7 +329,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_pieces,
         pid,
         show_consumption,
-        tpool.active_count(),
         engine.get_stats(),
     );
     let mut first_draw = true;
@@ -349,36 +337,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         if last.elapsed() >= Duration::from_secs(1) {
             system.refresh_pids(&vec![pid]);
-            progress_tracker.update_and_display(
-                engine.get_stats(),
-                &system,
-                tpool.active_count(),
-                first_draw,
-            );
+            progress_tracker.update_and_display(engine.get_stats(), &system, first_draw);
             first_draw = false;
             last = Instant::now();
         }
         let ev = engine.poll()?;
         match ev {
-            Event::Tick => {
-                engine.handle_event(ev)?;
-            }
-            Event::Stop | Event::Complete => {
+            Event::Stop => {
                 engine.handle_event(ev)?;
                 break;
             }
             _ => engine.handle_event(ev)?,
         }
     }
-    progress_tracker.update_and_display(
-        engine.get_stats(),
-        &system,
-        tpool.active_count(),
-        first_draw,
-    );
-    engine.stop();
     engine.join();
-    tpool.join();
 
     Ok(())
 }

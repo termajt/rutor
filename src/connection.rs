@@ -12,8 +12,7 @@ use mio::{Interest, Token, net::TcpStream as MioTcpStream};
 use threadpool::ThreadPool;
 
 use crate::{
-    engine::{Event, IoTask, PeerIoTask},
-    event::ManualResetEvent,
+    engine::{Event, IoTask, PeerIoTask, ShutdownState},
     peer::{MessageHandle, Peer, PeerMessage},
     picker::{self, PiecePicker},
     rate_limiter::RateLimiter,
@@ -46,7 +45,7 @@ pub struct ConnectionManager {
     idle_ticks: u32,
     picker: PiecePicker,
     torrent_size: u64,
-    stop_signal: Arc<ManualResetEvent>,
+    shutdown_state: Arc<ShutdownState>,
     info_hash: [u8; 20],
     peer_id: [u8; 20],
     total_pieces: usize,
@@ -61,7 +60,7 @@ impl ConnectionManager {
         io_tx: Sender<IoTask>,
         picker: PiecePicker,
         torrent_size: u64,
-        stop_signal: Arc<ManualResetEvent>,
+        shutdown_state: Arc<ShutdownState>,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
         total_pieces: usize,
@@ -85,13 +84,17 @@ impl ConnectionManager {
             idle_ticks: 0,
             picker,
             torrent_size,
-            stop_signal,
+            shutdown_state,
             info_hash,
             peer_id,
             total_pieces,
             read_limiter: RateLimiter::new(read_limit_bytes_per_sec),
             write_limiter: RateLimiter::new(write_limit_bytes_per_sec),
         })
+    }
+
+    pub fn join(&self) {
+        self.connector_pool.join();
     }
 
     fn adaptive_max_peers(&self, total_size: u64) -> usize {
@@ -183,15 +186,15 @@ impl ConnectionManager {
     }
 
     fn connect_peer(&self, addr: SocketAddr) {
-        if self.stop_signal.is_set() {
+        if !self.shutdown_state.is_running() {
             return;
         }
         let peer_io_tx = self.peer_io_tx.clone();
-        let stop_signal = self.stop_signal.clone();
+        let shutdown_state = self.shutdown_state.clone();
         let info_hash = self.info_hash;
         let peer_id = self.peer_id;
         self.connector_pool.execute(move || {
-            let mut stream = match tcp_connect(&addr, stop_signal.clone()) {
+            let mut stream = match tcp_connect(&addr, shutdown_state.clone()) {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = peer_io_tx.send(PeerIoTask::PeerConnectFailed {
@@ -201,7 +204,7 @@ impl ConnectionManager {
                     return;
                 }
             };
-            if stop_signal.is_set() {
+            if !shutdown_state.is_running() {
                 return;
             }
             if let Err(e) = peer_handshake(
@@ -209,7 +212,7 @@ impl ConnectionManager {
                 &mut stream,
                 &info_hash,
                 &peer_id,
-                stop_signal.clone(),
+                shutdown_state.clone(),
             ) {
                 let _ = peer_io_tx.send(PeerIoTask::PeerConnectFailed {
                     addr,
@@ -217,7 +220,7 @@ impl ConnectionManager {
                 });
                 return;
             }
-            if stop_signal.is_set() {
+            if !shutdown_state.is_running() {
                 return;
             }
             if let Err(e) = stream.set_nonblocking(true) {
@@ -586,14 +589,14 @@ fn send_handshake(
     Ok(())
 }
 
-fn tcp_connect(addr: &SocketAddr, stop_signal: Arc<ManualResetEvent>) -> io::Result<TcpStream> {
+fn tcp_connect(addr: &SocketAddr, shutdown_state: Arc<ShutdownState>) -> io::Result<TcpStream> {
     let mut last_err = None;
 
     for attempt in 1..=TCP_ATTEMPTS {
-        if stop_signal.is_set() {
+        if !shutdown_state.is_running() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "stop was signaled",
+                "shutdown in progress",
             ));
         }
         match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
@@ -608,7 +611,7 @@ fn tcp_connect(addr: &SocketAddr, stop_signal: Arc<ManualResetEvent>) -> io::Res
                 | io::ErrorKind::Interrupted => {
                     last_err = Some(e);
                     let backoff = ATTEMPT_BACKOFF * attempt as u32;
-                    stop_signal.wait_timeout(backoff);
+                    std::thread::sleep(backoff);
                     continue;
                 }
                 _ => return Err(e),
@@ -629,15 +632,15 @@ fn peer_handshake(
     stream: &mut TcpStream,
     info_hash: &[u8; 20],
     peer_id: &[u8; 20],
-    stop_signal: Arc<ManualResetEvent>,
+    shutdown_state: Arc<ShutdownState>,
 ) -> io::Result<()> {
     let mut last_err = None;
 
     for attempt in 1..=HANDSHAKE_ATTEMPTS {
-        if stop_signal.is_set() {
+        if !shutdown_state.is_running() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "stop was signaled",
+                "shutdown in progress",
             ));
         }
         match send_handshake(stream, info_hash, peer_id) {
@@ -648,7 +651,7 @@ fn peer_handshake(
                 | io::ErrorKind::Interrupted => {
                     last_err = Some(e);
                     let backoff = ATTEMPT_BACKOFF * attempt as u32;
-                    stop_signal.wait_timeout(backoff);
+                    std::thread::sleep(backoff);
                     continue;
                 }
                 _ => return Err(e),
