@@ -3,10 +3,19 @@
 /// Each piece is represented by a single bit: `1` if the piece is available,
 /// `0` if not. Bits are stored **most-significant-bit first** within each byte,
 /// following the BitTorrent wire protocol specification.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Bitfield {
     bits: Vec<u8>,
     length: usize,
+}
+
+impl std::fmt::Debug for Bitfield {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bitfield")
+            .field("bits", &self.bits.len())
+            .field("length", &self.length)
+            .finish()
+    }
 }
 
 impl Bitfield {
@@ -34,6 +43,12 @@ impl Bitfield {
         }
 
         false
+    }
+
+    pub fn reset(&mut self) {
+        for b in self.bits.iter_mut() {
+            *b = 0;
+        }
     }
 
     pub fn is_interesting_to(&self, other: &Bitfield) -> bool {
@@ -122,8 +137,12 @@ impl Bitfield {
         &self.bits
     }
 
-    pub fn len(&self) -> usize {
+    pub fn bits_len(&self) -> usize {
         self.bits.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.length
     }
 
     /// Merges another `Bitfield` into this one, setting bits that are set in either.
@@ -171,7 +190,7 @@ impl Bitfield {
     }
 
     pub fn differs_from(&self, other: &Bitfield) -> bool {
-        if self.len() != other.len() {
+        if self.bits_len() != other.bits_len() {
             return true;
         }
 

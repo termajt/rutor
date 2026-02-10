@@ -5,6 +5,7 @@ pub mod bytespeed;
 pub mod connection;
 pub mod disk;
 pub mod engine;
+pub mod hasher;
 pub mod inflight;
 pub mod peer;
 pub mod pending_requests;

@@ -73,7 +73,7 @@ impl ConnectionManager {
             connected_peers: HashMap::new(),
             peer_io_tx,
             event_tx,
-            connector_pool: ThreadPool::with_name("connector_pool".to_string(), 10),
+            connector_pool: create_connector_pool(),
             io_tx,
             poll: Poll::new()?,
             events: Events::with_capacity(1024),
@@ -399,18 +399,18 @@ impl ConnectionManager {
                                 piece,
                                 offset,
                                 data,
-                            });
-                        }
-                        if status.complete {
-                            let _ = self.io_tx.send(IoTask::DiskVerifyPiece {
-                                piece,
-                                expected_hash: status.expected_hash,
+                                complete: status.complete,
                             });
                         }
                         let _ = self
                             .peer_io_tx
                             .send(PeerIoTask::RequestBlocksForPeer { addr });
                     }
+                }
+                MessageHandle::Unchoke => {
+                    let _ = self
+                        .peer_io_tx
+                        .send(PeerIoTask::RequestBlocksForPeer { addr });
                 }
             });
             if let Err(e) = result {
@@ -424,7 +424,11 @@ impl ConnectionManager {
             Some(p) => p,
             None => return,
         };
-        peer.maybe_update_interest(bitfield_interested);
+        if peer.maybe_update_interest(bitfield_interested) {
+            let _ = self
+                .peer_io_tx
+                .send(PeerIoTask::RequestBlocksForPeer { addr });
+        }
     }
 
     fn request_blocks_for_peer(&mut self, addr: SocketAddr) {
@@ -435,7 +439,11 @@ impl ConnectionManager {
         if peer.is_choked() || !peer.am_interested() {
             return;
         }
-        for req in self.picker.pick_blocks_for_peer(&addr, peer.bitfield()) {
+        for req in self.picker.pick_blocks_for_peer(
+            &addr,
+            peer.bitfield(),
+            peer.max_inflight_piece_blocks(),
+        ) {
             peer.enqueue_message(&PeerMessage::Request((
                 req.piece as u32,
                 req.offset as u32,
@@ -665,4 +673,8 @@ fn peer_handshake(
             format!("handshake retries exhausted for {}", addr),
         )
     }))
+}
+
+fn create_connector_pool() -> ThreadPool {
+    ThreadPool::with_name("connector_pool".to_string(), 8)
 }

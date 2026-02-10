@@ -12,6 +12,7 @@ use crate::{
     bitfield::Bitfield,
     inflight::InFlight,
     pending_requests::{BlockKey, PendingRequests},
+    picker,
 };
 
 /// Represents a message exchanged between BitTorrent peers
@@ -92,7 +93,7 @@ impl fmt::Display for PeerMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PeerMessage::Bitfield(bitfield) => {
-                write!(f, "PeerMessage::Bitfield({})", bitfield.len())
+                write!(f, "PeerMessage::Bitfield({:?})", bitfield)
             }
             PeerMessage::Choke => write!(f, "PeerMessage::Choke"),
             PeerMessage::Unchoke => write!(f, "PeerMessage::Unchoke"),
@@ -238,6 +239,7 @@ pub enum MessageHandle {
     Have {
         bitfield: Bitfield,
     },
+    Unchoke,
 }
 
 #[derive(Debug)]
@@ -257,6 +259,10 @@ pub struct Peer {
     last_keepalive: Instant,
     last_speed_update: Instant,
     bytes_since_last_update: usize,
+    timeout: Duration,
+    rtt: Option<Duration>,
+    rtt_alpha: f64,
+    max_inflight_piece_blocks: usize,
 }
 
 const READ_CHUNK: usize = 16 * 1024;
@@ -277,17 +283,55 @@ impl Peer {
             interested: false,
             am_interested: false,
             inflight: InFlight::default(),
-            pending: PendingRequests::new(Duration::from_secs(10)),
+            pending: PendingRequests::new(),
             token,
-            speed: 0.0,
+            speed: 1024.0,
             last_keepalive: now,
             last_speed_update: now,
             bytes_since_last_update: 0,
+            timeout: Duration::from_secs(3),
+            rtt: None,
+            rtt_alpha: 0.2,
+            max_inflight_piece_blocks: 16,
         })
     }
 
+    fn update_adaptive_timeout(&mut self) {
+        const MULTIPLIER: f64 = 1.5;
+        const MIN_TIMEOUT: Duration = Duration::from_secs(1);
+        const MAX_TIMEOUT: Duration = Duration::from_secs(30);
+
+        let rtt = self.rtt.unwrap_or(Duration::from_millis(100));
+        let speed = self.speed.max(1024.0);
+        let transfer_time = picker::BLOCK_SIZE as f64 / speed;
+
+        let desired_timeout =
+            Duration::from_secs_f64(MULTIPLIER * transfer_time + rtt.as_secs_f64());
+        self.timeout = desired_timeout.clamp(MIN_TIMEOUT, MAX_TIMEOUT);
+    }
+
+    fn update_max_inflight_piece_blocks(&mut self) {
+        const MIN_BLOCKS: usize = 16;
+        const MAX_BLOCKS: usize = 128;
+        let rtt = self.rtt.unwrap_or(Duration::from_millis(100)).as_secs_f64();
+        let speed = self.speed.max(1024.0);
+        let max_inflight_piece_blocks = ((speed * rtt) / picker::BLOCK_SIZE as f64).ceil() as usize;
+        self.max_inflight_piece_blocks = max_inflight_piece_blocks.clamp(MIN_BLOCKS, MAX_BLOCKS)
+    }
+
+    fn update(&mut self, sample: Option<Duration>, bytes: usize) {
+        self.update_speed(bytes);
+        self.update_rtt(sample);
+        self.update_adaptive_timeout();
+        self.update_max_inflight_piece_blocks();
+    }
+
+    pub fn max_inflight_piece_blocks(&self) -> usize {
+        self.max_inflight_piece_blocks
+    }
+
     pub fn timeout(&self) -> Duration {
-        self.pending.timeout()
+        self.timeout.max(Duration::from_secs(1))
     }
 
     pub fn addr(&self) -> &SocketAddr {
@@ -388,9 +432,11 @@ impl Peer {
     where
         F: FnMut(MessageHandle),
     {
+        const MAX_MESSAGES_PER_READ: usize = 8;
         let mut offset = 0;
         let buf_len = self.read_buf.len();
-        loop {
+        let mut read = 0;
+        while read < MAX_MESSAGES_PER_READ {
             if buf_len - offset < 4 {
                 break;
             }
@@ -411,6 +457,7 @@ impl Peer {
             }
 
             offset = payload_end;
+            read += 1;
         }
 
         if offset > 0 {
@@ -421,7 +468,7 @@ impl Peer {
     }
 
     pub fn expire_requests(&mut self) -> Vec<BlockKey> {
-        let expired = self.pending.expire();
+        let expired = self.pending.expire(self.timeout);
         for key in &expired {
             self.inflight.complete(key.length as usize);
         }
@@ -431,7 +478,10 @@ impl Peer {
     fn handle_message(&mut self, message: PeerMessage) -> Option<MessageHandle> {
         match message {
             PeerMessage::Choke => self.am_choked = true,
-            PeerMessage::Unchoke => self.am_choked = false,
+            PeerMessage::Unchoke => {
+                self.am_choked = false;
+                return Some(MessageHandle::Unchoke);
+            }
             PeerMessage::Interested => self.interested = true,
             PeerMessage::NotInterested => self.interested = false,
             PeerMessage::Have(piece) => {
@@ -458,11 +508,13 @@ impl Peer {
                     length: len as u32,
                 };
 
-                if self.pending.remove(&key) {
+                let mut sample_opt = None;
+                if let Some(p) = self.pending.remove(&key) {
+                    sample_opt = Some(Instant::now() - p.requested_at);
                     self.inflight.complete(len);
                 }
 
-                self.update_speed(len);
+                self.update(sample_opt, len);
 
                 return Some(MessageHandle::Piece {
                     piece: piece as usize,
@@ -488,14 +540,16 @@ impl Peer {
         }
     }
 
-    pub fn maybe_update_interest(&mut self, bitfield_interested: bool) {
+    pub fn maybe_update_interest(&mut self, bitfield_interested: bool) -> bool {
         let was_interested = self.am_interested;
         self.am_interested = bitfield_interested;
         if was_interested != self.am_interested {
             if self.am_interested {
                 self.enqueue_message(&PeerMessage::Interested);
+                return true;
             }
         }
+        false
     }
 
     fn update_speed(&mut self, bytes: usize) {
@@ -509,6 +563,19 @@ impl Peer {
             self.bytes_since_last_update = 0;
             self.last_speed_update = now;
         }
+    }
+
+    fn update_rtt(&mut self, sample: Option<Duration>) {
+        let sample = match sample {
+            Some(s) => s,
+            None => return,
+        };
+        self.rtt = Some(match self.rtt {
+            Some(prev) => Duration::from_secs_f64(
+                self.rtt_alpha * sample.as_secs_f64() + (1.0 - self.rtt_alpha) * prev.as_secs_f64(),
+            ),
+            None => sample,
+        });
     }
 
     pub fn is_choked(&self) -> bool {

@@ -343,7 +343,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let ev = engine.poll()?;
         match ev {
-            Event::Stop => {
+            Event::Terminate => {
                 engine.handle_event(ev)?;
                 break;
             }

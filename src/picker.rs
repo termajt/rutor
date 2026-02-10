@@ -5,7 +5,6 @@ use std::{
 };
 
 use rand::{rngs::ThreadRng, seq::SliceRandom};
-use sha1::{Digest, Sha1};
 
 use crate::bitfield::Bitfield;
 
@@ -36,31 +35,33 @@ pub struct BlockRequest {
 
 #[derive(Debug)]
 struct Piece {
-    received: Vec<bool>,
+    received: Bitfield,
     expected_hash: [u8; 20],
     length: usize,
     availability: usize,
     received_count: usize,
+    block_size: usize,
 }
 
 impl Piece {
     fn new(piece_len: usize, block_size: usize, expected_hash: [u8; 20]) -> Self {
         let blocks = (piece_len + block_size - 1) / block_size;
         Self {
-            received: vec![false; blocks],
+            received: Bitfield::new(blocks),
             expected_hash,
             length: piece_len,
             availability: 0,
             received_count: 0,
+            block_size,
         }
     }
 
     fn mark_block(&mut self, offset: usize) -> bool {
         let block_idx = offset / BLOCK_SIZE;
-        if self.received[block_idx] {
+        if self.received.get(&block_idx) {
             return false;
         }
-        self.received[block_idx] = true;
+        self.received.set(&block_idx, true);
         self.received_count += 1;
         true
     }
@@ -70,15 +71,17 @@ impl Piece {
     }
 
     fn reset(&mut self) {
-        self.received.fill(false);
+        self.received.reset();
         self.received_count = 0;
     }
 
     fn downloaded_bytes(&self) -> usize {
-        let bytes = self.received_count * BLOCK_SIZE;
+        let bytes = self.received_count * self.block_size;
         bytes.min(self.length)
     }
 }
+
+const MAX_ACTIVE_PIECES: usize = 20;
 
 #[derive(Debug)]
 pub struct PiecePicker {
@@ -89,9 +92,9 @@ pub struct PiecePicker {
     dirty: bool,
     rng: ThreadRng,
     inflight_per_peer: HashMap<SocketAddr, usize>,
-    max_inflight_per_peer: usize,
     verified_bytes: usize,
     total_blocks: u64,
+    active_pieces: HashSet<usize>,
 }
 
 impl PiecePicker {
@@ -99,7 +102,6 @@ impl PiecePicker {
         piece_length: usize,
         total_size: u64,
         piece_hashes: Vec<[u8; 20]>,
-        max_inflight_per_peer: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut pieces = HashMap::new();
 
@@ -125,9 +127,9 @@ impl PiecePicker {
             dirty: true,
             rng: rand::rng(),
             inflight_per_peer: HashMap::new(),
-            max_inflight_per_peer,
             verified_bytes: 0,
             total_blocks,
+            active_pieces: HashSet::new(),
         })
     }
 
@@ -170,7 +172,7 @@ impl PiecePicker {
             }
             let blocks = blocks_per_piece(piece.length, BLOCK_SIZE);
             for block_idx in 0..blocks {
-                if !piece.received[block_idx] {
+                if !piece.received.get(&block_idx) {
                     remaining_blocks.push((*piece_idx, block_idx));
                 }
             }
@@ -178,10 +180,20 @@ impl PiecePicker {
 
         remaining_blocks.shuffle(&mut self.rng);
 
+        let active_initial = self.active_pieces.len();
+        let mut newly_activated = 0;
+        let mut activated_this_call = HashSet::new();
+
         for (piece_idx, block_idx) in remaining_blocks {
             if free == 0 {
                 break;
             }
+            let is_active = self.active_pieces.contains(&piece_idx);
+
+            if !is_active && active_initial + newly_activated >= MAX_ACTIVE_PIECES {
+                continue;
+            }
+
             let piece = &self.pieces[&piece_idx];
             let offset = block_idx * BLOCK_SIZE;
             let length = (piece.length - offset).min(BLOCK_SIZE);
@@ -202,6 +214,11 @@ impl PiecePicker {
                     self.requested.insert(key, block_in_flight);
                 }
             }
+
+            if !is_active && activated_this_call.insert(piece_idx) {
+                newly_activated += 1;
+            }
+
             *self.inflight_per_peer.entry(*addr).or_default() += 1;
             out.push(BlockRequest {
                 piece: piece_idx,
@@ -211,7 +228,11 @@ impl PiecePicker {
             free = free.saturating_sub(1);
         }
 
-        return out;
+        for p in activated_this_call {
+            self.adapt_active_pieces(p, false);
+        }
+
+        out
     }
 
     fn pick_rarest_first_blocks(
@@ -223,11 +244,27 @@ impl PiecePicker {
     ) -> Vec<BlockRequest> {
         self.rebuild_if_needed();
         let mut out = Vec::new();
-        for piece_index in &self.sorted_pieces {
+        let active_initial = self.active_pieces.len();
+        let mut newly_activated = 0;
+        // Iterator: active pieces first, then sorted pieces
+        let pieces_iter = self.active_pieces.iter().copied().chain(
+            self.sorted_pieces
+                .iter()
+                .copied()
+                .filter(|p| !self.active_pieces.contains(p)),
+        );
+        let mut activated = HashSet::new();
+        for piece_index in pieces_iter {
             if free == 0 {
                 break;
             }
-            if !peer_bf.get(piece_index) {
+
+            let is_active = self.active_pieces.contains(&piece_index);
+
+            if !is_active && active_initial + newly_activated >= MAX_ACTIVE_PIECES {
+                continue;
+            }
+            if !peer_bf.get(&piece_index) {
                 continue;
             }
 
@@ -241,19 +278,27 @@ impl PiecePicker {
 
             let blocks = blocks_per_piece(piece.length, BLOCK_SIZE);
 
+            let mut activated_this_piece = false;
+
             for block_idx in 0..blocks {
                 if free == 0 {
                     break;
                 }
-                if piece.received[block_idx] {
+                if piece.received.get(&block_idx) {
                     continue;
                 }
 
                 let offset = block_idx * BLOCK_SIZE;
-                let key = (*piece_index, offset);
+                let key = (piece_index, offset);
 
                 if self.requested.contains_key(&key) {
                     continue;
+                }
+
+                if !is_active && !activated_this_piece {
+                    newly_activated += 1;
+                    activated_this_piece = true;
+                    activated.insert(piece_index);
                 }
 
                 let remaining = piece.length.saturating_sub(offset);
@@ -266,12 +311,16 @@ impl PiecePicker {
                 self.requested.insert(key, block_in_flight);
                 *self.inflight_per_peer.entry(*addr).or_default() += 1;
                 out.push(BlockRequest {
-                    piece: *piece_index,
+                    piece: piece_index,
                     offset,
                     length,
                 });
                 free = free.saturating_sub(1);
             }
+        }
+
+        for p in activated {
+            self.adapt_active_pieces(p, false);
         }
 
         out
@@ -281,13 +330,14 @@ impl PiecePicker {
         &mut self,
         addr: &SocketAddr,
         peer_bf: &Bitfield,
+        max_inflight_per_peer: usize,
     ) -> Vec<BlockRequest> {
         let inflight = self.inflight_per_peer.get(addr).unwrap_or(&0);
-        if *inflight >= self.max_inflight_per_peer {
+        if *inflight >= max_inflight_per_peer {
             return Vec::new();
         }
 
-        let free = self.max_inflight_per_peer.saturating_sub(*inflight);
+        let free = max_inflight_per_peer.saturating_sub(*inflight);
         if free == 0 {
             eprintln!("no free blocks to pick");
             return Vec::new();
@@ -296,13 +346,14 @@ impl PiecePicker {
         let now = Instant::now();
 
         if self.endgame {
-            return self.pick_endgame_blocks(addr, peer_bf, now, free);
+            self.pick_endgame_blocks(addr, peer_bf, now, free)
         } else {
             self.pick_rarest_first_blocks(addr, peer_bf, now, free)
         }
     }
 
     pub fn on_piece_verified(&mut self, piece_idx: usize) {
+        self.adapt_active_pieces(piece_idx, true);
         if let Some(piece) = self.pieces.remove(&piece_idx) {
             self.verified_bytes += piece.length;
         }
@@ -312,13 +363,21 @@ impl PiecePicker {
     }
 
     pub fn on_piece_verification_failure(&mut self, piece_idx: usize) {
+        self.adapt_active_pieces(piece_idx, true);
         self.requested.retain(|(p, _), _| *p != piece_idx);
         let piece = match self.pieces.get_mut(&piece_idx) {
             Some(p) => p,
             None => return,
         };
         piece.reset();
-        eprintln!("piece {} failed verification", piece_idx);
+    }
+
+    fn adapt_active_pieces(&mut self, piece: usize, remove: bool) {
+        if remove {
+            self.active_pieces.remove(&piece);
+        } else {
+            self.active_pieces.insert(piece);
+        }
     }
 
     pub fn on_peer_bitfield(&mut self, bf: &Bitfield) {
@@ -405,6 +464,10 @@ impl PiecePicker {
             (piece.is_complete(), piece.expected_hash)
         };
 
+        if complete {
+            self.adapt_active_pieces(piece_idx, true);
+        }
+
         if let Some(inflight) = self.requested.get_mut(&key) {
             inflight.requested_by.remove(addr);
             if inflight.requested_by.is_empty() {
@@ -478,11 +541,4 @@ impl PiecePicker {
 
 fn blocks_per_piece(piece_len: usize, block_size: usize) -> usize {
     (piece_len + block_size - 1) / block_size
-}
-
-pub fn verify_piece(expected_hash: [u8; 20], data: &[u8]) -> bool {
-    let mut hasher = Sha1::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    result.as_slice() == expected_hash
 }

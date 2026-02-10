@@ -12,20 +12,18 @@ pub struct BlockKey {
 
 #[derive(Debug)]
 pub struct PendingBlock {
-    pub deadline: Instant,
+    pub requested_at: Instant,
 }
 
 #[derive(Debug)]
 pub struct PendingRequests {
     blocks: HashMap<BlockKey, PendingBlock>,
-    timeout: Duration,
 }
 
 impl PendingRequests {
-    pub fn new(timeout: Duration) -> Self {
+    pub fn new() -> Self {
         Self {
             blocks: HashMap::new(),
-            timeout,
         }
     }
 
@@ -33,21 +31,21 @@ impl PendingRequests {
         self.blocks.insert(
             key,
             PendingBlock {
-                deadline: Instant::now() + self.timeout,
+                requested_at: Instant::now(),
             },
         );
     }
 
-    pub fn remove(&mut self, key: &BlockKey) -> bool {
-        self.blocks.remove(key).is_some()
+    pub fn remove(&mut self, key: &BlockKey) -> Option<PendingBlock> {
+        self.blocks.remove(key)
     }
 
-    pub fn expire(&mut self) -> Vec<BlockKey> {
+    pub fn expire(&mut self, timeout: Duration) -> Vec<BlockKey> {
         let now = Instant::now();
         let mut expired = Vec::new();
 
         self.blocks.retain(|k, v| {
-            if now >= v.deadline {
+            if now.duration_since(v.requested_at) >= timeout {
                 expired.push(*k);
                 false
             } else {
@@ -60,9 +58,5 @@ impl PendingRequests {
 
     pub fn len(&self) -> usize {
         self.blocks.len()
-    }
-
-    pub fn timeout(&self) -> Duration {
-        self.timeout
     }
 }
