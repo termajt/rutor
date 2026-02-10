@@ -1,6 +1,6 @@
 use rutor::bytespeed::ByteSpeed;
 use rutor::engine::{Engine, Event, TorrentStats};
-use rutor::torrent;
+use rutor::{picker, torrent};
 use std::env;
 use std::fs::File;
 use std::io::Write;
@@ -190,13 +190,14 @@ impl ProgressTracker {
             self.stats.available_peers
         );
         println!(
-            "{0}{1:<10}:{2} {3} / {4} ({5} blocks in flight)",
+            "{0}{1:<10}:{2} {3} / {4} ({5} blocks in flight ~{6})",
             white,
             "Pieces",
             reset,
             self.stats.bitfield.count_ones(),
             self.total_pieces,
-            self.stats.blocks_inflight
+            self.stats.blocks_inflight,
+            self.human_bytes((self.stats.blocks_inflight * picker::BLOCK_SIZE) as u64)
         );
         println!(
             "{}",
@@ -313,6 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (io_tx, io_rx) = mpsc::channel();
     let (peer_io_tx, peer_io_rx) = mpsc::channel();
     let (announce_io_tx, announce_io_rx) = mpsc::channel();
+    let (hash_tx, hash_rx) = mpsc::channel();
     let mut engine = Engine::new(
         torrent,
         event_tx.clone(),
@@ -322,6 +324,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         announce_io_tx,
         0,
         0,
+        hash_tx,
     );
     let mut progress_tracker = ProgressTracker::new(
         &name,
@@ -333,7 +336,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut first_draw = true;
     let mut last = Instant::now();
-    engine.start(io_rx, peer_io_rx, announce_io_rx);
+    engine.start(io_rx, peer_io_rx, announce_io_rx, hash_rx);
     loop {
         if last.elapsed() >= Duration::from_secs(1) {
             system.refresh_pids(&vec![pid]);

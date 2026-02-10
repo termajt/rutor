@@ -266,36 +266,15 @@ impl DiskManager {
         &mut self,
         piece_index: usize,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let (piece_start, piece_end) = self.piece_range(piece_index);
-        let piece_len = (piece_end - piece_start) as usize;
-        let mut buf = vec![0u8; piece_len];
+        let mut buf = Vec::new();
 
-        let mut offset_in_piece = 0;
-        let mut offset_in_torrent = piece_start;
+        let result = self.read_piece_chunks(piece_index, 8192, |data, _| {
+            buf.extend_from_slice(&data);
+            Ok(())
+        });
 
-        for file in &self.files {
-            if offset_in_torrent >= file.length {
-                offset_in_torrent -= file.length;
-                continue;
-            }
-
-            let read_start = offset_in_torrent as usize;
-            let read_len = std::cmp::min(
-                file.length as usize - read_start,
-                piece_len - offset_in_piece,
-            );
-
-            self.file_handle_cache.with_file(&file.path, |f| {
-                f.seek(SeekFrom::Start(read_start as u64))?;
-                f.read_exact(&mut buf[offset_in_piece..offset_in_piece + read_len])?;
-                Ok(())
-            })?;
-
-            offset_in_piece += read_len;
-            offset_in_torrent = 0;
-            if offset_in_piece == piece_len {
-                break;
-            }
+        if let Err(e) = result {
+            return Err(e);
         }
 
         Ok(buf)
@@ -341,6 +320,63 @@ impl DiskManager {
 
         for piece in expired {
             self.flush_piece(piece)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn read_piece_chunks<F>(
+        &mut self,
+        piece_index: usize,
+        chunk_size: usize,
+        mut on_chunk: F,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        F: FnMut(Vec<u8>, bool) -> Result<(), Box<dyn std::error::Error>>,
+    {
+        let (piece_start, piece_end) = self.piece_range(piece_index);
+        let piece_len = (piece_end - piece_start) as usize;
+
+        let mut offset_in_piece = 0usize;
+        let mut offset_in_torrent = piece_start;
+
+        let mut buf = vec![0u8; chunk_size.min(piece_len)];
+
+        for file in &self.files {
+            if offset_in_torrent >= file.length {
+                offset_in_torrent -= file.length;
+                continue;
+            }
+
+            let mut file_offset = offset_in_torrent as usize;
+            let mut remaining_in_piece = piece_len - offset_in_piece;
+
+            while remaining_in_piece > 0 && file_offset < file.length as usize {
+                let read_len = std::cmp::min(
+                    chunk_size,
+                    std::cmp::min(remaining_in_piece, file.length as usize - file_offset),
+                );
+
+                self.file_handle_cache.with_file(&file.path, |f| {
+                    f.seek(SeekFrom::Start(file_offset as u64))?;
+                    f.read_exact(&mut buf[..read_len])?;
+                    Ok(())
+                })?;
+
+                let is_last = offset_in_piece + read_len == piece_len;
+
+                on_chunk(buf[..read_len].to_vec(), is_last)?;
+
+                offset_in_piece += read_len;
+                remaining_in_piece -= read_len;
+                file_offset += read_len;
+            }
+
+            offset_in_torrent = 0;
+
+            if offset_in_piece == piece_len {
+                break;
+            }
         }
 
         Ok(())

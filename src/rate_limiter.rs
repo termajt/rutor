@@ -30,6 +30,9 @@ impl RateLimiter {
     /// Allow up to `want` bytes.
     /// Returns how many bytes are allowed **right now**.
     pub fn allow(&mut self, want: usize) -> usize {
+        if self.bytes_per_sec == 0 {
+            return usize::MAX;
+        }
         self.refill();
         let granted = want.min(self.available);
         self.available = self.available.saturating_sub(granted);

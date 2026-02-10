@@ -81,8 +81,6 @@ impl Piece {
     }
 }
 
-const MAX_ACTIVE_PIECES: usize = 20;
-
 #[derive(Debug)]
 pub struct PiecePicker {
     requested: HashMap<BlockKey, BlockInFlight>,
@@ -180,8 +178,6 @@ impl PiecePicker {
 
         remaining_blocks.shuffle(&mut self.rng);
 
-        let active_initial = self.active_pieces.len();
-        let mut newly_activated = 0;
         let mut activated_this_call = HashSet::new();
 
         for (piece_idx, block_idx) in remaining_blocks {
@@ -189,11 +185,6 @@ impl PiecePicker {
                 break;
             }
             let is_active = self.active_pieces.contains(&piece_idx);
-
-            if !is_active && active_initial + newly_activated >= MAX_ACTIVE_PIECES {
-                continue;
-            }
-
             let piece = &self.pieces[&piece_idx];
             let offset = block_idx * BLOCK_SIZE;
             let length = (piece.length - offset).min(BLOCK_SIZE);
@@ -215,8 +206,8 @@ impl PiecePicker {
                 }
             }
 
-            if !is_active && activated_this_call.insert(piece_idx) {
-                newly_activated += 1;
+            if !is_active {
+                activated_this_call.insert(piece_idx);
             }
 
             *self.inflight_per_peer.entry(*addr).or_default() += 1;
@@ -244,8 +235,6 @@ impl PiecePicker {
     ) -> Vec<BlockRequest> {
         self.rebuild_if_needed();
         let mut out = Vec::new();
-        let active_initial = self.active_pieces.len();
-        let mut newly_activated = 0;
         // Iterator: active pieces first, then sorted pieces
         let pieces_iter = self.active_pieces.iter().copied().chain(
             self.sorted_pieces
@@ -261,9 +250,6 @@ impl PiecePicker {
 
             let is_active = self.active_pieces.contains(&piece_index);
 
-            if !is_active && active_initial + newly_activated >= MAX_ACTIVE_PIECES {
-                continue;
-            }
             if !peer_bf.get(&piece_index) {
                 continue;
             }
@@ -296,7 +282,6 @@ impl PiecePicker {
                 }
 
                 if !is_active && !activated_this_piece {
-                    newly_activated += 1;
                     activated_this_piece = true;
                     activated.insert(piece_index);
                 }
@@ -346,9 +331,9 @@ impl PiecePicker {
         let now = Instant::now();
 
         if self.endgame {
-            self.pick_endgame_blocks(addr, peer_bf, now, free)
+            self.pick_endgame_blocks(addr, peer_bf, now, max_inflight_per_peer)
         } else {
-            self.pick_rarest_first_blocks(addr, peer_bf, now, free)
+            self.pick_rarest_first_blocks(addr, peer_bf, now, max_inflight_per_peer)
         }
     }
 

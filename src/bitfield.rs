@@ -26,12 +26,10 @@ impl Bitfield {
     ///
     /// * `length` - Total number of pieces in the torrent.
     pub fn new(length: usize) -> Self {
-        {
-            let byte_len = (length + 7) / 8;
-            Bitfield {
-                bits: vec![0; byte_len],
-                length: length,
-            }
+        let byte_len = (length + 7) / 8;
+        Self {
+            bits: vec![0; byte_len],
+            length: length,
         }
     }
 
@@ -74,7 +72,7 @@ impl Bitfield {
     /// Panics if `bytes.len()` is insufficient for the given length.
     pub fn from_bytes(bytes: Vec<u8>, length: usize) -> Self {
         assert!(bytes.len() >= (length + 7) / 8, "not enough bytes");
-        Bitfield {
+        Self {
             bits: bytes,
             length: length,
         }

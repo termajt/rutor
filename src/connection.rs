@@ -14,7 +14,7 @@ use threadpool::ThreadPool;
 use crate::{
     engine::{Event, IoTask, PeerIoTask, ShutdownState},
     peer::{MessageHandle, Peer, PeerMessage},
-    picker::{self, PiecePicker},
+    picker::PiecePicker,
     rate_limiter::RateLimiter,
 };
 
@@ -102,17 +102,18 @@ impl ConnectionManager {
             16
         } else if total_size < 500 * 1024 * 1024 {
             32
-        } else if total_size < 2 * 1024 * 1024 * 1024 {
-            50
         } else {
-            80
+            50
         };
+        if self.connected_peers.is_empty() {
+            return base_peers;
+        }
 
         let swarm_speed: f64 = self.connected_peers.values().map(|p| p.speed()).sum();
 
         let extra_peers = if swarm_speed < 500_000.0 { 5 } else { 0 };
 
-        (base_peers + extra_peers).min(100)
+        (base_peers + extra_peers).min(50)
     }
 
     fn cleanup_peer(&mut self, addr: &SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
@@ -293,13 +294,10 @@ impl ConnectionManager {
         Ok(())
     }
 
-    pub fn poll_peers(&mut self) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>> {
-        self.poll
-            .poll(&mut self.events, Some(Duration::from_millis(50)))?;
+    pub fn poll_peers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.poll.poll(&mut self.events, Some(self.poll_timeout))?;
 
         let mut activity = false;
-        let mut drains_needed = Vec::new();
-        let connected_peers_count = self.connected_peers();
         for ev in self.events.iter() {
             let token = ev.token();
 
@@ -314,17 +312,10 @@ impl ConnectionManager {
             };
 
             if ev.is_readable() {
-                let budget = if self.read_limiter.bytes_per_sec == 0 {
-                    usize::MAX
-                } else {
-                    self.read_limiter
-                        .allow(connected_peers_count * picker::BLOCK_SIZE)
-                };
-                match conn.socket_read(budget, 8) {
+                match conn.socket_read(&mut self.read_limiter, 8) {
                     Ok(n) => {
                         if n > 0 {
                             activity = true;
-                            drains_needed.push(*conn.addr());
                         }
                     }
                     Err(e) => {
@@ -338,13 +329,7 @@ impl ConnectionManager {
             }
 
             if ev.is_writable() {
-                let budget = if self.write_limiter.bytes_per_sec == 0 {
-                    usize::MAX
-                } else {
-                    self.write_limiter
-                        .allow(connected_peers_count * picker::BLOCK_SIZE)
-                };
-                match conn.socket_write(budget) {
+                match conn.socket_write(&mut self.write_limiter) {
                     Ok(n) => {
                         if n > 0 {
                             activity = true;
@@ -373,48 +358,48 @@ impl ConnectionManager {
             self.poll_timeout = (BASE_POLL_TIMEOUT + backoff).min(MAX_POLL_TIMEOUT);
         }
 
-        Ok(drains_needed)
+        for peer in self.connected_peers.values() {
+            if peer.can_drain() {
+                let _ = self
+                    .peer_io_tx
+                    .send(PeerIoTask::Drain { addr: *peer.addr() });
+            }
+        }
+
+        Ok(())
     }
 
-    pub fn drain_peer_messages(&mut self, addrs: Vec<SocketAddr>) {
-        for addr in addrs {
-            let conn = match self.connected_peers.get_mut(&addr) {
-                Some(p) => p,
-                None => return,
-            };
-            let result = conn.drain_messages(|msg| match msg {
-                MessageHandle::Bitfield { bitfield } | MessageHandle::Have { bitfield } => {
-                    let _ = self
-                        .event_tx
-                        .send(Event::CompareBitfield { addr, bitfield });
-                }
-                MessageHandle::Piece {
-                    piece,
-                    offset,
-                    data,
-                } => {
-                    if let Some(status) = self.picker.on_block_received(&addr, piece, offset) {
-                        if status.received {
-                            let _ = self.io_tx.send(IoTask::WriteToDisk {
-                                piece,
-                                offset,
-                                data,
-                                complete: status.complete,
-                            });
-                        }
-                        let _ = self
-                            .peer_io_tx
-                            .send(PeerIoTask::RequestBlocksForPeer { addr });
+    fn handle_message(&mut self, addr: SocketAddr, message_handle: Arc<MessageHandle>) {
+        match message_handle.as_ref() {
+            MessageHandle::Piece {
+                piece,
+                offset,
+                data,
+            } => {
+                if let Some(status) = self.picker.on_block_received(&addr, *piece, *offset) {
+                    if status.received {
+                        let _ = self.io_tx.send(IoTask::WriteToDisk {
+                            piece: *piece,
+                            offset: *offset,
+                            data: data.clone(),
+                            complete: status.complete,
+                        });
                     }
-                }
-                MessageHandle::Unchoke => {
                     let _ = self
                         .peer_io_tx
                         .send(PeerIoTask::RequestBlocksForPeer { addr });
                 }
-            });
-            if let Err(e) = result {
-                eprintln!("failed to drain messages for: {} :: {}", conn.addr(), e);
+            }
+            MessageHandle::Bitfield { bitfield } | MessageHandle::Have { bitfield } => {
+                let _ = self.event_tx.send(Event::CompareBitfield {
+                    addr,
+                    bitfield: bitfield.clone(),
+                });
+            }
+            MessageHandle::Unchoke => {
+                let _ = self
+                    .peer_io_tx
+                    .send(PeerIoTask::RequestBlocksForPeer { addr });
             }
         }
     }
@@ -440,7 +425,7 @@ impl ConnectionManager {
             return;
         }
         for req in self.picker.pick_blocks_for_peer(
-            &addr,
+            peer.addr(),
             peer.bitfield(),
             peer.max_inflight_piece_blocks(),
         ) {
@@ -453,22 +438,40 @@ impl ConnectionManager {
     }
 
     fn maybe_request_blocks(&mut self) {
-        let mut peers: Vec<&Peer> = self
+        let mut peer_addrs: Vec<SocketAddr> = self
             .connected_peers
-            .values()
-            .filter(|p| !p.is_choked() && p.am_interested())
+            .iter()
+            .filter(|(_, p)| !p.is_choked() && p.am_interested())
+            .map(|(addr, _)| *addr)
             .collect();
 
-        peers.sort_by(|a, b| {
-            b.speed()
-                .partial_cmp(&a.speed())
+        peer_addrs.sort_by(|a, b| {
+            let speed_a = self.connected_peers[a].speed();
+            let speed_b = self.connected_peers[b].speed();
+            speed_b
+                .partial_cmp(&speed_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        for peer in peers {
-            let _ = self
-                .peer_io_tx
-                .send(PeerIoTask::RequestBlocksForPeer { addr: *peer.addr() });
+        for addr in peer_addrs {
+            self.request_blocks_for_peer(addr);
+        }
+    }
+
+    fn drain_peer(&mut self, addr: &SocketAddr) {
+        let peer = match self.connected_peers.get_mut(addr) {
+            Some(p) => p,
+            None => return,
+        };
+
+        let result = peer.drain_messages(|msg| {
+            let _ = self.peer_io_tx.send(PeerIoTask::MessageHandle {
+                addr: *addr,
+                message_handle: Arc::new(msg),
+            });
+        });
+        if let Err(e) = result {
+            eprintln!("{} failed to drain: {}", addr, e);
         }
     }
 
@@ -560,6 +563,15 @@ impl ConnectionManager {
                     total_speed_down: self.total_speed_down(),
                     opportunistic_downloaded: self.picker.opportunistic_downloaded_bytes(),
                 });
+            }
+            PeerIoTask::MessageHandle {
+                addr,
+                message_handle,
+            } => {
+                self.handle_message(addr, message_handle);
+            }
+            PeerIoTask::Drain { addr } => {
+                self.drain_peer(&addr);
             }
         }
     }

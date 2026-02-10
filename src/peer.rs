@@ -3,6 +3,7 @@ use std::{
     fmt,
     io::{self, Read, Write},
     net::SocketAddr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -10,9 +11,11 @@ use mio::{Token, net::TcpStream};
 
 use crate::{
     bitfield::Bitfield,
+    bytespeed::ByteSpeed,
     inflight::InFlight,
     pending_requests::{BlockKey, PendingRequests},
     picker,
+    rate_limiter::RateLimiter,
 };
 
 /// Represents a message exchanged between BitTorrent peers
@@ -68,7 +71,7 @@ pub enum PeerMessage {
     /// * `index` - Piece index of the block.
     /// * `begin` - Offset within the piece.
     /// * `block` - The actual bytes of data being sent.
-    Piece((u32, u32, Vec<u8>)),
+    Piece((u32, u32, Arc<Vec<u8>>)),
 
     /// Cancels a previously sent `Request`.
     ///
@@ -204,7 +207,7 @@ impl PeerMessage {
                 let index = u32::from_be_bytes(data[0..4].try_into()?);
                 let begin = u32::from_be_bytes(data[4..8].try_into()?);
                 let block = data[8..].to_vec();
-                PeerMessage::Piece((index, begin, block))
+                PeerMessage::Piece((index, begin, Arc::new(block)))
             }
             8 => {
                 let index = u32::from_be_bytes(data[0..4].try_into()?);
@@ -231,13 +234,13 @@ pub enum MessageHandle {
     Piece {
         piece: usize,
         offset: usize,
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
     },
     Bitfield {
-        bitfield: Bitfield,
+        bitfield: Arc<Bitfield>,
     },
     Have {
-        bitfield: Bitfield,
+        bitfield: Arc<Bitfield>,
     },
     Unchoke,
 }
@@ -255,18 +258,18 @@ pub struct Peer {
     inflight: InFlight,
     pending: PendingRequests,
     token: Token,
-    speed: f64,
+    speed: ByteSpeed,
     last_keepalive: Instant,
-    last_speed_update: Instant,
-    bytes_since_last_update: usize,
     timeout: Duration,
     rtt: Option<Duration>,
+    rttvar: Option<Duration>,
     rtt_alpha: f64,
     max_inflight_piece_blocks: usize,
 }
 
 const READ_CHUNK: usize = 16 * 1024;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_mins(2);
+const MIN_RTT: Duration = Duration::from_millis(20);
 
 impl Peer {
     pub fn new(stream: TcpStream, total_pieces: usize, token: Token) -> io::Result<Self> {
@@ -285,37 +288,36 @@ impl Peer {
             inflight: InFlight::default(),
             pending: PendingRequests::new(),
             token,
-            speed: 1024.0,
+            speed: ByteSpeed::new(Duration::from_millis(200), true, 0.02),
             last_keepalive: now,
-            last_speed_update: now,
-            bytes_since_last_update: 0,
             timeout: Duration::from_secs(3),
             rtt: None,
+            rttvar: None,
             rtt_alpha: 0.2,
-            max_inflight_piece_blocks: 16,
+            max_inflight_piece_blocks: 32,
         })
     }
 
     fn update_adaptive_timeout(&mut self) {
-        const MULTIPLIER: f64 = 1.5;
         const MIN_TIMEOUT: Duration = Duration::from_secs(1);
-        const MAX_TIMEOUT: Duration = Duration::from_secs(30);
+        const MAX_TIMEOUT: Duration = Duration::from_secs(10);
 
-        let rtt = self.rtt.unwrap_or(Duration::from_millis(100));
-        let speed = self.speed.max(1024.0);
-        let transfer_time = picker::BLOCK_SIZE as f64 / speed;
-
-        let desired_timeout =
-            Duration::from_secs_f64(MULTIPLIER * transfer_time + rtt.as_secs_f64());
-        self.timeout = desired_timeout.clamp(MIN_TIMEOUT, MAX_TIMEOUT);
+        let rtt = self.rtt.unwrap_or(MIN_RTT);
+        let rttvar = self.rttvar.unwrap_or(rtt / 2);
+        let desired_timeout = rtt + rttvar.mul_f64(4.0);
+        let timeout = desired_timeout.clamp(MIN_TIMEOUT, MAX_TIMEOUT);
+        self.timeout = timeout;
     }
 
     fn update_max_inflight_piece_blocks(&mut self) {
-        const MIN_BLOCKS: usize = 16;
-        const MAX_BLOCKS: usize = 128;
-        let rtt = self.rtt.unwrap_or(Duration::from_millis(100)).as_secs_f64();
-        let speed = self.speed.max(1024.0);
-        let max_inflight_piece_blocks = ((speed * rtt) / picker::BLOCK_SIZE as f64).ceil() as usize;
+        const MIN_BLOCKS: usize = 32;
+        const MAX_BLOCKS: usize = 512;
+        let rtt = self.rtt.unwrap_or(MIN_RTT);
+        let rttvar = self.rttvar.unwrap_or(rtt / 2);
+        let effective_rtt = rtt + rttvar.mul_f64(0.5);
+        let speed = self.speed.avg_speed.max(1.0);
+        let max_inflight_piece_blocks =
+            ((speed * effective_rtt.as_secs_f64()) / picker::BLOCK_SIZE as f64).ceil() as usize;
         self.max_inflight_piece_blocks = max_inflight_piece_blocks.clamp(MIN_BLOCKS, MAX_BLOCKS)
     }
 
@@ -331,7 +333,7 @@ impl Peer {
     }
 
     pub fn timeout(&self) -> Duration {
-        self.timeout.max(Duration::from_secs(1))
+        self.timeout
     }
 
     pub fn addr(&self) -> &SocketAddr {
@@ -347,12 +349,10 @@ impl Peer {
     }
 
     pub fn speed(&self) -> f64 {
-        self.speed
+        self.speed.avg_speed
     }
 
     pub fn enqueue_message(&mut self, message: &PeerMessage) {
-        let encoded = message.encode();
-        self.write_queue.push_back(encoded);
         match message {
             PeerMessage::Request((piece, offset, len)) => {
                 self.inflight.add(*len as usize);
@@ -364,9 +364,12 @@ impl Peer {
             }
             _ => {}
         }
+        let encoded = message.encode();
+        self.write_queue.push_back(encoded);
     }
 
-    pub fn socket_write(&mut self, mut budget: usize) -> io::Result<usize> {
+    pub fn socket_write(&mut self, limiter: &mut RateLimiter) -> io::Result<usize> {
+        let mut budget = limiter.allow(self.max_inflight_piece_blocks * picker::BLOCK_SIZE);
         let mut written = 0;
         while budget > 0 {
             let Some(front) = self.write_queue.front_mut() else {
@@ -398,12 +401,24 @@ impl Peer {
         Ok(written)
     }
 
-    pub fn socket_read(&mut self, mut budget: usize, max_reads: usize) -> io::Result<usize> {
+    pub fn socket_read(
+        &mut self,
+        limiter: &mut RateLimiter,
+        max_reads: usize,
+    ) -> io::Result<usize> {
+        const DEFAULT_MAX_TO_READ: usize = 128 * 1024;
+        let max_to_read = limiter.allow(DEFAULT_MAX_TO_READ);
+        if max_to_read == 0 {
+            eprintln!("{} is not allowed to read at the moment", self.addr);
+            return Ok(0);
+        }
         let mut total = 0;
         let mut reads = 0;
         let mut buf = [0u8; READ_CHUNK];
-        while budget > 0 && reads < max_reads {
-            let to_read = budget.min(buf.len());
+        let mut budget = max_to_read;
+        while budget > 0 && reads < max_reads && total < max_to_read {
+            let remaining_bytes = max_to_read.saturating_sub(total);
+            let to_read = budget.min(buf.len()).min(remaining_bytes);
             match self.stream.read(&mut buf[..to_read]) {
                 Ok(0) => {
                     return Err(io::Error::new(
@@ -425,6 +440,10 @@ impl Peer {
         Ok(total)
     }
 
+    pub fn can_drain(&self) -> bool {
+        self.read_buf.len() >= 4
+    }
+
     pub fn drain_messages<F>(
         &mut self,
         mut message_handle: F,
@@ -432,17 +451,21 @@ impl Peer {
     where
         F: FnMut(MessageHandle),
     {
-        const MAX_MESSAGES_PER_READ: usize = 8;
+        const DEFAULT_MAX_BYTES_PER_READ: usize = 64 * 1024;
         let mut offset = 0;
         let buf_len = self.read_buf.len();
-        let mut read = 0;
-        while read < MAX_MESSAGES_PER_READ {
-            if buf_len - offset < 4 {
+        let mut bytes_read = 0;
+        let mut messages_read = 0;
+        let max_bytes_per_read =
+            (self.max_inflight_piece_blocks * picker::BLOCK_SIZE).min(DEFAULT_MAX_BYTES_PER_READ);
+        let max_messages_per_read = (self.max_inflight_piece_blocks / 2).clamp(16, 128);
+        while messages_read < max_messages_per_read && bytes_read < max_bytes_per_read {
+            if buf_len.saturating_sub(offset) < 4 {
                 break;
             }
 
             let len = u32::from_be_bytes(self.read_buf[offset..offset + 4].try_into()?) as usize;
-            if buf_len - offset < 4 + len {
+            if buf_len.saturating_sub(offset) < 4 + len {
                 break;
             }
 
@@ -457,7 +480,8 @@ impl Peer {
             }
 
             offset = payload_end;
-            read += 1;
+            messages_read += 1;
+            bytes_read += 4 + len;
         }
 
         if offset > 0 {
@@ -488,13 +512,13 @@ impl Peer {
                 let piece = piece as usize;
                 self.bitfield.set(&piece, true);
                 return Some(MessageHandle::Have {
-                    bitfield: self.bitfield.clone(),
+                    bitfield: Arc::new(self.bitfield.clone()),
                 });
             }
             PeerMessage::Bitfield(bitfield) => {
                 self.bitfield.merge(&bitfield);
                 return Some(MessageHandle::Bitfield {
-                    bitfield: self.bitfield.clone(),
+                    bitfield: Arc::new(self.bitfield.clone()),
                 });
             }
             PeerMessage::Request((piece, offset, len)) => {
@@ -553,29 +577,37 @@ impl Peer {
     }
 
     fn update_speed(&mut self, bytes: usize) {
-        self.bytes_since_last_update += bytes;
-
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_speed_update).as_secs_f64();
-
-        if elapsed >= 1.0 {
-            self.speed = self.bytes_since_last_update as f64 / elapsed;
-            self.bytes_since_last_update = 0;
-            self.last_speed_update = now;
-        }
+        self.speed.update(bytes);
     }
 
     fn update_rtt(&mut self, sample: Option<Duration>) {
+        const MIN_RTT: Duration = Duration::from_millis(20);
+        const MAX_RTT: Duration = Duration::from_secs(2);
         let sample = match sample {
-            Some(s) => s,
+            Some(s) => s.clamp(MIN_RTT, MAX_RTT),
             None => return,
         };
-        self.rtt = Some(match self.rtt {
-            Some(prev) => Duration::from_secs_f64(
-                self.rtt_alpha * sample.as_secs_f64() + (1.0 - self.rtt_alpha) * prev.as_secs_f64(),
-            ),
-            None => sample,
-        });
+        match (self.rtt, self.rttvar) {
+            (Some(rtt), Some(rttvar)) => {
+                let alpha = self.rtt_alpha;
+                let beta = 0.25;
+
+                let rtt_secs = rtt.as_secs_f64();
+                let sample_secs = sample.as_secs_f64();
+
+                let new_rtt = alpha * sample_secs + (1.0 - alpha) * rtt_secs;
+
+                let deviation = (sample_secs - rtt_secs).abs();
+                let new_rttvar = beta * deviation + (1.0 - beta) * rttvar.as_secs_f64();
+
+                self.rtt = Some(Duration::from_secs_f64(new_rtt));
+                self.rttvar = Some(Duration::from_secs_f64(new_rttvar));
+            }
+            _ => {
+                self.rtt = Some(sample);
+                self.rttvar = Some(sample / 2);
+            }
+        }
     }
 
     pub fn is_choked(&self) -> bool {

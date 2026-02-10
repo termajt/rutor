@@ -4,7 +4,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
-        mpsc::{Receiver, RecvTimeoutError, Sender},
+        mpsc::{Receiver, Sender},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -16,13 +16,12 @@ use crate::{
     connection::ConnectionManager,
     disk::DiskManager,
     hasher::Hasher,
-    peer::PeerMessage,
-    picker::PiecePicker,
+    peer::{MessageHandle, PeerMessage},
+    picker::{self, PiecePicker},
     torrent::Torrent,
 };
 
 use rand::{Rng, distr::Alphanumeric};
-use threadpool::ThreadPool;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -33,7 +32,7 @@ pub enum Event {
     Stop,
     CompareBitfield {
         addr: SocketAddr,
-        bitfield: Bitfield,
+        bitfield: Arc<Bitfield>,
     },
     DiskStats {
         files: Vec<(PathBuf, u64, u64)>,
@@ -60,8 +59,11 @@ pub enum IoTask {
     WriteToDisk {
         piece: usize,
         offset: usize,
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
         complete: bool,
+    },
+    PrepareHash {
+        piece: usize,
     },
     Stop,
     CalculateFileStats {
@@ -111,6 +113,23 @@ pub enum PeerIoTask {
         piece: usize,
     },
     StatsUpdate,
+    MessageHandle {
+        addr: SocketAddr,
+        message_handle: Arc<MessageHandle>,
+    },
+    Drain {
+        addr: SocketAddr,
+    },
+}
+
+#[derive(Debug)]
+pub enum HashTask {
+    Piece {
+        piece: usize,
+        data: Arc<Vec<u8>>,
+        is_last: bool,
+    },
+    Stop,
 }
 
 #[derive(Debug)]
@@ -254,6 +273,7 @@ pub struct Engine {
     read_limit_bytes_per_sec: usize,
     write_limit_bytes_per_sec: usize,
     join_handles: Vec<JoinHandle<()>>,
+    hash_tx: Sender<HashTask>,
 }
 
 impl Engine {
@@ -266,6 +286,7 @@ impl Engine {
         announce_io_tx: Sender<AnnounceIoTask>,
         read_limit_bytes_per_sec: usize,
         write_limit_bytes_per_sec: usize,
+        hash_tx: Sender<HashTask>,
     ) -> Self {
         let announce_mgr = AnnounceManager::new(&torrent);
         let bitfield = Bitfield::new(torrent.info.piece_hashes.len());
@@ -285,6 +306,7 @@ impl Engine {
             read_limit_bytes_per_sec,
             write_limit_bytes_per_sec,
             join_handles: Vec::new(),
+            hash_tx,
         }
     }
 
@@ -396,6 +418,7 @@ impl Engine {
         io_rx: Receiver<IoTask>,
         peer_io_rx: Receiver<PeerIoTask>,
         announce_io_rx: Receiver<AnnounceIoTask>,
+        hash_rx: Receiver<HashTask>,
     ) {
         self.join_handles.push(self.start_disk_thread(io_rx));
         self.join_handles.push(self.start_tick_thread());
@@ -403,6 +426,7 @@ impl Engine {
             .push(self.start_peer_io_thread(peer_io_rx));
         self.join_handles
             .push(self.start_announce_io_thread(announce_io_rx));
+        self.join_handles.push(self.start_hash_thread(hash_rx));
     }
 
     pub fn stop(&self) {
@@ -411,7 +435,43 @@ impl Engine {
             let _ = self.io_tx.send(IoTask::Stop);
             let _ = self.peer_io_tx.send(PeerIoTask::Stop);
             let _ = self.announce_io_tx.send(AnnounceIoTask::Stop);
+            let _ = self.hash_tx.send(HashTask::Stop);
         }
+    }
+
+    fn start_hash_thread(&self, hash_rx: Receiver<HashTask>) -> JoinHandle<()> {
+        let event_tx = self.event_tx.clone();
+        let expected_hashes = self.torrent.info.piece_hashes.clone();
+        let peer_io_tx = self.peer_io_tx.clone();
+        let shutdown_state = self.shutdown_state.clone();
+        std::thread::spawn(move || {
+            let mut hasher = Hasher::new(expected_hashes, event_tx, peer_io_tx);
+            loop {
+                if shutdown_state.is_draining() || shutdown_state.is_terminated() {
+                    break;
+                }
+                match hash_rx.recv() {
+                    Ok(ev) => match ev {
+                        HashTask::Piece {
+                            piece,
+                            data,
+                            is_last,
+                        } => {
+                            hasher.update_hash(piece, &data);
+                            if is_last {
+                                hasher.finalize(piece);
+                            }
+                        }
+                        HashTask::Stop => break,
+                    },
+                    Err(e) => {
+                        eprintln!("hash rx error: {}", e);
+                        break;
+                    }
+                }
+            }
+            eprintln!("exiting hasher thread");
+        })
     }
 
     fn start_disk_thread(&self, io_rx: Receiver<IoTask>) -> JoinHandle<()> {
@@ -421,12 +481,10 @@ impl Engine {
         let total_size = self.torrent.info.total_size;
         let piece_length = self.torrent.info.piece_length as usize;
         let files = self.torrent.info.files.clone();
-        let expected_hashes = self.torrent.info.piece_hashes.clone();
-        let peer_io_tx = self.peer_io_tx.clone();
+        let io_tx = self.io_tx.clone();
+        let hash_tx = self.hash_tx.clone();
         std::thread::spawn(move || {
-            let verifier_pool = create_verifier_pool();
             let mut disk_mgr = DiskManager::new(total_pieces, total_size, piece_length, files);
-            let hasher = Arc::new(Hasher::new(expected_hashes, event_tx.clone(), peer_io_tx));
             loop {
                 if shutdown_state.is_draining() || shutdown_state.is_terminated() {
                     break;
@@ -450,26 +508,13 @@ impl Engine {
                                 continue;
                             }
                             if complete {
+                                let _ = io_tx.send(IoTask::PrepareHash { piece });
                                 if let Err(e) = disk_mgr.flush_piece(piece) {
                                     eprintln!(
                                         "failed to flush piece {} to disk before verification: {}",
                                         piece, e
                                     );
                                     continue;
-                                }
-                                match disk_mgr.read_piece(piece) {
-                                    Ok(data) => {
-                                        let hasher = hasher.clone();
-                                        verifier_pool.execute(move || {
-                                            hasher.hash_verify_piece(piece, &data);
-                                        });
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "failed to read piece {} from disk for verification: {}",
-                                            piece, e
-                                        );
-                                    }
                                 }
                             }
                         }
@@ -495,6 +540,28 @@ impl Engine {
                                 .collect();
                             let _ = event_tx.send(Event::DiskStats { files });
                         }
+                        IoTask::PrepareHash { piece } => {
+                            if let Err(e) = disk_mgr.flush_piece(piece) {
+                                eprintln!("failed to flush piece {}: {}", piece, e);
+                                continue;
+                            }
+                            let result = disk_mgr.read_piece_chunks(
+                                piece,
+                                picker::BLOCK_SIZE,
+                                |data, is_last| {
+                                    let data = Arc::new(data);
+                                    let _ = hash_tx.send(HashTask::Piece {
+                                        piece,
+                                        data,
+                                        is_last,
+                                    });
+                                    Ok(())
+                                },
+                            );
+                            if let Err(e) = result {
+                                eprintln!("failed to read chunks for piece {}: {}", piece, e);
+                            }
+                        }
                     },
                     Err(e) => {
                         eprintln!("disk io rx error: {}", e);
@@ -503,7 +570,6 @@ impl Engine {
                 }
             }
             eprintln!("exiting disk thread");
-            verifier_pool.join();
         })
     }
 
@@ -563,27 +629,18 @@ impl Engine {
                     return;
                 }
             };
-            let mut stop_received = false;
             while !shutdown_state.is_terminated() {
-                match peer_io_rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(PeerIoTask::Stop) => {
-                        eprintln!("stop received, break out?!");
-                        stop_received = true;
-                    }
-                    Ok(ev) => {
-                        if stop_received {
-                            eprintln!("Event after stop?!");
+                while let Ok(ev) = peer_io_rx.try_recv() {
+                    match ev {
+                        PeerIoTask::Stop => {
+                            connection_mgr.handle_event(ev);
+                            break;
                         }
-                        connection_mgr.handle_event(ev);
+                        _ => connection_mgr.handle_event(ev),
                     }
-                    Err(RecvTimeoutError::Disconnected) => break,
-                    Err(RecvTimeoutError::Timeout) => {}
                 }
-                match connection_mgr.poll_peers() {
-                    Ok(addrs) if !addrs.is_empty() => {
-                        connection_mgr.drain_peer_messages(addrs);
-                    }
-                    _ => {}
+                if let Err(e) = connection_mgr.poll_peers() {
+                    eprintln!("failed to poll peers: {}", e);
                 }
             }
             eprintln!("joining connection manager...");
@@ -706,11 +763,4 @@ fn generate_peer_id() -> [u8; 20] {
     }
 
     peer_id
-}
-
-fn create_verifier_pool() -> ThreadPool {
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    ThreadPool::with_name("verifier_pool".to_string(), num_threads * 2 + 1)
 }
