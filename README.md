@@ -69,6 +69,7 @@ This project uses a few well-established Rust crates:
 | [`bytes`](https://crates.io/crates/bytes) | Efficient byte buffers for network IO | [Docs](https://docs.rs/bytes) |
 | [`flexi_logger`](https://crates.io/crates/flexi_logger) | Logging with rotation, file output, and configurable verbosity | [Docs](https://docs.rs/flexi_logger) |
 | [`log`](https://crates.io/crates/log) | Standard logging facade for Rust | [Docs](https://docs.rs/log) |
+| [`urlencoding`](https://crates.io/crates/urlencoding) | Percent-encoding for tracker announce URLs | [Docs](https://docs.rs/urlencoding) |
 
 ## Notes
 

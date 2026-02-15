@@ -2,7 +2,9 @@ use flexi_logger::{Age, Cleanup, Criterion, DeferredNow, FileSpec, Logger, Namin
 use log::{LevelFilter, Record};
 use rutor::bytespeed::ByteSpeed;
 use rutor::engine::{Engine, EngineStats, Tick, duration_to_ticks};
+use rutor::magnet::MagnetLink;
 use rutor::net::MAX_CONNECTIONS;
+use rutor::torrent::Torrent;
 use rutor::{BLOCK_SIZE, torrent};
 use std::env;
 use std::fs::File;
@@ -10,6 +12,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use sysinfo::{Pid, System};
+
+#[derive(Debug)]
+enum InputSource {
+    TorrentFile(PathBuf),
+    Magnet(MagnetLink),
+}
 
 struct ProgressTracker {
     name: String,
@@ -433,6 +441,20 @@ fn init_logger(level: LevelFilter) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn detect_input(s: &str) -> Result<InputSource, Box<dyn std::error::Error>> {
+    if s.starts_with("magnet:?") {
+        return Ok(InputSource::Magnet(MagnetLink::parse(s)?));
+    }
+
+    let path = Path::new(s);
+
+    if path.exists() && path.is_file() {
+        Ok(InputSource::TorrentFile(path.to_path_buf()))
+    } else {
+        Err(format!("'{}' is neither a magnet link nor a torrent file", s).into())
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<String>>();
     let program = Path::new(&args[0])
@@ -507,20 +529,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if filename.is_empty() {
-        let mut stderr = std::io::stderr();
-        print_usage_header(&mut stderr, &program);
-        return Err("missing torrent file".into());
+        print_usage_header(&mut std::io::stderr(), &program);
+        return Err("missing torrent file or magnet link".into());
     }
 
     let log_level = parse_verbosity(verbosity_level);
     init_logger(log_level)?;
 
+    let input_source = detect_input(&filename)?;
+    let mut torrent: Torrent;
+    match input_source {
+        InputSource::TorrentFile(path) => {
+            torrent = {
+                let file = File::open(path)?;
+                torrent::Torrent::from_file(&file, destination)?
+            };
+        }
+        InputSource::Magnet(magnet) => {
+            println!("Fetching torrent metadata...");
+            let torrent_bencode = magnet.fetch()?;
+            torrent = torrent::Torrent::from_bencode(torrent_bencode, destination)?;
+            torrent.add_trackers(magnet.trackers());
+            println!("OK!");
+        }
+    }
+
+    start_engine(
+        torrent,
+        max_read_bytes_per_sec,
+        max_write_bytes_per_sec,
+        show_consumption,
+    )?;
+
+    Ok(())
+}
+
+fn start_engine(
+    torrent: Torrent,
+    max_read_bytes_per_sec: usize,
+    max_write_bytes_per_sec: usize,
+    show_consumption: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let pid = sysinfo::get_current_pid()?;
     let mut system = System::new_all();
-    let torrent: torrent::Torrent = {
-        let file = File::open(filename)?;
-        torrent::Torrent::from_file(&file, destination)?
-    };
     let total_pieces = torrent.info.piece_hashes.len();
     let total_size = torrent.info.total_size;
     let name = torrent.info.name.clone();
@@ -536,6 +587,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let progress_interval = duration_to_ticks(Duration::from_secs(1));
     let mut first_draw = true;
     log::debug!("Starting engine");
+    println!("Starting download...");
     engine.start(|now, stats| {
         if now % progress_interval == Tick(0) {
             if show_consumption {
@@ -550,6 +602,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::debug!("Joining engine");
     engine.join();
     progress_tracker.display_peak();
+    println!("Download complete!");
 
     Ok(())
 }

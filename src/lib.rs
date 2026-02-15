@@ -10,6 +10,7 @@ pub mod bitfield;
 pub mod bytespeed;
 pub mod disk;
 pub mod engine;
+pub mod magnet;
 pub mod net;
 pub mod peer;
 pub mod picker;
@@ -248,4 +249,14 @@ impl PeerMessage {
 
         Ok(msg)
     }
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    for b in bytes {
+        write!(&mut s, "{:02x}", b).unwrap();
+    }
+
+    s
 }

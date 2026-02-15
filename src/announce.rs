@@ -7,12 +7,14 @@ use std::{
     time::Duration,
 };
 
+use bytes::{BufMut, Bytes, BytesMut};
 use crossbeam::channel::{Receiver, Sender};
 use rand::RngCore;
 use reqwest::blocking::Client;
 
 use crate::bencode::{self, Bencode};
 use crate::engine::EngineEvent;
+use crate::to_hex;
 
 #[derive(Debug)]
 pub enum AnnounceEvent {
@@ -160,6 +162,7 @@ impl AnnounceManager {
         } else if let Some(url) = announce {
             tiers.push(vec![TrackerState::new(url.clone())]);
         }
+        log::debug!("trackers: {:?}", tiers);
 
         Self { tiers, join: None }
     }
@@ -197,6 +200,7 @@ impl AnnounceManager {
                             left,
                             respond_to,
                         } => {
+                            log::info!("performing announce for {}: {}", to_hex(&info_hash), url);
                             let result = announce(
                                 &url, &info_hash, &peer_id, 6881, uploaded, downloaded, left, None,
                                 None,
@@ -230,25 +234,6 @@ impl AnnounceManager {
         };
         let _ = join.join();
     }
-}
-
-fn percent_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 3);
-    for &b in bytes {
-        if (b'0'..=b'9').contains(&b)
-            || (b'a'..=b'z').contains(&b)
-            || (b'A'..=b'Z').contains(&b)
-            || b == b'-'
-            || b == b'.'
-            || b == b'_'
-            || b == b'~'
-        {
-            out.push(b as char);
-        } else {
-            write!(out, "%{b:02X}").unwrap();
-        }
-    }
-    out
 }
 
 fn parse_compact_peers(bytes: &[u8]) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error>> {
@@ -373,8 +358,8 @@ fn announce_http(
     write!(
         &mut url,
         "info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&compact=1",
-        percent_encode(info_hash),
-        percent_encode(peer_id),
+        urlencoding::encode_binary(info_hash), // percent_encode(info_hash),
+        urlencoding::encode_binary(peer_id),
         port,
         uploaded,
         downloaded,
@@ -420,15 +405,15 @@ fn announce_udp(
         .ok_or("invalid udp tracker address")?;
     let socket = UdpSocket::bind("0.0.0.0:0")?;
 
-    let mut buf = Vec::with_capacity(16);
+    let mut buf = BytesMut::with_capacity(16);
     let conn_id: u64 = 0x41727101980;
     let action_connect: u32 = 0;
     let transaction_id: u32 = rand::rng().next_u32();
 
-    buf.extend_from_slice(&conn_id.to_be_bytes());
-    buf.extend_from_slice(&action_connect.to_be_bytes());
-    buf.extend_from_slice(&transaction_id.to_be_bytes());
-    send_all(&mut buf, &socket, tracker_addr, timeout)?;
+    buf.put_u64(conn_id);
+    buf.put_u32(action_connect);
+    buf.put_u32(transaction_id);
+    send_all(buf.freeze(), &socket, tracker_addr, timeout)?;
 
     let resp = recv_packet(&socket, timeout)?;
     if resp.len() < 16 {
@@ -458,21 +443,21 @@ fn announce_udp(
         event_code = 0;
     }
 
-    let mut req = Vec::with_capacity(98);
-    req.extend_from_slice(&connection_id.to_be_bytes());
-    req.extend_from_slice(&action_announce.to_be_bytes());
-    req.extend_from_slice(&transaction_id.to_be_bytes());
+    let mut req = BytesMut::with_capacity(98);
+    req.put_u64(connection_id);
+    req.put_u32(action_announce);
+    req.put_u32(transaction_id);
     req.extend_from_slice(info_hash);
     req.extend_from_slice(peer_id);
-    req.extend_from_slice(&downloaded.to_be_bytes());
-    req.extend_from_slice(&left.to_be_bytes());
-    req.extend_from_slice(&uploaded.to_be_bytes());
-    req.extend_from_slice(&event_code.to_be_bytes());
-    req.extend_from_slice(&0u32.to_be_bytes());
-    req.extend_from_slice(&rand::rng().next_u32().to_be_bytes());
-    req.extend_from_slice(&(-1i32).to_be_bytes());
-    req.extend_from_slice(&port.to_be_bytes());
-    send_all(&mut req, &socket, tracker_addr, timeout)?;
+    req.put_u64(downloaded);
+    req.put_u64(left);
+    req.put_u64(uploaded);
+    req.put_u32(event_code);
+    req.put_u32(0);
+    req.put_u32(rand::rng().next_u32());
+    req.put_i32(-1);
+    req.put_u16(port);
+    send_all(req.freeze(), &socket, tracker_addr, timeout)?;
 
     let resp = recv_packet(&socket, timeout)?;
     if resp.len() < 20 {
@@ -501,7 +486,7 @@ fn announce_udp(
 }
 
 fn send_all(
-    data: &mut Vec<u8>,
+    data: Bytes,
     socket: &UdpSocket,
     addr: SocketAddr,
     timeout: Duration,
@@ -511,12 +496,11 @@ fn send_all(
     Ok(())
 }
 
-fn recv_packet(
-    socket: &UdpSocket,
-    timeout: Duration,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+fn recv_packet(socket: &UdpSocket, timeout: Duration) -> Result<Bytes, Box<dyn std::error::Error>> {
     socket.set_read_timeout(Some(timeout))?;
     let mut buf = [0u8; 2048];
     let (n, _) = socket.recv_from(&mut buf)?;
-    Ok(buf[..n].to_vec())
+    let data = Bytes::copy_from_slice(&buf[..n]);
+
+    Ok(data)
 }

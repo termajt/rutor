@@ -232,6 +232,27 @@ impl Torrent {
         let bencode = bencode::decode_from_reader(reader)?;
         Torrent::from_bencode(bencode, destination)
     }
+
+    pub fn add_trackers(&mut self, trackers: Vec<String>) {
+        if trackers.is_empty() {
+            return;
+        }
+
+        if self.announce_list.is_empty() {
+            self.announce_list.push(Vec::new());
+        }
+
+        let tier = &mut self.announce_list[0];
+        for tracker in trackers {
+            if !tier.iter().any(|t| t == &tracker) {
+                tier.push(tracker.clone());
+            }
+
+            if self.announce.is_none() {
+                self.announce = Some(tracker);
+            }
+        }
+    }
 }
 
 fn compute_info_hash(binfo: &Bencode) -> Result<[u8; 20], Error> {
