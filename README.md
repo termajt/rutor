@@ -43,6 +43,8 @@ Usage: rutor [OPTIONS...] <torrent-file>
 OPTIONS:
   -d/--destination    destination folder of where the torrent should be downloaded to
   -c/--consumption    shows cpu and memory consumption used by the client
+  -r/--max-read       maximum read bytes per second (e.g., 1024, 1MB, 2.5MB)
+  -w/--max-write      maximum write bytes per second (e.g., 1024, 1MB, 2.5MB)
   -h/--help           shows this help message and exits
 ```
 

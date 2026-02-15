@@ -311,9 +311,43 @@ fn print_usage<W: Write>(writer: &mut W, prog: &str) {
         "  -d/--destination    destination folder of where the torrent should be downloaded to\n",
     );
     usage.push_str("  -c/--consumption    shows cpu and memory consumption used by the client\n");
+    usage
+        .push_str("  -r/--max-read       maximum read bytes per second (e.g., 1024, 1MB, 2.5MB)\n");
+    usage.push_str(
+        "  -w/--max-write      maximum write bytes per second (e.g., 1024, 1MB, 2.5MB)\n",
+    );
     usage.push_str("  -h/--help           shows this help message and exits");
 
     let _ = writeln!(writer, "{}", usage);
+}
+
+fn parse_bytes(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty string".into());
+    }
+
+    let mut chars = s.chars();
+    let mut number_str = String::new();
+    while let Some(c) = chars.next() {
+        if c.is_digit(10) || c == '.' {
+            number_str.push(c);
+        } else {
+            let unit = format!("{}{}", c, chars.as_str()).to_uppercase();
+            let number: f64 = number_str.parse()?;
+            return Ok(match unit.as_str() {
+                "B" => number as usize,
+                "KB" => (number * 1024.0) as usize,
+                "MB" => (number * 1024.0 * 1024.0) as usize,
+                "GB" => (number * 1024.0 * 1024.0 * 1024.0) as usize,
+                "" => number as usize,
+                _ => return Err(format!("unknown unit '{}'", unit).into()),
+            });
+        }
+    }
+
+    let number: f64 = number_str.parse()?;
+    Ok(number as usize)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -327,6 +361,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut filename = String::new();
     let mut destination: Option<PathBuf> = None;
     let mut show_consumption = false;
+    let mut max_read_bytes_per_sec = 0;
+    let mut max_write_bytes_per_sec = 0;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -344,6 +380,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "-c" | "--consumption" => {
                 show_consumption = true;
+            }
+            "-r" | "--max-read" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("max-read value not provided".into());
+                }
+                match parse_bytes(&args[i]) {
+                    Ok(n) => max_read_bytes_per_sec = n,
+                    Err(e) => {
+                        eprintln!("failed to parse '{}' as max read bytes: {}", args[i], e);
+                        return Err(e);
+                    }
+                }
+            }
+            "-w" | "--max-write" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("max-write value not provided".into());
+                }
+                match parse_bytes(&args[i]) {
+                    Ok(n) => max_write_bytes_per_sec = n,
+                    Err(e) => {
+                        eprintln!("failed to parse '{}' as max write bytes: {}", args[i], e);
+                        return Err(e);
+                    }
+                }
             }
             arg if filename.is_empty() => {
                 filename = arg.to_string();
@@ -372,7 +434,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_pieces = torrent.info.piece_hashes.len();
     let total_size = torrent.info.total_size;
     let name = torrent.info.name.clone();
-    let mut engine = Engine::new(torrent, 0, 0)?;
+    let mut engine = Engine::new(torrent, max_read_bytes_per_sec, max_write_bytes_per_sec)?;
     let mut progress_tracker = ProgressTracker::new(
         &name,
         total_size,
