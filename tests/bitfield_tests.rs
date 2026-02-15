@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use rutor::bitfield::Bitfield;
 
 #[test]
@@ -6,7 +7,7 @@ fn test_new_bitfield() {
     for i in 0..10 {
         assert!(!bf.get(&i));
     }
-    assert_eq!(bf.as_bytes().len(), 2);
+    assert_eq!(bf.freeze().len(), 2);
 }
 
 #[test]
@@ -44,7 +45,7 @@ fn test_as_bytes() {
     bf.set(&3, true);
     bf.set(&9, true);
 
-    let bytes = bf.as_bytes();
+    let bytes = bf.freeze();
     // Expect first byte: 10010000 = 0x90, second byte: 10000000 = 0x80
     assert_eq!(bytes[0], 0b10010000);
     assert_eq!(bytes[1], 0b01000000);
@@ -52,7 +53,7 @@ fn test_as_bytes() {
 
 #[test]
 fn test_from_bytes() {
-    let bytes = vec![0b10101010, 0b11000000];
+    let bytes = Bytes::from(vec![0b10101010, 0b11000000]);
     let bf = Bitfield::from_bytes(bytes.clone(), 10);
 
     // Check specific bits
@@ -68,7 +69,7 @@ fn test_from_bytes() {
     assert!(bf.get(&9));
 
     // Check that bytes are preserved
-    assert_eq!(bf.as_bytes(), &bytes);
+    assert_eq!(bf.freeze(), &bytes);
 }
 
 #[test]

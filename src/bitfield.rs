@@ -1,3 +1,5 @@
+use bytes::{Bytes, BytesMut};
+
 /// A `Bitfield` represents which pieces a BitTorrent peer has downloaded.
 ///
 /// Each piece is represented by a single bit: `1` if the piece is available,
@@ -5,7 +7,7 @@
 /// following the BitTorrent wire protocol specification.
 #[derive(Clone)]
 pub struct Bitfield {
-    bits: Vec<u8>,
+    bits: BytesMut,
     length: usize,
 }
 
@@ -27,10 +29,9 @@ impl Bitfield {
     /// * `length` - Total number of pieces in the torrent.
     pub fn new(length: usize) -> Self {
         let byte_len = (length + 7) / 8;
-        Self {
-            bits: vec![0; byte_len],
-            length: length,
-        }
+        let mut bits = BytesMut::with_capacity(byte_len);
+        bits.resize(byte_len, 0);
+        Self { bits, length }
     }
 
     pub fn has_any_zero(&self) -> bool {
@@ -74,12 +75,11 @@ impl Bitfield {
     /// # Panics
     ///
     /// Panics if `bytes.len()` is insufficient for the given length.
-    pub fn from_bytes(bytes: Vec<u8>, length: usize) -> Self {
+    pub fn from_bytes(bytes: Bytes, length: usize) -> Self {
         assert!(bytes.len() >= (length + 7) / 8, "not enough bytes");
-        Self {
-            bits: bytes,
-            length: length,
-        }
+        let mut bits = BytesMut::with_capacity(bytes.len());
+        bits.extend_from_slice(&bytes);
+        Self { bits, length }
     }
 
     /// Sets the bit corresponding to the given piece index.
@@ -132,11 +132,8 @@ impl Bitfield {
         result
     }
 
-    /// Returns the underlying bytes of the bitfield.
-    ///
-    /// Useful for sending the bitfield over the wire in BitTorrent messages.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bits
+    pub fn freeze(&self) -> Bytes {
+        self.bits.clone().freeze()
     }
 
     pub fn bits_len(&self) -> usize {

@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use crossbeam::channel::{Receiver, Sender};
 use mio::{Events, Interest, Poll, Token, net::TcpStream};
 
@@ -83,14 +83,21 @@ struct Connection {
     addr: SocketAddr,
     token: Token,
     socket: TcpStream,
-    outgoing: VecDeque<BytesMut>,
+    outgoing: VecDeque<Bytes>,
     incoming: BytesMut,
     connecting: bool,
     connect_deadline: Tick,
+    last_interest: Interest,
 }
 
 impl Connection {
-    fn new(addr: SocketAddr, token: Token, socket: TcpStream, current_tick: Tick) -> Self {
+    fn new(
+        addr: SocketAddr,
+        token: Token,
+        socket: TcpStream,
+        current_tick: Tick,
+        interest: Interest,
+    ) -> Self {
         Self {
             addr,
             token,
@@ -99,20 +106,29 @@ impl Connection {
             incoming: BytesMut::with_capacity(64 * 1024),
             connecting: true,
             connect_deadline: current_tick + CONNECTION_TIMEOUT,
+            last_interest: interest,
         }
     }
 
-    fn enqueue_message(&mut self, data: BytesMut) {
+    fn enqueue_message(&mut self, data: Bytes) {
         self.outgoing.push_back(data);
     }
 
     fn update_interest(&mut self, poll: &mut Poll) {
         let interest = self.interest();
-        if let Err(e) = poll
-            .registry()
-            .reregister(&mut self.socket, self.token, interest)
-        {
-            eprintln!("{} failed to reregister poll: {:?}", self.addr, e);
+
+        if interest != self.last_interest {
+            match poll
+                .registry()
+                .reregister(&mut self.socket, self.token, interest)
+            {
+                Ok(()) => {
+                    self.last_interest = interest;
+                }
+                Err(e) => {
+                    eprintln!("{} failed to reregister poll: {:?}", self.addr, e);
+                }
+            }
         }
     }
 
@@ -135,7 +151,7 @@ pub enum NetEvent {
     },
     Send {
         token: Token,
-        data: BytesMut,
+        data: Bytes,
     },
     Close {
         token: Token,
@@ -780,16 +796,13 @@ fn handle_connect(
     let mut stream =
         TcpStream::connect(addr).map_err(|err| NetError::ConnectFailure { addr, reason: err })?;
 
+    let interest = Interest::READABLE.add(Interest::WRITABLE);
     poll.registry()
-        .register(
-            &mut stream,
-            token,
-            Interest::READABLE.add(Interest::WRITABLE),
-        )
+        .register(&mut stream, token, interest)
         .map_err(|err| NetError::ConnectFailure { addr, reason: err })?;
 
     token_to_addr.insert(token, addr);
-    connections.insert(addr, Connection::new(addr, token, stream, now));
+    connections.insert(addr, Connection::new(addr, token, stream, now, interest));
 
     Ok(())
 }

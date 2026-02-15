@@ -1,6 +1,6 @@
 use std::{fmt, io};
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::bitfield::Bitfield;
 
@@ -12,7 +12,6 @@ pub mod disk;
 pub mod engine;
 pub mod net;
 pub mod peer;
-pub mod pending_requests;
 pub mod picker;
 pub mod rate_limiter;
 pub mod torrent;
@@ -118,70 +117,82 @@ impl fmt::Display for PeerMessage {
 }
 
 impl PeerMessage {
-    pub fn encode(&self) -> Vec<u8> {
-        match self {
-            PeerMessage::Choke => Self::encode_simple(0),
-            PeerMessage::Unchoke => Self::encode_simple(1),
-            PeerMessage::Interested => Self::encode_simple(2),
-            PeerMessage::NotInterested => Self::encode_simple(3),
+    pub fn encode(&self) -> Bytes {
+        let buf = match self {
+            PeerMessage::Choke => Self::simple(0),
+            PeerMessage::Unchoke => Self::simple(1),
+            PeerMessage::Interested => Self::simple(2),
+            PeerMessage::NotInterested => Self::simple(3),
             PeerMessage::Have(index) => {
-                let mut buf = Vec::with_capacity(9);
-                buf.extend_from_slice(&5u32.to_be_bytes());
-                buf.push(4);
-                buf.extend_from_slice(&index.to_be_bytes());
-                buf
+                let mut b = BytesMut::with_capacity(9);
+                b.put_u32(5);
+                b.put_u8(4);
+                b.put_u32(*index);
+                b
             }
             PeerMessage::Bitfield(bitfield) => {
-                let bytes = bitfield.as_bytes();
+                let bytes = bitfield.freeze();
                 let total_len = 1 + bytes.len();
-                let mut buf = Vec::with_capacity(4 + total_len);
-                buf.extend_from_slice(&(total_len as u32).to_be_bytes());
-                buf.push(5);
-                buf.extend_from_slice(bytes);
-                buf
+                let mut b = BytesMut::with_capacity(4 + total_len);
+                b.put_u32(total_len as u32);
+                b.put_u8(5);
+                b.extend_from_slice(&bytes);
+                b
             }
-            PeerMessage::Request((index, begin, length))
-            | PeerMessage::Cancel((index, begin, length)) => {
-                let id = if matches!(self, PeerMessage::Request(_)) {
-                    6
-                } else {
-                    8
-                };
-                let mut buf = Vec::with_capacity(17);
-                buf.extend_from_slice(&13u32.to_be_bytes());
-                buf.push(id);
-                buf.extend_from_slice(&index.to_be_bytes());
-                buf.extend_from_slice(&begin.to_be_bytes());
-                buf.extend_from_slice(&length.to_be_bytes());
-                buf
+            PeerMessage::Request((index, begin, length)) => {
+                let mut b = BytesMut::with_capacity(17);
+                b.put_u32(13);
+                b.put_u8(6);
+                b.put_u32(*index);
+                b.put_u32(*begin);
+                b.put_u32(*length);
+                b
             }
             PeerMessage::Piece((index, begin, block)) => {
                 let total_len = 1 + 8 + block.len();
-                let mut buf = Vec::with_capacity(4 + total_len);
-                buf.extend_from_slice(&(total_len as u32).to_be_bytes());
-                buf.push(7);
-                buf.extend_from_slice(&index.to_be_bytes());
-                buf.extend_from_slice(&begin.to_be_bytes());
-                buf.extend_from_slice(block);
-                buf
+                let mut b = BytesMut::with_capacity(4 + total_len);
+                b.put_u32(total_len as u32);
+                b.put_u8(7);
+                b.put_u32(*index);
+                b.put_u32(*begin);
+                b.unsplit(block.clone().into());
+                b
             }
             PeerMessage::Port(port) => {
-                let mut buf = Vec::with_capacity(7);
-                buf.extend_from_slice(&3u32.to_be_bytes());
-                buf.push(9);
-                buf.extend_from_slice(&port.to_be_bytes());
-                buf
+                let mut b = BytesMut::with_capacity(7);
+                b.put_u32(3);
+                b.put_u8(9);
+                b.put_u16(*port);
+                b
             }
-            PeerMessage::KeepAlive => 0u32.to_be_bytes().to_vec(),
-        }
+            PeerMessage::KeepAlive => {
+                let mut b = BytesMut::with_capacity(4);
+                b.put_u32(0);
+                b
+            }
+            PeerMessage::Cancel((index, begin, length)) => {
+                let mut b = BytesMut::with_capacity(17);
+                b.put_u32(13);
+                b.put_u8(8);
+                b.put_u32(*index);
+                b.put_u32(*begin);
+                b.put_u32(*length);
+                b
+            }
+        };
+
+        buf.freeze()
     }
 
-    fn encode_simple(id: u8) -> Vec<u8> {
-        vec![0, 0, 0, 1, id]
+    fn simple(id: u8) -> BytesMut {
+        let mut b = BytesMut::with_capacity(5);
+        b.put_u32(1);
+        b.put_u8(id);
+        b
     }
 
     pub fn parse(
-        payload: &[u8],
+        payload: Bytes,
         total_pieces: usize,
     ) -> Result<PeerMessage, Box<dyn std::error::Error>> {
         if payload.is_empty() {
@@ -189,7 +200,7 @@ impl PeerMessage {
         }
 
         let id = payload[0];
-        let data = &payload[1..];
+        let data = payload.slice(1..);
 
         let msg = match id {
             0 => PeerMessage::Choke,
@@ -205,7 +216,7 @@ impl PeerMessage {
                     )
                     .into());
                 }
-                PeerMessage::Bitfield(Bitfield::from_bytes(data.to_vec(), total_pieces))
+                PeerMessage::Bitfield(Bitfield::from_bytes(data, total_pieces))
             }
             6 => {
                 let index = u32::from_be_bytes(data[0..4].try_into()?);

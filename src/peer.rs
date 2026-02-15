@@ -108,7 +108,7 @@ struct Peer {
     bitfield: Option<Bitfield>,
     peer_id: Option<[u8; 20]>,
     incoming: BytesMut,
-    outgoing: VecDeque<BytesMut>,
+    outgoing: VecDeque<Bytes>,
     handshake_deadline: Tick,
     last_activity: Tick,
     last_outbound: Tick,
@@ -215,7 +215,7 @@ impl PeerManager {
         }
     }
 
-    fn build_handshake(&self) -> BytesMut {
+    fn build_handshake(&self) -> Bytes {
         let mut buf = BytesMut::with_capacity(68);
 
         buf.put_u8(19);
@@ -224,7 +224,7 @@ impl PeerManager {
         buf.extend_from_slice(&self.info_hash);
         buf.extend_from_slice(&self.peer_id);
 
-        buf
+        buf.freeze()
     }
 
     pub fn peer_count(&self) -> usize {
@@ -408,7 +408,7 @@ impl PeerManager {
         ]
     }
 
-    pub fn push_write(&mut self, token: &Token, data: BytesMut, now: Tick) -> Vec<PeerAction> {
+    pub fn push_write(&mut self, token: &Token, data: Bytes, now: Tick) -> Vec<PeerAction> {
         let peer = match self.peers.get_mut(token) {
             Some(p) => p,
             None => return vec![],
@@ -424,7 +424,7 @@ impl PeerManager {
         self.peers.remove(token).is_some()
     }
 
-    pub fn collect_outgoing(&mut self, token: &Token) -> Vec<BytesMut> {
+    pub fn collect_outgoing(&mut self, token: &Token) -> Vec<Bytes> {
         let peer = match self.peers.get_mut(token) {
             Some(p) => p,
             None => return vec![],
@@ -561,7 +561,8 @@ fn parse_messages(peer: &mut Peer, total_pieces: usize, now: Tick) -> Vec<PeerAc
             break;
         }
 
-        let len = u32::from_be_bytes(peer.incoming[..4].try_into().unwrap()) as usize;
+        let mut header = peer.incoming.clone();
+        let len = header.get_u32() as usize;
 
         if len > MAX_MESSAGE_LEN {
             eprintln!("{} invalid message length", peer.addr);
@@ -581,7 +582,7 @@ fn parse_messages(peer: &mut Peer, total_pieces: usize, now: Tick) -> Vec<PeerAc
 
         let payload = peer.incoming.split_to(len);
 
-        match PeerMessage::parse(&payload, total_pieces) {
+        match PeerMessage::parse(payload.freeze(), total_pieces) {
             Ok(msg) => {
                 handle_message(peer, msg, now, &mut actions);
             }
@@ -653,13 +654,11 @@ fn handle_message(peer: &mut Peer, msg: PeerMessage, now: Tick, actions: &mut Ve
             let len = data.len() as u64;
             peer.stats.downloaded_bytes += len;
 
-            let mut buf = BytesMut::new();
-            buf.extend_from_slice(&data);
             actions.push(PeerAction::BlockReceived {
                 token: peer.token,
                 piece,
                 offset,
-                data: Bytes::from(buf),
+                data,
             });
             if peer.can_request_blocks() {
                 actions.push(PeerAction::PickBlocks {
@@ -692,16 +691,11 @@ fn push_write_peer_msg(
         }
         _ => {}
     }
-    let data = {
-        let v = msg.encode();
-        let mut b = BytesMut::with_capacity(v.len());
-        b.extend_from_slice(&v);
-        b
-    };
+    let data = msg.encode();
     push_write_peer(peer, data, actions, now);
 }
 
-fn push_write_peer(peer: &mut Peer, data: BytesMut, actions: &mut Vec<PeerAction>, now: Tick) {
+fn push_write_peer(peer: &mut Peer, data: Bytes, actions: &mut Vec<PeerAction>, now: Tick) {
     peer.stats.uploaded_bytes += data.len() as u64;
     peer.outgoing.push_back(data);
     peer.last_outbound = now;
