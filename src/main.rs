@@ -1,12 +1,12 @@
 use rutor::bytespeed::ByteSpeed;
-use rutor::engine::{Engine, Event, TorrentStats};
-use rutor::{picker, torrent};
+use rutor::engine2::{Engine2, EngineStats, Tick, duration_to_ticks};
+use rutor::net::MAX_CONNECTIONS;
+use rutor::{picker2, torrent};
 use std::env;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use sysinfo::{Pid, System};
 
 struct ProgressTracker {
@@ -18,9 +18,13 @@ struct ProgressTracker {
     mem_usage_kb: u64,
     pid: Pid,
     show_consumption: bool,
-    stats: TorrentStats,
+    stats: EngineStats,
     speed: ByteSpeed,
     last_downloaded: u64,
+    peak_cpu: f32,
+    peak_mem_usage_kb: u64,
+    min_cpu: Option<f32>,
+    min_mem_usage_kb: Option<u64>,
 }
 
 impl ProgressTracker {
@@ -30,7 +34,7 @@ impl ProgressTracker {
         total_pieces: usize,
         pid: Pid,
         show_consumption: bool,
-        stats: TorrentStats,
+        stats: EngineStats,
     ) -> Self {
         Self {
             name: name.to_string(),
@@ -44,6 +48,10 @@ impl ProgressTracker {
             stats,
             speed: ByteSpeed::new(Duration::from_secs(1), false, 0.1),
             last_downloaded: 0,
+            peak_cpu: 0.0,
+            peak_mem_usage_kb: 0,
+            min_cpu: None,
+            min_mem_usage_kb: None,
         }
     }
 
@@ -109,27 +117,41 @@ impl ProgressTracker {
         format!("{:02}:{:02}:{:02}", hours, minutes, secs)
     }
 
-    fn update(&mut self, stats: TorrentStats, system: &System) {
-        let delta_downloaded = (stats.downloaded - self.last_downloaded) as usize;
-        self.last_downloaded = stats.downloaded;
+    fn update(&mut self, stats: EngineStats, system: &System) {
+        let delta_downloaded = stats.downloaded_bytes.saturating_sub(self.last_downloaded) as usize;
+        self.last_downloaded = stats.downloaded_bytes;
         self.speed.update(delta_downloaded);
-        let remaining = self.total_size.saturating_sub(stats.downloaded) as f64;
+        let remaining = self.total_size.saturating_sub(stats.downloaded_bytes) as f64;
         self.eta = if self.speed.avg_speed > 0.0 {
             remaining / self.speed.avg_speed
         } else {
             f64::INFINITY
         };
 
-        if let Some(process) = system.process(self.pid) {
-            self.cpu_usage = process.cpu_usage();
-            self.mem_usage_kb = process.memory();
+        if self.show_consumption {
+            if let Some(process) = system.process(self.pid) {
+                self.cpu_usage = process.cpu_usage();
+                self.mem_usage_kb = process.memory();
+                self.peak_cpu = self.peak_cpu.max(self.cpu_usage);
+                self.peak_mem_usage_kb = self.peak_mem_usage_kb.max(self.mem_usage_kb);
+                if let Some(v) = &mut self.min_cpu {
+                    *v = v.min(self.cpu_usage);
+                } else {
+                    self.min_cpu = Some(self.cpu_usage);
+                }
+                if let Some(v) = &mut self.min_mem_usage_kb {
+                    *v = std::cmp::min(*v, self.mem_usage_kb);
+                } else {
+                    self.min_mem_usage_kb = Some(self.mem_usage_kb);
+                }
+            }
         }
         self.stats = stats;
     }
 
     fn display(&self, first_draw: bool) {
         if !first_draw {
-            let mut max = if self.show_consumption { 6 } else { 5 };
+            let mut max = if self.show_consumption { 7 } else { 6 };
             if self.stats.files.len() > 1 {
                 max += self.stats.files.len();
             }
@@ -151,57 +173,53 @@ impl ProgressTracker {
             println!("📦 {}{}{}", cyan, self.name, reset);
         } else {
             println!("📦 {}{}{}", cyan, self.name, reset);
-            for (path, written, total_size) in &self.stats.files {
-                let file_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("[unknown]");
+            for (name, _, verified, total_size) in &self.stats.files {
                 println!(
                     "  {}• {}{} {} / {}",
                     gray,
-                    file_name,
+                    name,
                     reset,
-                    self.human_bytes(*written),
+                    self.human_bytes(*verified),
                     self.human_bytes(*total_size)
                 );
             }
         }
         println!(
-            "{0}{1:<10}:{2} {3} / {4} @ {5}{6}/s{7} ETA: {8}{9}{10}",
+            "{0}{1:<10}:{2} {3} / {4} ({5} remaining)",
             green,
             "Downloaded",
             reset,
-            self.human_bytes(self.stats.downloaded),
+            self.human_bytes(self.stats.downloaded_bytes),
             self.human_bytes(self.total_size),
+            self.human_bytes(self.stats.left),
+        );
+        println!(
+            "{0:<10}: {1}{2}{3}, ETA: {4}{5}{6}",
+            "Speed",
             yellow,
             self.human_bytes(self.speed.avg_speed as u64),
             reset,
-            self.format_eta(self.eta),
-            reset,
             magenta,
+            self.format_eta(self.eta),
+            reset
         );
         println!(
-            "{0}{1:<10}:{2} {3} / {4} (C) ({5} available)",
-            blue,
-            "Peers",
-            reset,
-            self.stats.peers,
-            self.stats.max_peers,
-            self.stats.available_peers
+            "{0}{1:<10}:{2} {3} / {4} (C)",
+            blue, "Peers", reset, self.stats.peers, MAX_CONNECTIONS
         );
         println!(
-            "{0}{1:<10}:{2} {3} / {4} ({5} blocks in flight ~{6})",
+            "{0}{1:<10}:{2} {3} / {4} ({5} inflight blocks ~{6})",
             white,
             "Pieces",
             reset,
-            self.stats.bitfield.count_ones(),
+            self.stats.complete_pieces,
             self.total_pieces,
-            self.stats.blocks_inflight,
-            self.human_bytes((self.stats.blocks_inflight * picker::BLOCK_SIZE) as u64)
+            self.stats.inflight_blocks,
+            self.human_bytes((self.stats.inflight_blocks * picker2::BLOCK_SIZE) as u64)
         );
         println!(
             "{}",
-            self.format_bar(self.stats.downloaded.min(self.total_size))
+            self.format_bar(self.stats.downloaded_bytes.min(self.total_size))
         );
         if self.show_consumption {
             println!(
@@ -212,7 +230,51 @@ impl ProgressTracker {
         }
     }
 
-    fn update_and_display(&mut self, stats: TorrentStats, system: &System, first_draw: bool) {
+    fn display_peak(&self) {
+        let peak_cpu_str = format!("{:.1}%", self.peak_cpu);
+        let peak_mem_str = self.human_bytes(self.peak_mem_usage_kb);
+
+        let min_cpu_str = format!("{:.1}%", self.min_cpu.unwrap_or(0.0));
+        let min_mem_str = self.human_bytes(self.min_mem_usage_kb.unwrap_or(0));
+
+        let cpu_width = peak_cpu_str.len().max(min_cpu_str.len()).max("CPU".len());
+        let mem_width = peak_mem_str
+            .len()
+            .max(min_mem_str.len())
+            .max("Memory".len());
+
+        let total_width = cpu_width + mem_width + 7;
+        // 7 = 3 for dividers | | and 4 for spaces/padding
+
+        let border = format!("+{}+", "-".repeat(total_width - 2));
+
+        println!("{}", border);
+        println!(
+            "| {:^cpu_width$} | {:^mem_width$} |",
+            "CPU",
+            "Memory",
+            cpu_width = cpu_width,
+            mem_width = mem_width
+        );
+        println!("{}", border);
+        println!(
+            "| {:>cpu_width$} | {:>mem_width$} |",
+            peak_cpu_str,
+            peak_mem_str,
+            cpu_width = cpu_width,
+            mem_width = mem_width
+        );
+        println!(
+            "| {:>cpu_width$} | {:>mem_width$} |",
+            min_cpu_str,
+            min_mem_str,
+            cpu_width = cpu_width,
+            mem_width = mem_width
+        );
+        println!("{}", border);
+    }
+
+    fn update_and_display(&mut self, stats: EngineStats, system: &System, first_draw: bool) {
         self.update(stats, system);
         self.display(first_draw);
     }
@@ -307,25 +369,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let file = File::open(filename)?;
         torrent::Torrent::from_file(&file, destination)?
     };
-    let name = torrent.info.name.clone();
-    let total_size = torrent.info.total_size;
     let total_pieces = torrent.info.piece_hashes.len();
-    let (event_tx, event_rx) = mpsc::channel();
-    let (io_tx, io_rx) = mpsc::channel();
-    let (peer_io_tx, peer_io_rx) = mpsc::channel();
-    let (announce_io_tx, announce_io_rx) = mpsc::channel();
-    let (hash_tx, hash_rx) = mpsc::channel();
-    let mut engine = Engine::new(
-        torrent,
-        event_tx.clone(),
-        event_rx,
-        io_tx,
-        peer_io_tx,
-        announce_io_tx,
-        0,
-        0,
-        hash_tx,
-    );
+    let total_size = torrent.info.total_size;
+    let name = torrent.info.name.clone();
+    let mut engine = Engine2::new(torrent, 0, 0)?;
     let mut progress_tracker = ProgressTracker::new(
         &name,
         total_size,
@@ -334,26 +381,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         show_consumption,
         engine.get_stats(),
     );
+    let progress_interval = duration_to_ticks(Duration::from_secs(1));
     let mut first_draw = true;
-    let mut last = Instant::now();
-    engine.start(io_rx, peer_io_rx, announce_io_rx, hash_rx);
-    loop {
-        if last.elapsed() >= Duration::from_secs(1) {
-            system.refresh_pids(&vec![pid]);
-            progress_tracker.update_and_display(engine.get_stats(), &system, first_draw);
-            first_draw = false;
-            last = Instant::now();
-        }
-        let ev = engine.poll()?;
-        match ev {
-            Event::Terminate => {
-                engine.handle_event(ev)?;
-                break;
+    engine.start(|now, stats| {
+        if now % progress_interval == Tick(0) {
+            if show_consumption {
+                system.refresh_pids(&vec![pid]);
             }
-            _ => engine.handle_event(ev)?,
+            progress_tracker.update_and_display(stats, &system, first_draw);
+            first_draw = false;
         }
-    }
+    });
+    engine.stop();
     engine.join();
+    progress_tracker.display_peak();
 
     Ok(())
 }

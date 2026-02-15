@@ -58,6 +58,10 @@ impl Bitfield {
         false
     }
 
+    pub fn bits(&self) -> &[u8] {
+        &self.bits
+    }
+
     /// Constructs a `Bitfield` from raw bytes and a specified number of pieces.
     ///
     /// The `bytes` vector must contain at least `(length + 7) / 8` bytes.

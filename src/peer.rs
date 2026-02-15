@@ -179,7 +179,7 @@ impl PeerMessage {
         vec![0, 0, 0, 1, id]
     }
 
-    fn parse(
+    pub fn parse(
         payload: &[u8],
         total_pieces: usize,
     ) -> Result<PeerMessage, Box<dyn std::error::Error>> {
@@ -196,7 +196,16 @@ impl PeerMessage {
             2 => PeerMessage::Interested,
             3 => PeerMessage::NotInterested,
             4 => PeerMessage::Have(u32::from_be_bytes(data[..4].try_into()?)),
-            5 => PeerMessage::Bitfield(Bitfield::from_bytes(data.to_vec(), total_pieces)),
+            5 => {
+                if data.len() != (total_pieces + 7) / 8 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid bitfield length",
+                    )
+                    .into());
+                }
+                PeerMessage::Bitfield(Bitfield::from_bytes(data.to_vec(), total_pieces))
+            }
             6 => {
                 let index = u32::from_be_bytes(data[0..4].try_into()?);
                 let begin = u32::from_be_bytes(data[4..8].try_into()?);

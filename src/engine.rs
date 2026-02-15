@@ -288,7 +288,7 @@ impl Engine {
         write_limit_bytes_per_sec: usize,
         hash_tx: Sender<HashTask>,
     ) -> Self {
-        let announce_mgr = AnnounceManager::new(&torrent);
+        let announce_mgr = AnnounceManager::new(&torrent.announce, &torrent.announce_list);
         let bitfield = Bitfield::new(torrent.info.piece_hashes.len());
         let stats = TorrentStats::new(torrent.info.total_size, Vec::new(), bitfield);
         Self {

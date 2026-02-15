@@ -1,18 +1,31 @@
 use std::fmt::Write;
 use std::net::UdpSocket;
+use std::thread::JoinHandle;
 use std::time::Instant;
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs},
     time::Duration,
 };
 
+use crossbeam::channel::{Receiver, Sender};
 use rand::RngCore;
 use reqwest::blocking::Client;
 
-use crate::{
-    bencode::{self, Bencode},
-    torrent::Torrent,
-};
+use crate::bencode::{self, Bencode};
+use crate::engine2::EngineEvent;
+
+#[derive(Debug)]
+pub enum AnnounceEvent {
+    Announce {
+        url: String,
+        info_hash: [u8; 20],
+        peer_id: [u8; 20],
+        uploaded: u64,
+        downloaded: u64,
+        left: u64,
+        respond_to: Sender<EngineEvent>,
+    },
+}
 
 /// Represents the state of a single tracker, including its URL and announce timing.
 #[derive(Debug, Clone)]
@@ -126,28 +139,29 @@ impl TrackerResponse {
 #[derive(Debug)]
 pub struct AnnounceManager {
     /// A list of tracker tiers. Each tier is a list of trackers.
-    pub tiers: Vec<Vec<TrackerState>>,
+    tiers: Vec<Vec<TrackerState>>,
+    join: Option<JoinHandle<()>>,
 }
 
 impl AnnounceManager {
     /// Creates a new `AnnounceManager` for a given torrent.
     ///
     /// If the torrent has an `announce_list`, it is used; otherwise, the single `announce` URL is used.
-    pub fn new(torrent: &Torrent) -> Self {
+    pub fn new(announce: &Option<String>, announce_list: &Vec<Vec<String>>) -> Self {
         let mut tiers = Vec::new();
-        if !torrent.announce_list.is_empty() {
-            for tier_urls in &torrent.announce_list {
+        if !announce_list.is_empty() {
+            for tier_urls in announce_list {
                 let tier = tier_urls
                     .iter()
                     .map(|url| TrackerState::new(url.clone()))
                     .collect();
                 tiers.push(tier);
             }
-        } else if let Some(url) = &torrent.announce {
+        } else if let Some(url) = announce {
             tiers.push(vec![TrackerState::new(url.clone())]);
         }
 
-        AnnounceManager { tiers: tiers }
+        Self { tiers, join: None }
     }
 
     /// Returns a mutable reference to the next tracker that is due for announcing.
@@ -162,6 +176,59 @@ impl AnnounceManager {
             }
         }
         None
+    }
+
+    pub fn start(&mut self, rx: &Receiver<AnnounceEvent>) {
+        let rx = rx.clone();
+        let join = std::thread::spawn(move || {
+            eprintln!(
+                "announce thread {:?} starting...",
+                std::thread::current().id()
+            );
+            loop {
+                match rx.recv() {
+                    Ok(ev) => match ev {
+                        AnnounceEvent::Announce {
+                            url,
+                            info_hash,
+                            peer_id,
+                            uploaded,
+                            downloaded,
+                            left,
+                            respond_to,
+                        } => {
+                            let result = announce(
+                                &url, &info_hash, &peer_id, 6881, uploaded, downloaded, left, None,
+                                None,
+                            );
+                            match result {
+                                Ok(response) => {
+                                    let _ =
+                                        respond_to.send(EngineEvent::AnnounceResponse { response });
+                                }
+                                Err(e) => {
+                                    eprintln!("{} failed announce: {}", url, e);
+                                }
+                            }
+                        }
+                    },
+                    Err(_) => break,
+                }
+            }
+            eprintln!(
+                "announce thread {:?} exiting...",
+                std::thread::current().id()
+            );
+        });
+        self.join = Some(join);
+    }
+
+    pub fn join(&mut self) {
+        let join = match self.join.take() {
+            Some(j) => j,
+            None => return,
+        };
+        let _ = join.join();
     }
 }
 

@@ -59,6 +59,8 @@ This project uses a few well-established Rust crates:
 | [`threadpool`](https://crates.io/crates/threadpool) | Worker thread pool for concurrent peer handling | [Docs](https://docs.rs/threadpool) |
 | [`libc`](https://crates.io/crates/libc) | Low-level system bindings (for cross-platform support) | [Docs](https://docs.rs/libc) |
 | [`mio`](https://crates.io/crates/mio) | Low-level async IO for efficient peer connections | [Docs](https://docs.rs/mio/latest/mio) |
+| [`crossbeam`](https://crates.io/crates/crossbeam) | Lock-free concurrency primitives and channels | [Docs](https://docs.rs/crossbeam) |
+| [`bytes`](https://crates.io/crates/bytes) | Efficient byte buffers for network IO | [Docs](https://docs.rs/bytes) |
 
 ## Notes
 
