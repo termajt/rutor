@@ -58,7 +58,6 @@ This project uses a few well-established Rust crates:
 | [`sha1`](https://crates.io/crates/sha1) | Torrent piece hash verification | [Docs](https://docs.rs/sha1) |
 | [`rand`](https://crates.io/crates/rand) | Random peer IDs and session identifiers | [Docs](https://docs.rs/rand) |
 | [`sysinfo`](https://crates.io/crates/sysinfo) | System stats for CPU/memory/thread usage in the UI | [Docs](https://docs.rs/sysinfo) |
-| [`threadpool`](https://crates.io/crates/threadpool) | Worker thread pool for concurrent peer handling | [Docs](https://docs.rs/threadpool) |
 | [`libc`](https://crates.io/crates/libc) | Low-level system bindings (for cross-platform support) | [Docs](https://docs.rs/libc) |
 | [`mio`](https://crates.io/crates/mio) | Low-level async IO for efficient peer connections | [Docs](https://docs.rs/mio/latest/mio) |
 | [`crossbeam`](https://crates.io/crates/crossbeam) | Lock-free concurrency primitives and channels | [Docs](https://docs.rs/crossbeam) |
