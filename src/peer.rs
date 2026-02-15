@@ -344,17 +344,11 @@ impl PeerManager {
         actions
     }
 
-    pub fn on_data(&mut self, token: Token, data: &[u8], now: Tick) -> Vec<PeerAction> {
+    pub fn parse_messages(&mut self, token: Token, now: Tick) -> Vec<PeerAction> {
         let peer = match self.peers.get_mut(&token) {
             Some(p) => p,
             None => return vec![],
         };
-
-        if data.len() > 0 {
-            peer.last_activity = now;
-        }
-
-        peer.incoming.extend_from_slice(data);
 
         match peer.state {
             PeerState::Handshaking => match try_parse_handshake(peer, &self.info_hash) {
@@ -371,6 +365,19 @@ impl PeerManager {
             },
             PeerState::Active => parse_messages(peer, self.total_pieces, now),
         }
+    }
+
+    pub fn append_incoming(&mut self, token: &Token, data: &[u8], now: Tick) {
+        let peer = match self.peers.get_mut(&token) {
+            Some(p) => p,
+            None => return,
+        };
+
+        if data.len() > 0 {
+            peer.last_activity = now;
+        }
+
+        peer.incoming.extend_from_slice(data);
     }
 
     pub fn on_connected(&mut self, addr: SocketAddr, token: Token, now: Tick) -> Vec<PeerAction> {

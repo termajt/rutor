@@ -22,7 +22,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct EngineStats {
-    pub complete_pieces: usize,
+    pub verified_pieces: usize,
     pub total_pieces: usize,
     pub peers: usize,
     pub downloaded_bytes: u64,
@@ -35,7 +35,7 @@ pub struct EngineStats {
 impl EngineStats {
     pub fn new(total_size: u64, total_pieces: usize, files: Vec<(String, u64, u64, u64)>) -> Self {
         Self {
-            complete_pieces: 0,
+            verified_pieces: 0,
             total_pieces,
             peers: 0,
             downloaded_bytes: 0,
@@ -474,7 +474,7 @@ impl Engine {
         if self.complete {
             return;
         }
-        if !self.piece_picker.bitfield().has_any_zero() {
+        if self.piece_picker.is_complete() {
             self.complete = true;
             if let Some(tx) = &self.engine_tx {
                 let tx = tx.clone();
@@ -487,7 +487,7 @@ impl Engine {
     }
 
     fn update_stats(&mut self) {
-        self.stats.complete_pieces = self.piece_picker.bitfield().count_ones();
+        self.stats.verified_pieces = self.piece_picker.verified_pieces();
         self.stats.downloaded_bytes = self.piece_picker.opportunistic_downloaded_bytes();
         if self.stats.downloaded_bytes > self.total_size {
             self.stats.downloaded_bytes = self.total_size;

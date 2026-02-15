@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use crossbeam::channel::{Receiver, Sender};
 use mio::{Events, Interest, Poll, Token, net::TcpStream};
 
@@ -20,6 +20,9 @@ use crate::{
 
 pub const MAX_CONNECTIONS: usize = 50;
 const CONNECTION_TIMEOUT: Tick = duration_to_ticks(Duration::from_secs(3));
+const READ_CHUNK: usize = 16 * 1024;
+const MAX_READ_PER_EVENT: usize = 256 * 1024;
+const MAX_WRITE_PER_EVENT: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub enum NetError {
@@ -82,7 +85,6 @@ struct Connection {
     token: Token,
     socket: TcpStream,
     outgoing: VecDeque<Bytes>,
-    incoming: BytesMut,
     connecting: bool,
     connect_deadline: Tick,
     last_interest: Interest,
@@ -105,7 +107,6 @@ impl Connection {
             token,
             socket,
             outgoing: VecDeque::new(),
-            incoming: BytesMut::with_capacity(64 * 1024),
             connecting: true,
             connect_deadline: current_tick + CONNECTION_TIMEOUT,
             last_interest: interest,
@@ -118,7 +119,7 @@ impl Connection {
         self.outgoing.push_back(data);
     }
 
-    fn update_interest(&mut self, poll: &mut Poll) {
+    fn update_interest(&mut self, poll: &mut Poll) -> io::Result<()> {
         let interest = self.interest();
 
         if interest != self.last_interest {
@@ -131,9 +132,12 @@ impl Connection {
                 }
                 Err(e) => {
                     log::error!("{} failed to reregister poll: {:?}", self.addr, e);
+                    return Err(e);
                 }
             }
         }
+
+        Ok(())
     }
 
     fn interest(&self) -> Interest {
@@ -149,17 +153,6 @@ impl Connection {
 pub enum NetEvent {
     NewPeers {
         addrs: Vec<SocketAddr>,
-    },
-    Connect {
-        addr: SocketAddr,
-    },
-    Send {
-        token: Token,
-        data: Bytes,
-    },
-    Close {
-        token: Token,
-        respond_to: Sender<Result<(), NetError>>,
     },
     Tick {
         tick: Tick,
@@ -312,24 +305,15 @@ impl NetManager {
                     };
 
                     if event.is_readable() {
-                        match socket_read(conn, &mut global_read_limiter) {
-                            Ok(true) => {
-                                let actions = peer_mgr.on_data(token, &conn.incoming, current_tick);
-                                conn.incoming.clear();
-                                peer_actions.push(actions);
-                            }
-                            Ok(false) => {
-                                log::warn!("{} closed the connection", conn.addr);
-                                let _ = handle_close(
-                                    token,
-                                    &mut poll,
-                                    &mut connections,
-                                    &mut token_to_addr,
-                                    &mut peer_mgr,
-                                    &engine_tx,
-                                    &mut connection_pool,
-                                );
-                                continue;
+                        match socket_read(
+                            conn,
+                            &mut global_read_limiter,
+                            &mut peer_mgr,
+                            current_tick,
+                        ) {
+                            Ok(()) => {
+                                let actions = peer_mgr.parse_messages(conn.token, current_tick);
+                                peer_actions.extend(actions);
                             }
                             Err(e) => {
                                 log::error!("{} read error: {:?}", conn.addr, e);
@@ -364,7 +348,7 @@ impl NetManager {
                             }
                             conn.connecting = false;
                             let actions = peer_mgr.on_connected(conn.addr, token, current_tick);
-                            peer_actions.push(actions);
+                            peer_actions.extend(actions);
                         }
                         if let Err(e) = socket_write(conn, &mut poll, &mut global_write_limiter) {
                             log::error!("{} write error: {:?}", conn.addr, e);
@@ -381,17 +365,15 @@ impl NetManager {
                     }
                 }
                 let idle = events.is_empty() && peer_actions.is_empty();
-                for actions in peer_actions {
-                    consume_peer_actions(
-                        actions,
-                        &mut poll,
-                        &mut connections,
-                        &mut token_to_addr,
-                        &mut peer_mgr,
-                        &engine_tx,
-                        &mut connection_pool,
-                    );
-                }
+                consume_peer_actions(
+                    peer_actions,
+                    &mut poll,
+                    &mut connections,
+                    &mut token_to_addr,
+                    &mut peer_mgr,
+                    &engine_tx,
+                    &mut connection_pool,
+                );
 
                 if idle {
                     let since = idle_since.get_or_insert_with(Instant::now);
@@ -511,7 +493,9 @@ fn consume_peer_action(
             }
         }
         PeerAction::Write { token } => {
-            collect_messages(token, peer_mgr, token_to_addr, connections, poll);
+            if let Err(e) = collect_messages(token, peer_mgr, token_to_addr, connections, poll) {
+                log::error!("{:?} failed to collect outgoing messages: {:?}", token, e);
+            }
         }
         PeerAction::BlockReceived {
             token: _,
@@ -561,34 +545,6 @@ fn consume_events(
 ) -> (bool, Tick) {
     while let Ok(job) = rx.recv_timeout(CHANNEL_TIMEOUT) {
         match job {
-            NetEvent::Connect { addr } => {
-                connection_pool.add_peers(vec![addr]);
-            }
-            NetEvent::Send { token, data } => {
-                let addr = match token_to_addr.get(&token) {
-                    Some(a) => a,
-                    None => continue,
-                };
-                let conn = match connections.get_mut(addr) {
-                    Some(c) => c,
-                    None => continue,
-                };
-                conn.enqueue_message(data);
-                conn.update_interest(poll);
-            }
-            NetEvent::Close { token, respond_to } => {
-                peer_mgr.on_close(&token);
-                let result = handle_close(
-                    token,
-                    poll,
-                    connections,
-                    token_to_addr,
-                    peer_mgr,
-                    engine_tx,
-                    connection_pool,
-                );
-                let _ = respond_to.send(result);
-            }
             NetEvent::Shutdown => return (true, current_tick),
             NetEvent::Tick { tick, endgame } => {
                 current_tick = tick;
@@ -671,32 +627,39 @@ fn consume_events(
     (false, current_tick)
 }
 
-fn socket_read(conn: &mut Connection, global_limiter: &mut RateLimiter) -> io::Result<bool> {
-    let mut budget = conn.read_limiter.allow().min(global_limiter.allow());
-    if budget == 0 {
-        return Ok(true);
-    }
-    let mut buf = [0u8; 16 * 1024];
-    loop {
-        if budget == 0 {
-            break;
-        }
-        let to_read = buf.len().min(budget);
+fn socket_read(
+    conn: &mut Connection,
+    global_limiter: &mut RateLimiter,
+    peer_mgr: &mut PeerManager,
+    now: Tick,
+) -> io::Result<()> {
+    let mut budget = conn
+        .read_limiter
+        .allow(MAX_READ_PER_EVENT)
+        .min(global_limiter.allow(MAX_READ_PER_EVENT));
+    let mut total_read = 0;
+    let mut buf = [0u8; READ_CHUNK];
+    while budget > 0 && total_read < MAX_READ_PER_EVENT {
+        let remaining = MAX_READ_PER_EVENT.saturating_sub(total_read);
+        let to_read = buf.len().min(budget).min(remaining);
         match conn.socket.read(&mut buf[..to_read]) {
             Ok(0) => {
-                return Ok(false);
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "connection closed",
+                ));
             }
             Ok(n) => {
-                conn.incoming.extend_from_slice(&buf[..n]);
+                peer_mgr.append_incoming(&conn.token, &buf[..n], now);
                 budget -= n;
+                total_read += n;
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
-            Err(ref e) if e.kind() == io::ErrorKind::TimedOut => return Ok(true),
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(e),
         }
     }
 
-    Ok(true)
+    Ok(())
 }
 
 fn socket_write(
@@ -704,14 +667,22 @@ fn socket_write(
     poll: &mut Poll,
     global_limiter: &mut RateLimiter,
 ) -> io::Result<()> {
-    let mut budget = conn.write_limiter.allow().min(global_limiter.allow());
-    if budget == 0 {
-        return Ok(());
-    }
-    while budget > 0
-        && let Some(front) = conn.outgoing.front_mut()
-    {
-        match conn.socket.write(&front) {
+    let mut budget = conn
+        .write_limiter
+        .allow(MAX_WRITE_PER_EVENT)
+        .min(global_limiter.allow(MAX_WRITE_PER_EVENT));
+    let mut total_written = 0;
+
+    while budget > 0 && total_written < MAX_WRITE_PER_EVENT {
+        let front = match conn.outgoing.front_mut() {
+            Some(f) => f,
+            None => break,
+        };
+
+        let remaining = MAX_WRITE_PER_EVENT.saturating_sub(total_written);
+        let to_write = front.len().min(budget).min(remaining);
+
+        match conn.socket.write(&front[..to_write]) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::ConnectionAborted,
@@ -724,12 +695,13 @@ fn socket_write(
                     conn.outgoing.pop_front();
                 }
                 budget -= n;
+                total_written += n;
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) => return Err(e),
         }
     }
-    conn.update_interest(poll);
+    conn.update_interest(poll)?;
 
     Ok(())
 }
@@ -740,13 +712,15 @@ fn collect_messages(
     token_to_addr: &HashMap<Token, SocketAddr>,
     connections: &mut HashMap<SocketAddr, Connection>,
     poll: &mut Poll,
-) {
+) -> io::Result<()> {
     let addr = token_to_addr[&token];
     let conn = connections.get_mut(&addr).unwrap();
     for data in peer_mgr.collect_outgoing(&token) {
         conn.enqueue_message(data);
     }
-    conn.update_interest(poll);
+    conn.update_interest(poll)?;
+
+    Ok(())
 }
 
 fn handle_close(

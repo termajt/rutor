@@ -129,6 +129,7 @@ pub struct PiecePicker {
     verified_bytes: u64,
     inflight_blocks: usize,
     candidates: Vec<usize>,
+    verified_pieces: usize,
 }
 
 impl PiecePicker {
@@ -152,6 +153,7 @@ impl PiecePicker {
             verified_bytes: 0,
             inflight_blocks: 0,
             candidates: Vec::with_capacity(total_pieces),
+            verified_pieces: 0,
         }
     }
 
@@ -197,6 +199,7 @@ impl PiecePicker {
             if let Some(p) = self.pieces.remove(&idx) {
                 self.bitfield.set(&idx, true);
                 self.verified_bytes += p.length as u64;
+                self.verified_pieces += 1;
             }
             return;
         }
@@ -491,6 +494,14 @@ impl PiecePicker {
         }
 
         false
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.pieces.is_empty()
+    }
+
+    pub fn verified_pieces(&self) -> usize {
+        self.verified_pieces
     }
 
     pub fn is_endgame(&self) -> bool {

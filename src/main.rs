@@ -218,11 +218,11 @@ impl ProgressTracker {
             blue, "Peers", reset, self.stats.peers, MAX_CONNECTIONS
         );
         println!(
-            "{0}{1:<10}:{2} {3} / {4} ({5} inflight blocks ~{6})",
+            "{0}{1:<10}:{2} {3} / {4}, ({5} inflight blocks ~{6})",
             white,
             "Pieces",
             reset,
-            self.stats.complete_pieces,
+            self.stats.verified_pieces,
             self.total_pieces,
             self.stats.inflight_blocks,
             self.human_bytes((self.stats.inflight_blocks * BLOCK_SIZE) as u64)

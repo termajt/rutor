@@ -28,13 +28,13 @@ impl RateLimiter {
         self.last = now;
     }
 
-    pub fn allow(&mut self) -> usize {
+    pub fn allow(&mut self, want: usize) -> usize {
         if self.bytes_per_sec == 0.0 {
             return usize::MAX;
         }
         self.refill();
 
-        let granted = self.available.floor();
+        let granted = self.available.floor().min(want as f64);
         self.available -= granted;
 
         granted as usize
