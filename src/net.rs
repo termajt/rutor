@@ -11,10 +11,10 @@ use crossbeam::channel::{Receiver, Sender};
 use mio::{Events, Interest, Poll, Token, net::TcpStream};
 
 use crate::{
+    PeerMessage,
     bitfield::Bitfield,
-    engine2::{EngineEvent, Tick, duration_to_ticks},
-    peer::PeerMessage,
-    peer2::{PeerAction, PeerManager},
+    engine::{EngineEvent, Tick, duration_to_ticks},
+    peer::{PeerAction, PeerManager},
     rate_limiter::RateLimiter,
 };
 

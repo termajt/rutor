@@ -1,629 +1,741 @@
 use std::{
-    collections::VecDeque,
-    fmt,
-    io::{self, Read, Write},
+    collections::{HashMap, VecDeque},
+    io,
     net::SocketAddr,
-    sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use mio::{Token, net::TcpStream};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use mio::Token;
 
 use crate::{
+    BLOCK_SIZE, PeerMessage,
     bitfield::Bitfield,
-    bytespeed::ByteSpeed,
-    inflight::InFlight,
-    pending_requests::{BlockKey, PendingRequests},
-    picker,
-    rate_limiter::RateLimiter,
+    engine::{Tick, duration_to_ticks},
 };
 
-/// Represents a message exchanged between BitTorrent peers
-/// according to the standard peer wire protocol.
-///
-/// Each variant corresponds to one of the standard messages a peer
-/// can send. Some messages carry additional data (like piece index
-/// or a block of data), while others are simple notifications.
-#[derive(Debug, Clone)]
-pub enum PeerMessage {
-    /// Tells the receiving peer that it is **choked**.
-    /// No data will be sent until an `Unchoke` message is received.
-    Choke,
-
-    /// Tells the receiving peer that it is **unchoked** and may
-    /// request pieces.
-    Unchoke,
-
-    /// Indicates that the sending peer is **interested** in downloading pieces.
-    Interested,
-
-    /// Indicates that the sending peer is **not interested** in downloading pieces.
-    NotInterested,
-
-    /// Announces that the sending peer has successfully downloaded
-    /// the piece at `piece_index`.
-    ///
-    /// # Fields
-    ///
-    /// * `piece_index` - The index of the piece that has been downloaded.
-    Have(u32),
-
-    /// Sends the bitfield of the pieces the sending peer has.
-    ///
-    /// # Fields
-    ///    /// * `bitfield` - A `Bitfield` struct representing which pieces
-    ///   the peer has.
-    Bitfield(Bitfield),
-
-    /// Requests a block of data from the receiving peer.
-    ///
-    /// # Fields
-    ///
-    /// * `index` - Piece index being requested.
-    /// * `begin` - Offset within the piece.
-    /// * `length` - Length of the requested block in bytes.
-    Request((u32, u32, u32)),
-
-    /// Sends a block of data in response to a `Request` message.
-    ///
-    /// # Fields
-    ///
-    /// * `index` - Piece index of the block.
-    /// * `begin` - Offset within the piece.
-    /// * `block` - The actual bytes of data being sent.
-    Piece((u32, u32, Arc<Vec<u8>>)),
-
-    /// Cancels a previously sent `Request`.
-    ///
-    /// # Fields
-    ///
-    /// * `index` - Piece index of the canceled block.
-    /// * `begin` - Offset within the piece.
-    /// * `length` - Length of the canceled block in bytes.
-    Cancel((u32, u32, u32)),
-
-    /// Announces the DHT listening port of the sending peer.
-    ///
-    /// # Fields
-    ///
-    /// * `port` - The port number the peer is listening on for DHT messages.
-    Port(u16),
-
-    KeepAlive,
-}
-
-impl fmt::Display for PeerMessage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PeerMessage::Bitfield(bitfield) => {
-                write!(f, "PeerMessage::Bitfield({:?})", bitfield)
-            }
-            PeerMessage::Choke => write!(f, "PeerMessage::Choke"),
-            PeerMessage::Unchoke => write!(f, "PeerMessage::Unchoke"),
-            PeerMessage::Interested => write!(f, "PeerMessage::Interested"),
-            PeerMessage::NotInterested => write!(f, "PeerMessage::NotInterested"),
-            PeerMessage::Have(i) => write!(f, "PeerMessage::Have({})", i),
-            PeerMessage::Request((i, b, l)) => {
-                write!(f, "PeerMessage::Request({}, {}, {})", i, b, l)
-            }
-            PeerMessage::Piece((i, b, d)) => {
-                write!(f, "PeerMessage::Piece({}, {}, {})", i, b, d.len())
-            }
-            PeerMessage::Cancel((i, b, l)) => write!(f, "PeerMessage::Cancel({}, {}, {})", i, b, l),
-            PeerMessage::Port(p) => write!(f, "PeerMessage::Port({})", p),
-            PeerMessage::KeepAlive => write!(f, "PeerMessage::KeepAlive"),
-        }
-    }
-}
-
-impl PeerMessage {
-    pub fn encode(&self) -> Vec<u8> {
-        match self {
-            PeerMessage::Choke => Self::encode_simple(0),
-            PeerMessage::Unchoke => Self::encode_simple(1),
-            PeerMessage::Interested => Self::encode_simple(2),
-            PeerMessage::NotInterested => Self::encode_simple(3),
-            PeerMessage::Have(index) => {
-                let mut buf = Vec::with_capacity(9);
-                buf.extend_from_slice(&5u32.to_be_bytes());
-                buf.push(4);
-                buf.extend_from_slice(&index.to_be_bytes());
-                buf
-            }
-            PeerMessage::Bitfield(bitfield) => {
-                let bytes = bitfield.as_bytes();
-                let total_len = 1 + bytes.len();
-                let mut buf = Vec::with_capacity(4 + total_len);
-                buf.extend_from_slice(&(total_len as u32).to_be_bytes());
-                buf.push(5);
-                buf.extend_from_slice(bytes);
-                buf
-            }
-            PeerMessage::Request((index, begin, length))
-            | PeerMessage::Cancel((index, begin, length)) => {
-                let id = if matches!(self, PeerMessage::Request(_)) {
-                    6
-                } else {
-                    8
-                };
-                let mut buf = Vec::with_capacity(17);
-                buf.extend_from_slice(&13u32.to_be_bytes());
-                buf.push(id);
-                buf.extend_from_slice(&index.to_be_bytes());
-                buf.extend_from_slice(&begin.to_be_bytes());
-                buf.extend_from_slice(&length.to_be_bytes());
-                buf
-            }
-            PeerMessage::Piece((index, begin, block)) => {
-                let total_len = 1 + 8 + block.len();
-                let mut buf = Vec::with_capacity(4 + total_len);
-                buf.extend_from_slice(&(total_len as u32).to_be_bytes());
-                buf.push(7);
-                buf.extend_from_slice(&index.to_be_bytes());
-                buf.extend_from_slice(&begin.to_be_bytes());
-                buf.extend_from_slice(block);
-                buf
-            }
-            PeerMessage::Port(port) => {
-                let mut buf = Vec::with_capacity(7);
-                buf.extend_from_slice(&3u32.to_be_bytes());
-                buf.push(9);
-                buf.extend_from_slice(&port.to_be_bytes());
-                buf
-            }
-            PeerMessage::KeepAlive => 0u32.to_be_bytes().to_vec(),
-        }
-    }
-
-    fn encode_simple(id: u8) -> Vec<u8> {
-        vec![0, 0, 0, 1, id]
-    }
-
-    pub fn parse(
-        payload: &[u8],
-        total_pieces: usize,
-    ) -> Result<PeerMessage, Box<dyn std::error::Error>> {
-        if payload.is_empty() {
-            return Ok(PeerMessage::KeepAlive);
-        }
-
-        let id = payload[0];
-        let data = &payload[1..];
-
-        let msg = match id {
-            0 => PeerMessage::Choke,
-            1 => PeerMessage::Unchoke,
-            2 => PeerMessage::Interested,
-            3 => PeerMessage::NotInterested,
-            4 => PeerMessage::Have(u32::from_be_bytes(data[..4].try_into()?)),
-            5 => {
-                if data.len() != (total_pieces + 7) / 8 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid bitfield length",
-                    )
-                    .into());
-                }
-                PeerMessage::Bitfield(Bitfield::from_bytes(data.to_vec(), total_pieces))
-            }
-            6 => {
-                let index = u32::from_be_bytes(data[0..4].try_into()?);
-                let begin = u32::from_be_bytes(data[4..8].try_into()?);
-                let length = u32::from_be_bytes(data[8..12].try_into()?);
-                PeerMessage::Request((index, begin, length))
-            }
-            7 => {
-                let index = u32::from_be_bytes(data[0..4].try_into()?);
-                let begin = u32::from_be_bytes(data[4..8].try_into()?);
-                let block = data[8..].to_vec();
-                PeerMessage::Piece((index, begin, Arc::new(block)))
-            }
-            8 => {
-                let index = u32::from_be_bytes(data[0..4].try_into()?);
-                let begin = u32::from_be_bytes(data[4..8].try_into()?);
-                let length = u32::from_be_bytes(data[8..12].try_into()?);
-                PeerMessage::Cancel((index, begin, length))
-            }
-            9 => PeerMessage::Port(u16::from_be_bytes(data[0..2].try_into()?)),
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unknown message id: {}", id),
-                )
-                .into());
-            }
-        };
-
-        Ok(msg)
-    }
-}
+const PEER_IDLE_TIMEOUT: Tick = duration_to_ticks(Duration::from_mins(2));
+const HANDSHAKE_TIMEOUT: Tick = duration_to_ticks(Duration::from_secs(10));
+const KEEPALIVE_INTERVAL: Tick = duration_to_ticks(Duration::from_mins(2));
 
 #[derive(Debug)]
-pub enum MessageHandle {
-    Piece {
-        piece: usize,
-        offset: usize,
-        data: Arc<Vec<u8>>,
+pub enum PeerAction {
+    Close {
+        token: Token,
     },
-    Bitfield {
-        bitfield: Arc<Bitfield>,
+    PeerBitfield {
+        token: Token,
+        bitfield: Bitfield,
     },
-    Have {
-        bitfield: Arc<Bitfield>,
+    PeerHave {
+        token: Token,
+        piece: u32,
     },
-    Unchoke,
+    PeerConnected {
+        token: Token,
+    },
+    HandshakeSuccess {
+        token: Token,
+    },
+    PickBlocks {
+        token: Token,
+        count: usize,
+    },
+    Write {
+        token: Token,
+    },
+    BlockReceived {
+        token: Token,
+        piece: u32,
+        offset: u32,
+        data: Bytes,
+    },
+    TimeoutBlocks {
+        blocks: Vec<(u32, u32)>,
+    },
+    RequestBlocks,
+    Choked {
+        token: Token,
+    },
+    RequestMissingBlocks {
+        token: Token,
+        bitfield: Bitfield,
+    },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PeerState {
+    Handshaking,
+    Active,
+}
+
+const RATE_ALPHA: f64 = 0.2;
+
 #[derive(Debug)]
-pub struct Peer {
+struct PeerStats {
+    downloaded_bytes: u64,
+    uploaded_bytes: u64,
+    download_rate: f64,
+    upload_rate: f64,
+    last_rate_tick: Tick,
+    rtt_ema: Option<f64>,
+}
+
+impl PeerStats {
+    fn new() -> Self {
+        Self {
+            downloaded_bytes: 0,
+            uploaded_bytes: 0,
+            download_rate: 0.0,
+            upload_rate: 0.0,
+            last_rate_tick: Tick(0),
+            rtt_ema: None,
+        }
+    }
+}
+
+const MIN_OUTSTANDING: usize = 2;
+const MAX_OUTSTANDING: usize = 32;
+
+#[derive(Debug)]
+struct Peer {
     addr: SocketAddr,
-    pub stream: TcpStream,
-    read_buf: Vec<u8>,
-    write_queue: VecDeque<Vec<u8>>,
-    bitfield: Bitfield,
-    am_choked: bool,
-    interested: bool,
-    am_interested: bool,
-    inflight: InFlight,
-    pending: PendingRequests,
     token: Token,
-    speed: ByteSpeed,
-    last_keepalive: Instant,
-    timeout: Duration,
-    rtt: Option<Duration>,
-    rttvar: Option<Duration>,
-    rtt_alpha: f64,
-    max_inflight_piece_blocks: usize,
+    choked: bool,
+    interested: bool,
+    peer_choked: bool,
+    peer_interested: bool,
+    bitfield: Option<Bitfield>,
+    peer_id: Option<[u8; 20]>,
+    incoming: BytesMut,
+    outgoing: VecDeque<BytesMut>,
+    handshake_deadline: Tick,
+    last_activity: Tick,
+    last_outbound: Tick,
+    state: PeerState,
+    stats: PeerStats,
+    pending_requests: HashMap<(u32, u32), Tick>,
 }
-
-const READ_CHUNK: usize = 16 * 1024;
-const KEEPALIVE_INTERVAL: Duration = Duration::from_mins(2);
-const MIN_RTT: Duration = Duration::from_millis(20);
 
 impl Peer {
-    pub fn new(stream: TcpStream, total_pieces: usize, token: Token) -> io::Result<Self> {
-        let addr = stream.peer_addr()?;
-        let bitfield = Bitfield::new(total_pieces);
-        let now = Instant::now();
-        Ok(Self {
+    fn new(addr: SocketAddr, token: Token) -> Self {
+        Self {
             addr,
-            stream,
-            read_buf: Vec::with_capacity(64 * 1024),
-            write_queue: VecDeque::new(),
-            bitfield,
-            am_choked: true,
-            interested: false,
-            am_interested: false,
-            inflight: InFlight::default(),
-            pending: PendingRequests::new(),
             token,
-            speed: ByteSpeed::new(Duration::from_millis(200), true, 0.02),
-            last_keepalive: now,
-            timeout: Duration::from_secs(3),
-            rtt: None,
-            rttvar: None,
-            rtt_alpha: 0.2,
-            max_inflight_piece_blocks: 32,
-        })
-    }
-
-    fn update_adaptive_timeout(&mut self) {
-        const MIN_TIMEOUT: Duration = Duration::from_secs(1);
-        const MAX_TIMEOUT: Duration = Duration::from_secs(10);
-
-        let rtt = self.rtt.unwrap_or(MIN_RTT);
-        let rttvar = self.rttvar.unwrap_or(rtt / 2);
-        let desired_timeout = rtt + rttvar.mul_f64(4.0);
-        let timeout = desired_timeout.clamp(MIN_TIMEOUT, MAX_TIMEOUT);
-        self.timeout = timeout;
-    }
-
-    fn update_max_inflight_piece_blocks(&mut self) {
-        const MIN_BLOCKS: usize = 32;
-        const MAX_BLOCKS: usize = 512;
-        let rtt = self.rtt.unwrap_or(MIN_RTT);
-        let rttvar = self.rttvar.unwrap_or(rtt / 2);
-        let effective_rtt = rtt + rttvar.mul_f64(0.5);
-        let speed = self.speed.avg_speed.max(1.0);
-        let max_inflight_piece_blocks =
-            ((speed * effective_rtt.as_secs_f64()) / picker::BLOCK_SIZE as f64).ceil() as usize;
-        self.max_inflight_piece_blocks = max_inflight_piece_blocks.clamp(MIN_BLOCKS, MAX_BLOCKS)
-    }
-
-    fn update(&mut self, sample: Option<Duration>, bytes: usize) {
-        self.update_speed(bytes);
-        self.update_rtt(sample);
-        self.update_adaptive_timeout();
-        self.update_max_inflight_piece_blocks();
-    }
-
-    pub fn max_inflight_piece_blocks(&self) -> usize {
-        self.max_inflight_piece_blocks
-    }
-
-    pub fn timeout(&self) -> Duration {
-        self.timeout
-    }
-
-    pub fn addr(&self) -> &SocketAddr {
-        &self.addr
-    }
-
-    pub fn bitfield(&self) -> &Bitfield {
-        &self.bitfield
-    }
-
-    pub fn token(&self) -> &Token {
-        &self.token
-    }
-
-    pub fn speed(&self) -> f64 {
-        self.speed.avg_speed
-    }
-
-    pub fn enqueue_message(&mut self, message: &PeerMessage) {
-        match message {
-            PeerMessage::Request((piece, offset, len)) => {
-                self.inflight.add(*len as usize);
-                self.pending.insert(BlockKey {
-                    piece: *piece,
-                    offset: *offset,
-                    length: *len,
-                });
-            }
-            _ => {}
+            choked: true,
+            interested: false,
+            peer_choked: true,
+            peer_interested: false,
+            bitfield: None,
+            peer_id: None,
+            incoming: BytesMut::with_capacity(64 * 1024),
+            outgoing: VecDeque::new(),
+            handshake_deadline: Tick(0),
+            last_activity: Tick(0),
+            last_outbound: Tick(0),
+            state: PeerState::Handshaking,
+            stats: PeerStats::new(),
+            pending_requests: HashMap::new(),
         }
-        let encoded = message.encode();
-        self.write_queue.push_back(encoded);
     }
 
-    pub fn socket_write(&mut self, limiter: &mut RateLimiter) -> io::Result<usize> {
-        let mut budget = limiter.allow(self.max_inflight_piece_blocks * picker::BLOCK_SIZE);
-        let mut written = 0;
-        while budget > 0 {
-            let Some(front) = self.write_queue.front_mut() else {
-                break;
-            };
+    fn start_handshake(&mut self, now: Tick) {
+        self.state = PeerState::Handshaking;
+        self.handshake_deadline = now + HANDSHAKE_TIMEOUT;
+    }
 
-            let to_write = budget.min(front.len());
+    fn can_request_blocks(&self) -> bool {
+        if self.choked || !self.interested {
+            return false;
+        }
+        self.pending_requests.len() < self.desired_outstanding_requests()
+    }
 
-            match self.stream.write(&front[..to_write]) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "peer closed",
-                    ));
-                }
-                Ok(n) => {
-                    written += n;
-                    budget -= n;
-                    front.drain(..n);
-                    if front.is_empty() {
-                        self.write_queue.pop_front();
+    fn desired_outstanding_requests(&self) -> usize {
+        let rtt = match self.stats.rtt_ema {
+            Some(rtt) => rtt.max(0.1),
+            None => return 4,
+        };
+
+        let bw = self.stats.download_rate.max(1.0);
+
+        let bdp_bytes = bw * rtt;
+        let blocks = (bdp_bytes / BLOCK_SIZE as f64).ceil() as usize;
+
+        blocks.clamp(MIN_OUTSTANDING, MAX_OUTSTANDING)
+    }
+
+    fn get_request_block_count(&self) -> usize {
+        self.desired_outstanding_requests()
+            .saturating_sub(self.pending_requests.len())
+    }
+
+    fn calculate_timeout(&self) -> Tick {
+        let expected_secs = if let Some(rtt) = self.stats.rtt_ema {
+            let bw = self.stats.download_rate.max(1.0);
+            let block_time = BLOCK_SIZE as f64 / bw;
+            block_time + rtt * 1.5
+        } else {
+            10.0
+        };
+
+        duration_to_ticks(Duration::from_secs_f64(expected_secs))
+    }
+
+    fn remove_timed_out_requests(&mut self, now: Tick) -> Vec<(u32, u32)> {
+        let timeout = self.calculate_timeout();
+        let mut timed_out = Vec::new();
+        self.pending_requests.retain(|&(piece, offset), sent_at| {
+            if now >= *sent_at + timeout {
+                timed_out.push((piece, offset));
+                false
+            } else {
+                true
+            }
+        });
+        timed_out
+    }
+}
+
+#[derive(Debug)]
+pub struct PeerManager {
+    peers: HashMap<Token, Peer>,
+    total_pieces: usize,
+    info_hash: [u8; 20],
+    peer_id: [u8; 20],
+}
+
+impl PeerManager {
+    pub fn new(total_pieces: usize, info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
+        Self {
+            peers: HashMap::new(),
+            total_pieces,
+            info_hash,
+            peer_id,
+        }
+    }
+
+    fn build_handshake(&self) -> BytesMut {
+        let mut buf = BytesMut::with_capacity(68);
+
+        buf.put_u8(19);
+        buf.extend_from_slice(b"BitTorrent protocol");
+        buf.extend_from_slice(&[0u8; 8]);
+        buf.extend_from_slice(&self.info_hash);
+        buf.extend_from_slice(&self.peer_id);
+
+        buf
+    }
+
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
+    }
+
+    pub fn on_tick(&mut self, now: Tick, endgame: bool) -> Vec<PeerAction> {
+        let mut actions = Vec::new();
+
+        for peer in self.peers.values_mut() {
+            update_peer_rate(now, peer);
+            match peer.state {
+                PeerState::Handshaking => {
+                    if now >= peer.handshake_deadline {
+                        eprintln!("<> {} handshake timeout", peer.addr);
+                        actions.push(PeerAction::Close { token: peer.token });
                     }
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
+                PeerState::Active => {
+                    if now >= peer.last_activity + PEER_IDLE_TIMEOUT {
+                        eprintln!("<> {} idle timeout", peer.addr);
+                        actions.push(PeerAction::Close { token: peer.token });
+                        continue;
+                    }
+
+                    if now >= peer.last_outbound + KEEPALIVE_INTERVAL {
+                        eprintln!("< {} keepalive", peer.addr);
+                        push_write_peer_msg(peer, &PeerMessage::KeepAlive, &mut actions, now);
+                    }
+
+                    let timeout_blocks = peer.remove_timed_out_requests(now);
+                    if !timeout_blocks.is_empty() {
+                        actions.push(PeerAction::TimeoutBlocks {
+                            blocks: timeout_blocks,
+                        });
+                        if !endgame {
+                            if peer.can_request_blocks() {
+                                actions.push(PeerAction::PickBlocks {
+                                    token: peer.token,
+                                    count: peer.get_request_block_count(),
+                                });
+                            }
+                        }
+                    }
+                    if endgame && peer.can_request_blocks() {
+                        if let Some(bf) = &peer.bitfield {
+                            actions.push(PeerAction::RequestMissingBlocks {
+                                token: peer.token,
+                                bitfield: bf.clone(),
+                            });
+                        }
+                    }
+                }
             }
         }
 
-        Ok(written)
+        actions
     }
 
-    pub fn socket_read(
+    pub fn on_request_missing_blocks(
         &mut self,
-        limiter: &mut RateLimiter,
-        max_reads: usize,
-    ) -> io::Result<usize> {
-        const DEFAULT_MAX_TO_READ: usize = 128 * 1024;
-        let max_to_read = limiter.allow(DEFAULT_MAX_TO_READ);
-        if max_to_read == 0 {
-            eprintln!("{} is not allowed to read at the moment", self.addr);
-            return Ok(0);
-        }
-        let mut total = 0;
-        let mut reads = 0;
-        let mut buf = [0u8; READ_CHUNK];
-        let mut budget = max_to_read;
-        while budget > 0 && reads < max_reads && total < max_to_read {
-            let remaining_bytes = max_to_read.saturating_sub(total);
-            let to_read = budget.min(buf.len()).min(remaining_bytes);
-            match self.stream.read(&mut buf[..to_read]) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "peer closed",
-                    ));
-                }
-                Ok(n) => {
-                    self.read_buf.extend_from_slice(&buf[..n]);
-                    total += n;
-                    budget -= n;
-                    reads += 1;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
-            }
-        }
-
-        Ok(total)
-    }
-
-    pub fn can_drain(&self) -> bool {
-        self.read_buf.len() >= 4
-    }
-
-    pub fn drain_messages<F>(
-        &mut self,
-        mut message_handle: F,
-    ) -> Result<(), Box<dyn std::error::Error>>
-    where
-        F: FnMut(MessageHandle),
-    {
-        const DEFAULT_MAX_BYTES_PER_READ: usize = 64 * 1024;
-        let mut offset = 0;
-        let buf_len = self.read_buf.len();
-        let mut bytes_read = 0;
-        let mut messages_read = 0;
-        let max_bytes_per_read =
-            (self.max_inflight_piece_blocks * picker::BLOCK_SIZE).min(DEFAULT_MAX_BYTES_PER_READ);
-        let max_messages_per_read = (self.max_inflight_piece_blocks / 2).clamp(16, 128);
-        while messages_read < max_messages_per_read && bytes_read < max_bytes_per_read {
-            if buf_len.saturating_sub(offset) < 4 {
-                break;
-            }
-
-            let len = u32::from_be_bytes(self.read_buf[offset..offset + 4].try_into()?) as usize;
-            if buf_len.saturating_sub(offset) < 4 + len {
-                break;
-            }
-
-            let payload_start = offset + 4;
-            let payload_end = payload_start + len;
-
-            let payload = &self.read_buf[payload_start..payload_end];
-            let msg = PeerMessage::parse(payload, self.bitfield.len())?;
-
-            if let Some(handle) = self.handle_message(msg) {
-                message_handle(handle);
-            }
-
-            offset = payload_end;
-            messages_read += 1;
-            bytes_read += 4 + len;
-        }
-
-        if offset > 0 {
-            self.read_buf.drain(..offset);
-        }
-
-        Ok(())
-    }
-
-    pub fn expire_requests(&mut self) -> Vec<BlockKey> {
-        let expired = self.pending.expire(self.timeout);
-        for key in &expired {
-            self.inflight.complete(key.length as usize);
-        }
-        expired
-    }
-
-    fn handle_message(&mut self, message: PeerMessage) -> Option<MessageHandle> {
-        match message {
-            PeerMessage::Choke => self.am_choked = true,
-            PeerMessage::Unchoke => {
-                self.am_choked = false;
-                return Some(MessageHandle::Unchoke);
-            }
-            PeerMessage::Interested => self.interested = true,
-            PeerMessage::NotInterested => self.interested = false,
-            PeerMessage::Have(piece) => {
-                let piece = piece as usize;
-                self.bitfield.set(&piece, true);
-                return Some(MessageHandle::Have {
-                    bitfield: Arc::new(self.bitfield.clone()),
-                });
-            }
-            PeerMessage::Bitfield(bitfield) => {
-                self.bitfield.merge(&bitfield);
-                return Some(MessageHandle::Bitfield {
-                    bitfield: Arc::new(self.bitfield.clone()),
-                });
-            }
-            PeerMessage::Request((piece, offset, len)) => {
-                eprintln!("{} REQUEST {} {} {}", self.addr, piece, offset, len)
-            }
-            PeerMessage::Piece((piece, offset, data)) => {
-                let len = data.len();
-                let key = BlockKey {
-                    piece,
-                    offset,
-                    length: len as u32,
-                };
-
-                let mut sample_opt = None;
-                if let Some(p) = self.pending.remove(&key) {
-                    sample_opt = Some(Instant::now() - p.requested_at);
-                    self.inflight.complete(len);
-                }
-
-                self.update(sample_opt, len);
-
-                return Some(MessageHandle::Piece {
-                    piece: piece as usize,
-                    offset: offset as usize,
-                    data,
-                });
-            }
-            PeerMessage::Cancel((piece, offset, len)) => {
-                eprintln!("{} CANCEL {} {} {}", self.addr, piece, offset, len)
-            }
-            PeerMessage::Port(port) => eprintln!("{} PORT {}", self.addr, port),
-            PeerMessage::KeepAlive => eprintln!("{} KEEPALIVE", self.addr),
-        }
-
-        None
-    }
-
-    pub fn maybe_send_keepalive(&mut self) {
-        if self.last_keepalive.elapsed() >= KEEPALIVE_INTERVAL {
-            eprintln!("sending keepalive to {}", self.addr);
-            self.enqueue_message(&PeerMessage::KeepAlive);
-            self.last_keepalive = Instant::now();
-        }
-    }
-
-    pub fn maybe_update_interest(&mut self, bitfield_interested: bool) -> bool {
-        let was_interested = self.am_interested;
-        self.am_interested = bitfield_interested;
-        if was_interested != self.am_interested {
-            if self.am_interested {
-                self.enqueue_message(&PeerMessage::Interested);
-                return true;
-            }
-        }
-        false
-    }
-
-    fn update_speed(&mut self, bytes: usize) {
-        self.speed.update(bytes);
-    }
-
-    fn update_rtt(&mut self, sample: Option<Duration>) {
-        const MIN_RTT: Duration = Duration::from_millis(20);
-        const MAX_RTT: Duration = Duration::from_secs(2);
-        let sample = match sample {
-            Some(s) => s.clamp(MIN_RTT, MAX_RTT),
-            None => return,
+        token: Token,
+        missing_blocks: Vec<(u32, u32)>,
+    ) -> Vec<PeerAction> {
+        let peer = match self.peers.get_mut(&token) {
+            Some(p) => p,
+            None => return vec![],
         };
-        match (self.rtt, self.rttvar) {
-            (Some(rtt), Some(rttvar)) => {
-                let alpha = self.rtt_alpha;
-                let beta = 0.25;
-
-                let rtt_secs = rtt.as_secs_f64();
-                let sample_secs = sample.as_secs_f64();
-
-                let new_rtt = alpha * sample_secs + (1.0 - alpha) * rtt_secs;
-
-                let deviation = (sample_secs - rtt_secs).abs();
-                let new_rttvar = beta * deviation + (1.0 - beta) * rttvar.as_secs_f64();
-
-                self.rtt = Some(Duration::from_secs_f64(new_rtt));
-                self.rttvar = Some(Duration::from_secs_f64(new_rttvar));
+        if peer.can_request_blocks() {
+            let count = missing_blocks.len().min(peer.get_request_block_count());
+            if count > 0 {
+                return vec![PeerAction::PickBlocks { token, count }];
+            } else {
+                eprintln!(
+                    ">>> {} cannot request blocks, choked={}, interested={}, desired_count={}, inflight={}, missing_block_count={}",
+                    peer.addr,
+                    peer.choked,
+                    peer.interested,
+                    peer.desired_outstanding_requests(),
+                    peer.pending_requests.len(),
+                    missing_blocks.len()
+                )
             }
-            _ => {
-                self.rtt = Some(sample);
-                self.rttvar = Some(sample / 2);
+        } else {
+            eprintln!(
+                "> {} cannot request blocks, choked={}, interested={}, desired_count={}, inflight={}, missing_block_count={}",
+                peer.addr,
+                peer.choked,
+                peer.interested,
+                peer.desired_outstanding_requests(),
+                peer.pending_requests.len(),
+                missing_blocks.len()
+            )
+        }
+
+        vec![]
+    }
+
+    pub fn on_request_blocks(&mut self) -> Vec<PeerAction> {
+        let mut peers: Vec<_> = self
+            .peers
+            .values()
+            .filter(|p| p.can_request_blocks())
+            .collect();
+        peers.sort_by(|a, b| {
+            peer_score(b)
+                .partial_cmp(&peer_score(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut actions = Vec::new();
+        for peer in peers {
+            actions.push(PeerAction::PickBlocks {
+                token: peer.token,
+                count: peer.get_request_block_count(),
+            });
+        }
+
+        actions
+    }
+
+    pub fn on_cancel_block(
+        &mut self,
+        piece: u32,
+        offset: u32,
+        length: u32,
+        now: Tick,
+    ) -> Vec<PeerAction> {
+        let mut actions = Vec::new();
+        let key = (piece, offset);
+        let msg = PeerMessage::Cancel((piece, offset, length));
+        for peer in self.peers.values_mut() {
+            if peer.pending_requests.remove(&key).is_some() {
+                push_write_peer_msg(peer, &msg, &mut actions, now);
+            }
+        }
+
+        actions
+    }
+
+    pub fn on_data(&mut self, token: Token, data: &[u8], now: Tick) -> Vec<PeerAction> {
+        let peer = match self.peers.get_mut(&token) {
+            Some(p) => p,
+            None => return vec![],
+        };
+
+        if data.len() > 0 {
+            peer.last_activity = now;
+        }
+
+        peer.incoming.extend_from_slice(data);
+
+        match peer.state {
+            PeerState::Handshaking => match try_parse_handshake(peer, &self.info_hash) {
+                Ok(completed) => {
+                    if completed {
+                        return vec![PeerAction::HandshakeSuccess { token }];
+                    }
+                    return vec![];
+                }
+                Err(e) => {
+                    eprintln!("{} handshake failed: {}", peer.addr, e);
+                    return vec![PeerAction::Close { token }];
+                }
+            },
+            PeerState::Active => parse_messages(peer, self.total_pieces, now),
+        }
+    }
+
+    pub fn on_connected(&mut self, addr: SocketAddr, token: Token, now: Tick) -> Vec<PeerAction> {
+        let mut peer = Peer::new(addr, token);
+
+        peer.start_handshake(now);
+        peer.last_activity = now;
+
+        peer.outgoing.push_back(self.build_handshake());
+        self.peers.insert(token, peer);
+
+        vec![
+            PeerAction::PeerConnected { token },
+            PeerAction::Write { token },
+        ]
+    }
+
+    pub fn push_write(&mut self, token: &Token, data: BytesMut, now: Tick) -> Vec<PeerAction> {
+        let peer = match self.peers.get_mut(token) {
+            Some(p) => p,
+            None => return vec![],
+        };
+        let mut actions = Vec::new();
+
+        push_write_peer(peer, data, &mut actions, now);
+
+        actions
+    }
+
+    pub fn on_close(&mut self, token: &Token) -> bool {
+        self.peers.remove(token).is_some()
+    }
+
+    pub fn collect_outgoing(&mut self, token: &Token) -> Vec<BytesMut> {
+        let peer = match self.peers.get_mut(token) {
+            Some(p) => p,
+            None => return vec![],
+        };
+        if peer.outgoing.is_empty() {
+            return vec![];
+        }
+
+        let mut data = Vec::with_capacity(peer.outgoing.len());
+        while let Some(msg) = peer.outgoing.pop_front() {
+            data.push(msg);
+        }
+
+        data
+    }
+
+    pub fn on_update_interest(
+        &mut self,
+        token: Token,
+        interested: bool,
+        now: Tick,
+    ) -> Vec<PeerAction> {
+        let peer = match self.peers.get_mut(&token) {
+            Some(p) => p,
+            None => return vec![],
+        };
+        let mut actions = Vec::new();
+        let was_interested = peer.interested;
+        peer.interested = interested;
+        if was_interested != peer.interested {
+            let msg = if peer.interested {
+                PeerMessage::Interested
+            } else {
+                PeerMessage::NotInterested
+            };
+            push_write_peer_msg(peer, &msg, &mut actions, now);
+            if peer.can_request_blocks() {
+                actions.push(PeerAction::PickBlocks {
+                    token,
+                    count: peer.get_request_block_count(),
+                });
+            }
+        }
+
+        actions
+    }
+
+    pub fn get_bitfield(&self, token: &Token) -> Option<Bitfield> {
+        let peer = match self.peers.get(token) {
+            Some(p) => p,
+            None => return None,
+        };
+
+        peer.bitfield.clone()
+    }
+
+    pub fn enqueue_messages(
+        &mut self,
+        token: Token,
+        messages: &[PeerMessage],
+        now: Tick,
+    ) -> Vec<PeerAction> {
+        let mut actions = Vec::new();
+        let peer = match self.peers.get_mut(&token) {
+            Some(p) => p,
+            None => return actions,
+        };
+        for msg in messages {
+            push_write_peer_msg(peer, msg, &mut actions, now);
+        }
+
+        actions
+    }
+}
+
+fn try_parse_handshake(peer: &mut Peer, info_hash: &[u8; 20]) -> Result<bool, io::Error> {
+    if peer.incoming.len() < 68 {
+        return Ok(false);
+    }
+
+    let pstrlen = peer.incoming[0] as usize;
+    let total_len = 1 + pstrlen + 8 + 20 + 20;
+    if peer.incoming.len() < total_len {
+        return Ok(false);
+    }
+
+    let mut handshake = peer.incoming.split_to(total_len);
+
+    let pstrlen = handshake.get_u8();
+    if pstrlen != 19 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid pstr length {}", pstrlen),
+        ));
+    }
+
+    let mut protocol = vec![0u8; pstrlen as usize];
+    handshake.copy_to_slice(&mut protocol);
+
+    if &protocol != b"BitTorrent protocol" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid protocol {:?}", protocol),
+        ));
+    }
+
+    // reserved bytes
+    handshake.advance(8);
+
+    let mut received_info_hash = [0u8; 20];
+    handshake.copy_to_slice(&mut received_info_hash);
+
+    if &received_info_hash != info_hash {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid info hash {:?}", received_info_hash),
+        ));
+    }
+
+    let mut peer_id = [0u8; 20];
+    handshake.copy_to_slice(&mut peer_id);
+
+    peer.peer_id = Some(peer_id);
+    peer.state = PeerState::Active;
+
+    Ok(true)
+}
+
+fn parse_messages(peer: &mut Peer, total_pieces: usize, now: Tick) -> Vec<PeerAction> {
+    const MAX_MESSAGE_LEN: usize = 1 << 20;
+    let mut actions = Vec::new();
+    loop {
+        if peer.incoming.len() < 4 {
+            break;
+        }
+
+        let len = u32::from_be_bytes(peer.incoming[..4].try_into().unwrap()) as usize;
+
+        if len > MAX_MESSAGE_LEN {
+            eprintln!("{} invalid message length", peer.addr);
+            return vec![PeerAction::Close { token: peer.token }];
+        }
+
+        if peer.incoming.len() < 4 + len {
+            break;
+        }
+
+        peer.incoming.advance(4);
+
+        if len == 0 {
+            handle_message(peer, PeerMessage::KeepAlive, now, &mut actions);
+            continue;
+        }
+
+        let payload = peer.incoming.split_to(len);
+
+        match PeerMessage::parse(&payload, total_pieces) {
+            Ok(msg) => {
+                handle_message(peer, msg, now, &mut actions);
+            }
+            Err(e) => {
+                eprintln!("{} invalid message: {}", peer.addr, e);
+                actions.push(PeerAction::Close { token: peer.token });
+                break;
             }
         }
     }
 
-    pub fn is_choked(&self) -> bool {
-        self.am_choked
-    }
+    actions
+}
 
-    pub fn am_interested(&self) -> bool {
-        self.am_interested
+fn handle_message(peer: &mut Peer, msg: PeerMessage, now: Tick, actions: &mut Vec<PeerAction>) {
+    match msg {
+        PeerMessage::Choke => {
+            peer.choked = true;
+            peer.pending_requests.clear();
+            peer.outgoing.clear();
+            actions.push(PeerAction::Choked { token: peer.token });
+        }
+        PeerMessage::Unchoke => {
+            peer.choked = false;
+            if peer.can_request_blocks() {
+                actions.push(PeerAction::PickBlocks {
+                    token: peer.token,
+                    count: peer.get_request_block_count(),
+                });
+            }
+        }
+        PeerMessage::Interested => {
+            peer.peer_interested = true;
+        }
+        PeerMessage::NotInterested => {
+            peer.peer_interested = false;
+        }
+        PeerMessage::Have(piece) => {
+            if let Some(bitfield) = &mut peer.bitfield {
+                bitfield.set(&(piece as usize), true);
+                actions.push(PeerAction::PeerHave {
+                    token: peer.token,
+                    piece,
+                });
+            }
+        }
+        PeerMessage::Bitfield(bitfield) => {
+            if let Some(bf) = &mut peer.bitfield {
+                bf.merge_safe(&bitfield);
+            } else {
+                peer.bitfield = Some(bitfield.clone());
+            }
+            actions.push(PeerAction::PeerBitfield {
+                token: peer.token,
+                bitfield: bitfield.clone(),
+            });
+        }
+        PeerMessage::Request(_) => todo!(),
+        PeerMessage::Piece((piece, offset, data)) => {
+            if let Some(sent_at) = peer.pending_requests.remove(&(piece, offset)) {
+                let rtt = (now - sent_at).as_f64();
+
+                peer.stats.rtt_ema = Some(match peer.stats.rtt_ema {
+                    Some(old) => 0.2 * rtt + 0.8 * old,
+                    None => rtt,
+                });
+            }
+
+            let len = data.len() as u64;
+            peer.stats.downloaded_bytes += len;
+
+            let mut buf = BytesMut::new();
+            buf.extend_from_slice(&data);
+            actions.push(PeerAction::BlockReceived {
+                token: peer.token,
+                piece,
+                offset,
+                data: Bytes::from(buf),
+            });
+            if peer.can_request_blocks() {
+                actions.push(PeerAction::PickBlocks {
+                    token: peer.token,
+                    count: peer.get_request_block_count(),
+                });
+            }
+        }
+        PeerMessage::Cancel(_) => todo!(),
+        PeerMessage::Port(_) => todo!(),
+        PeerMessage::KeepAlive => {}
     }
+}
+
+fn push_write_peer_msg(
+    peer: &mut Peer,
+    msg: &PeerMessage,
+    actions: &mut Vec<PeerAction>,
+    now: Tick,
+) {
+    match msg {
+        PeerMessage::Request((piece, offset, _)) => {
+            peer.pending_requests.insert((*piece, *offset), now);
+        }
+        PeerMessage::Choke => {
+            peer.peer_choked = true;
+        }
+        PeerMessage::Unchoke => {
+            peer.peer_choked = false;
+        }
+        _ => {}
+    }
+    let data = {
+        let v = msg.encode();
+        let mut b = BytesMut::with_capacity(v.len());
+        b.extend_from_slice(&v);
+        b
+    };
+    push_write_peer(peer, data, actions, now);
+}
+
+fn push_write_peer(peer: &mut Peer, data: BytesMut, actions: &mut Vec<PeerAction>, now: Tick) {
+    peer.stats.uploaded_bytes += data.len() as u64;
+    peer.outgoing.push_back(data);
+    peer.last_outbound = now;
+    actions.push(PeerAction::Write { token: peer.token });
+}
+
+fn update_rate(bytes: u64, dt_ticks: Tick, rate: &mut f64) {
+    let dt = dt_ticks.as_secs_f64();
+    if dt > 0.0 {
+        let inst = bytes as f64 / dt;
+        *rate = RATE_ALPHA * inst + (1.0 - RATE_ALPHA) * *rate;
+    }
+}
+
+fn update_peer_rate(now: Tick, peer: &mut Peer) {
+    let dt = now - peer.stats.last_rate_tick;
+    if dt >= duration_to_ticks(Duration::from_secs(1)) {
+        update_rate(
+            peer.stats.downloaded_bytes,
+            dt,
+            &mut peer.stats.download_rate,
+        );
+        peer.stats.downloaded_bytes = 0;
+
+        update_rate(peer.stats.uploaded_bytes, dt, &mut peer.stats.upload_rate);
+        peer.stats.uploaded_bytes = 0;
+
+        peer.stats.last_rate_tick = now;
+    }
+}
+
+fn peer_score(peer: &Peer) -> f64 {
+    let bw = peer.stats.download_rate;
+    let rtt = peer.stats.rtt_ema.unwrap_or(1000.0);
+
+    bw / rtt.max(1.0)
 }

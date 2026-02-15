@@ -1,7 +1,7 @@
 use rutor::bytespeed::ByteSpeed;
-use rutor::engine2::{Engine2, EngineStats, Tick, duration_to_ticks};
+use rutor::engine::{Engine, EngineStats, Tick, duration_to_ticks};
 use rutor::net::MAX_CONNECTIONS;
-use rutor::{picker2, torrent};
+use rutor::{BLOCK_SIZE, torrent};
 use std::env;
 use std::fs::File;
 use std::io::Write;
@@ -215,7 +215,7 @@ impl ProgressTracker {
             self.stats.complete_pieces,
             self.total_pieces,
             self.stats.inflight_blocks,
-            self.human_bytes((self.stats.inflight_blocks * picker2::BLOCK_SIZE) as u64)
+            self.human_bytes((self.stats.inflight_blocks * BLOCK_SIZE) as u64)
         );
         println!(
             "{}",
@@ -372,7 +372,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_pieces = torrent.info.piece_hashes.len();
     let total_size = torrent.info.total_size;
     let name = torrent.info.name.clone();
-    let mut engine = Engine2::new(torrent, 0, 0)?;
+    let mut engine = Engine::new(torrent, 0, 0)?;
     let mut progress_tracker = ProgressTracker::new(
         &name,
         total_size,

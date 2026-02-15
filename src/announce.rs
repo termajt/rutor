@@ -12,7 +12,7 @@ use rand::RngCore;
 use reqwest::blocking::Client;
 
 use crate::bencode::{self, Bencode};
-use crate::engine2::EngineEvent;
+use crate::engine::EngineEvent;
 
 #[derive(Debug)]
 pub enum AnnounceEvent {

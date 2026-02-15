@@ -1,490 +1,391 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::SocketAddr,
-    time::{Duration, Instant},
+    ops::{BitOr, BitOrAssign},
 };
 
-use rand::{rngs::ThreadRng, seq::SliceRandom};
+use mio::Token;
+use rand::seq::SliceRandom;
 
-use crate::bitfield::Bitfield;
+use crate::{BLOCK_SIZE, PeerMessage, bitfield::Bitfield, engine::Tick};
 
-pub const BLOCK_SIZE: usize = 16 * 1024;
-
-type BlockKey = (usize, usize);
+const MAX_INFLIGHT_BLOCKS: usize = 512;
 
 #[derive(Debug)]
-struct BlockInFlight {
-    first_requested_at: Instant,
-    requested_by: HashSet<SocketAddr>,
+pub struct Request {
+    pub piece: u32,
+    pub offset: u32,
+    pub length: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct PieceReceiveStatus(u8);
+
+impl PieceReceiveStatus {
+    pub const NONE: Self = Self(0);
+    pub const BLOCK_RECEIVED: Self = Self(1 << 0);
+    pub const PIECE_COMPLETE: Self = Self(1 << 1);
+
+    pub fn contains(&self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+impl BitOr for PieceReceiveStatus {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for PieceReceiveStatus {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum BlockStatus {
+    NotRequested,
+    Pending,
+    Received,
 }
 
 #[derive(Debug)]
-pub struct PieceReceiveStatus {
-    pub piece: usize,
-    pub received: bool,
-    pub complete: bool,
-    pub expected_hash: [u8; 20],
+struct Block {
+    requested_by: HashSet<Token>,
+    requested_at: Tick,
+    status: BlockStatus,
 }
 
-#[derive(Debug)]
-pub struct BlockRequest {
-    pub piece: usize,
-    pub offset: usize,
-    pub length: usize,
+impl Block {
+    fn new() -> Self {
+        Self {
+            requested_by: HashSet::new(),
+            requested_at: Tick(0),
+            status: BlockStatus::NotRequested,
+        }
+    }
 }
 
 #[derive(Debug)]
 struct Piece {
-    received: Bitfield,
-    expected_hash: [u8; 20],
-    length: usize,
-    availability: usize,
+    blocks: Vec<Block>,
     received_count: usize,
-    block_size: usize,
+    length: u32,
+    block_size: u32,
 }
 
 impl Piece {
-    fn new(piece_len: usize, block_size: usize, expected_hash: [u8; 20]) -> Self {
-        let blocks = (piece_len + block_size - 1) / block_size;
+    fn new(length: u32, block_size: u32) -> Self {
         Self {
-            received: Bitfield::new(blocks),
-            expected_hash,
-            length: piece_len,
-            availability: 0,
+            blocks: generate_blocks(length, block_size),
             received_count: 0,
+            length,
             block_size,
         }
     }
 
-    fn mark_block(&mut self, offset: usize) -> bool {
-        let block_idx = offset / BLOCK_SIZE;
-        if self.received.get(&block_idx) {
-            return false;
-        }
-        self.received.set(&block_idx, true);
-        self.received_count += 1;
-        true
+    fn is_complete(&self) -> bool {
+        self.received_count >= self.blocks.len()
     }
 
-    fn is_complete(&self) -> bool {
-        self.received_count >= self.received.len()
+    fn mark_received(&mut self, offset: u32) -> bool {
+        let block_idx = offset as usize / BLOCK_SIZE;
+        let block = match self.blocks.get_mut(block_idx) {
+            Some(b) => b,
+            None => return false,
+        };
+        match block.status {
+            BlockStatus::NotRequested | BlockStatus::Pending => {
+                block.status = BlockStatus::Received;
+                self.received_count += 1;
+                return true;
+            }
+            BlockStatus::Received => {
+                return false;
+            }
+        }
     }
 
     fn reset(&mut self) {
-        self.received.reset();
         self.received_count = 0;
+        self.blocks = generate_blocks(self.length, self.block_size);
     }
 
-    fn downloaded_bytes(&self) -> usize {
-        let bytes = self.received_count * self.block_size;
-        bytes.min(self.length)
+    fn downloaded_bytes(&self) -> u32 {
+        let bytes = self.received_count * self.block_size as usize;
+        bytes.min(self.length as usize) as u32
     }
 }
 
 #[derive(Debug)]
 pub struct PiecePicker {
-    requested: HashMap<BlockKey, BlockInFlight>,
-    endgame: bool,
+    bitfield: Bitfield,
     pieces: HashMap<usize, Piece>,
-    sorted_pieces: Vec<usize>,
-    dirty: bool,
-    rng: ThreadRng,
-    inflight_per_peer: HashMap<SocketAddr, usize>,
-    verified_bytes: usize,
+    availability: Vec<usize>,
     total_blocks: u64,
-    active_pieces: HashSet<usize>,
+    endgame: bool,
+    verified_bytes: u64,
+    inflight_blocks: usize,
+    candidates: Vec<usize>,
 }
 
 impl PiecePicker {
-    pub fn new(
-        piece_length: usize,
-        total_size: u64,
-        piece_hashes: Vec<[u8; 20]>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(total_pieces: usize, total_length: u64, piece_length: u32) -> Self {
         let mut pieces = HashMap::new();
 
-        let num_pieces = piece_hashes.len();
         let mut total_blocks = 0u64;
 
-        for i in 0..num_pieces {
-            let len = if i == num_pieces - 1 {
-                total_size as usize - piece_length * (num_pieces - 1)
-            } else {
-                piece_length
-            };
-            let expected_hash: [u8; 20] = piece_hashes[i].as_slice().try_into()?;
-            let piece = Piece::new(len, BLOCK_SIZE, expected_hash);
-            total_blocks += piece.received.len() as u64;
+        for i in 0..total_pieces {
+            let len = length_for_piece(i, total_pieces, total_length, piece_length);
+            let piece = Piece::new(len, BLOCK_SIZE as u32);
+            total_blocks += piece.blocks.len() as u64;
             pieces.insert(i, piece);
         }
-        Ok(Self {
-            requested: HashMap::new(),
-            endgame: false,
+        Self {
+            bitfield: Bitfield::new(total_pieces),
             pieces,
-            sorted_pieces: Vec::new(),
-            dirty: true,
-            rng: rand::rng(),
-            inflight_per_peer: HashMap::new(),
-            verified_bytes: 0,
+            availability: vec![0; total_pieces],
             total_blocks,
-            active_pieces: HashSet::new(),
-        })
+            endgame: false,
+            verified_bytes: 0,
+            inflight_blocks: 0,
+            candidates: Vec::with_capacity(total_pieces),
+        }
     }
 
-    fn rebuild_if_needed(&mut self) {
-        if !self.dirty {
+    pub fn register_peer_bitfield(&mut self, bitfield: &Bitfield) {
+        for i in 0..bitfield.len() {
+            if bitfield.get(&i) {
+                self.availability[i] += 1;
+            }
+        }
+    }
+
+    pub fn remove_peer_bitfield(&mut self, bitfield: &Bitfield) {
+        for i in 0..bitfield.len() {
+            if bitfield.get(&i) {
+                self.availability[i] = self.availability[i].saturating_sub(1);
+            }
+        }
+    }
+
+    pub fn register_peer_have(&mut self, piece: u32) {
+        self.availability[piece as usize] += 1;
+    }
+
+    pub fn on_block_received(&mut self, piece: u32, offset: u32) -> PieceReceiveStatus {
+        let idx = piece as usize;
+        let mut status = PieceReceiveStatus::NONE;
+        if let Some(p) = self.pieces.get_mut(&idx) {
+            self.inflight_blocks = self.inflight_blocks.saturating_sub(1);
+            if p.mark_received(offset) {
+                status |= PieceReceiveStatus::BLOCK_RECEIVED;
+                if p.is_complete() {
+                    status |= PieceReceiveStatus::PIECE_COMPLETE;
+                }
+            }
+        }
+
+        status
+    }
+
+    pub fn on_piece_verified(&mut self, piece: u32, verified: bool) {
+        let idx = piece as usize;
+        if verified {
+            if let Some(p) = self.pieces.remove(&idx) {
+                self.bitfield.set(&idx, true);
+                self.verified_bytes += p.length as u64;
+            }
             return;
         }
+        if let Some(p) = self.pieces.get_mut(&idx) {
+            self.bitfield.set(&idx, false);
+            p.reset();
+        }
+    }
 
-        let mut v: Vec<_> = self
-            .pieces
-            .iter()
-            .map(|(idx, p)| (*idx, p.availability, p.received_count))
-            .collect();
+    pub fn missing_blocks_for_peer(&self, bitfield: &Bitfield) -> Vec<(u32, u32)> {
+        let mut blocks = Vec::new();
 
-        let top_n = 10.min(v.len());
-        if top_n > 0 {
-            v.select_nth_unstable_by(top_n - 1, |a, b| (a.1, a.2).cmp(&(b.1, b.2)));
-            v[..top_n].shuffle(&mut self.rng);
+        for (piece_index, piece) in self.pieces.iter() {
+            if !bitfield.get(piece_index) {
+                continue;
+            }
+            for (block_idx, block) in piece.blocks.iter().enumerate() {
+                if block.status != BlockStatus::Received {
+                    let offset = block_idx * BLOCK_SIZE;
+                    blocks.push((*piece_index as u32, offset as u32));
+                }
+            }
         }
 
-        self.sorted_pieces = v.into_iter().map(|(idx, _, _)| idx).collect();
-        self.dirty = false;
+        blocks
+    }
+
+    pub fn pick_blocks(
+        &mut self,
+        token: Token,
+        peer_bitfield: &Bitfield,
+        now: Tick,
+        requested_count: usize,
+    ) -> Vec<PeerMessage> {
+        let inflight = self.inflight_blocks;
+        if inflight >= MAX_INFLIGHT_BLOCKS {
+            return vec![];
+        }
+
+        let max_requestable = MAX_INFLIGHT_BLOCKS
+            .saturating_sub(inflight)
+            .min(requested_count);
+        if max_requestable == 0 {
+            return vec![];
+        }
+
+        if self.endgame {
+            self.pick_endgame_blocks(token, max_requestable, peer_bitfield, now)
+        } else {
+            self.pick_rarest_first_blocks(token, max_requestable, peer_bitfield, now)
+        }
     }
 
     fn pick_endgame_blocks(
         &mut self,
-        addr: &SocketAddr,
-        peer_bf: &Bitfield,
-        now: Instant,
-        mut free: usize,
-    ) -> Vec<BlockRequest> {
-        let mut out = Vec::new();
-        let mut remaining_blocks = Vec::new();
-        for (piece_idx, piece) in &self.pieces {
-            if piece.is_complete() {
-                continue;
-            }
-            if !peer_bf.get(piece_idx) {
-                continue;
-            }
-            let blocks = blocks_per_piece(piece.length, BLOCK_SIZE);
-            for block_idx in 0..blocks {
-                if !piece.received.get(&block_idx) {
-                    remaining_blocks.push((*piece_idx, block_idx));
-                }
+        token: Token,
+        max_requestable: usize,
+        peer_bitfield: &Bitfield,
+        now: Tick,
+    ) -> Vec<PeerMessage> {
+        let mut requests = Vec::new();
+        let mut count = max_requestable;
+
+        self.candidates.clear();
+        for (&i, _) in self.pieces.iter() {
+            if peer_bitfield.get(&i) {
+                self.candidates.push(i);
             }
         }
+        self.candidates.shuffle(&mut rand::rng());
 
-        remaining_blocks.shuffle(&mut self.rng);
-
-        let mut activated_this_call = HashSet::new();
-
-        for (piece_idx, block_idx) in remaining_blocks {
-            if free == 0 {
+        for &piece_idx in &self.candidates {
+            if count == 0 {
                 break;
             }
-            let is_active = self.active_pieces.contains(&piece_idx);
-            let piece = &self.pieces[&piece_idx];
-            let offset = block_idx * BLOCK_SIZE;
-            let length = (piece.length - offset).min(BLOCK_SIZE);
+            let piece = match self.pieces.get_mut(&piece_idx) {
+                Some(p) => p,
+                None => continue,
+            };
 
-            let key = (piece_idx, offset);
-            match self.requested.get_mut(&key) {
-                Some(inflight) => {
-                    if !inflight.requested_by.insert(*addr) {
-                        continue;
+            if piece.is_complete() {
+                // Waiting for verification
+                continue;
+            }
+
+            for (block_idx, block) in piece.blocks.iter_mut().enumerate() {
+                if count == 0 {
+                    break;
+                }
+                match block.status {
+                    BlockStatus::NotRequested => {
+                        block.requested_at = now;
+                        block.status = BlockStatus::Pending;
                     }
+                    BlockStatus::Pending => {
+                        if block.requested_by.contains(&token) || block.requested_by.len() >= 2 {
+                            continue;
+                        }
+                    }
+                    BlockStatus::Received => continue,
                 }
-                None => {
-                    let mut block_in_flight = BlockInFlight {
-                        first_requested_at: now,
-                        requested_by: HashSet::new(),
-                    };
-                    block_in_flight.requested_by.insert(*addr);
-                    self.requested.insert(key, block_in_flight);
-                }
-            }
+                self.inflight_blocks += 1;
+                block.requested_by.insert(token);
 
-            if !is_active {
-                activated_this_call.insert(piece_idx);
-            }
+                let offset = block_idx * BLOCK_SIZE;
+                let length = BLOCK_SIZE.min(piece.length as usize - offset);
 
-            *self.inflight_per_peer.entry(*addr).or_default() += 1;
-            out.push(BlockRequest {
-                piece: piece_idx,
-                offset,
-                length,
-            });
-            free = free.saturating_sub(1);
+                requests.push(PeerMessage::Request((
+                    piece_idx as u32,
+                    offset as u32,
+                    length as u32,
+                )));
+
+                count = count.saturating_sub(1);
+            }
         }
 
-        for p in activated_this_call {
-            self.adapt_active_pieces(p, false);
-        }
-
-        out
+        requests
     }
 
     fn pick_rarest_first_blocks(
         &mut self,
-        addr: &SocketAddr,
-        peer_bf: &Bitfield,
-        now: Instant,
-        mut free: usize,
-    ) -> Vec<BlockRequest> {
-        self.rebuild_if_needed();
-        let mut out = Vec::new();
-        // Iterator: active pieces first, then sorted pieces
-        let pieces_iter = self.active_pieces.iter().copied().chain(
-            self.sorted_pieces
-                .iter()
-                .copied()
-                .filter(|p| !self.active_pieces.contains(p)),
-        );
-        let mut activated = HashSet::new();
-        for piece_index in pieces_iter {
-            if free == 0 {
+        token: Token,
+        max_requestable: usize,
+        peer_bitfield: &Bitfield,
+        now: Tick,
+    ) -> Vec<PeerMessage> {
+        let mut requests = Vec::new();
+        let mut count = max_requestable;
+
+        self.candidates.clear();
+        for (&i, _) in self.pieces.iter() {
+            if peer_bitfield.get(&i) {
+                self.candidates.push(i);
+            }
+        }
+        self.candidates.sort_by_key(|&i| self.availability[i]);
+
+        for &piece_idx in &self.candidates {
+            if count == 0 {
                 break;
             }
-
-            let is_active = self.active_pieces.contains(&piece_index);
-
-            if !peer_bf.get(&piece_index) {
-                continue;
-            }
-
-            let piece = match self.pieces.get_mut(&piece_index) {
+            let piece = match self.pieces.get_mut(&piece_idx) {
                 Some(p) => p,
                 None => continue,
             };
+
             if piece.is_complete() {
+                // Waiting for verification
                 continue;
             }
 
-            let blocks = blocks_per_piece(piece.length, BLOCK_SIZE);
-
-            let mut activated_this_piece = false;
-
-            for block_idx in 0..blocks {
-                if free == 0 {
+            for (block_idx, block) in piece.blocks.iter_mut().enumerate() {
+                if count == 0 {
                     break;
                 }
-                if piece.received.get(&block_idx) {
-                    continue;
-                }
-
-                let offset = block_idx * BLOCK_SIZE;
-                let key = (piece_index, offset);
-
-                if self.requested.contains_key(&key) {
-                    continue;
-                }
-
-                if !is_active && !activated_this_piece {
-                    activated_this_piece = true;
-                    activated.insert(piece_index);
-                }
-
-                let remaining = piece.length.saturating_sub(offset);
-                let length = remaining.min(BLOCK_SIZE);
-                let mut block_in_flight = BlockInFlight {
-                    first_requested_at: now,
-                    requested_by: HashSet::new(),
-                };
-                block_in_flight.requested_by.insert(*addr);
-                self.requested.insert(key, block_in_flight);
-                *self.inflight_per_peer.entry(*addr).or_default() += 1;
-                out.push(BlockRequest {
-                    piece: piece_index,
-                    offset,
-                    length,
-                });
-                free = free.saturating_sub(1);
-            }
-        }
-
-        for p in activated {
-            self.adapt_active_pieces(p, false);
-        }
-
-        out
-    }
-
-    pub fn pick_blocks_for_peer(
-        &mut self,
-        addr: &SocketAddr,
-        peer_bf: &Bitfield,
-        max_inflight_per_peer: usize,
-    ) -> Vec<BlockRequest> {
-        let inflight = self.inflight_per_peer.get(addr).unwrap_or(&0);
-        if *inflight >= max_inflight_per_peer {
-            return Vec::new();
-        }
-
-        let free = max_inflight_per_peer.saturating_sub(*inflight);
-        if free == 0 {
-            eprintln!("no free blocks to pick");
-            return Vec::new();
-        }
-
-        let now = Instant::now();
-
-        if self.endgame {
-            self.pick_endgame_blocks(addr, peer_bf, now, max_inflight_per_peer)
-        } else {
-            self.pick_rarest_first_blocks(addr, peer_bf, now, max_inflight_per_peer)
-        }
-    }
-
-    pub fn on_piece_verified(&mut self, piece_idx: usize) {
-        self.adapt_active_pieces(piece_idx, true);
-        if let Some(piece) = self.pieces.remove(&piece_idx) {
-            self.verified_bytes += piece.length;
-        }
-        self.requested.retain(|(p, _), _| *p != piece_idx);
-        self.maybe_enter_endgame();
-        self.dirty = true;
-    }
-
-    pub fn on_piece_verification_failure(&mut self, piece_idx: usize) {
-        self.adapt_active_pieces(piece_idx, true);
-        self.requested.retain(|(p, _), _| *p != piece_idx);
-        let piece = match self.pieces.get_mut(&piece_idx) {
-            Some(p) => p,
-            None => return,
-        };
-        piece.reset();
-    }
-
-    fn adapt_active_pieces(&mut self, piece: usize, remove: bool) {
-        if remove {
-            self.active_pieces.remove(&piece);
-        } else {
-            self.active_pieces.insert(piece);
-        }
-    }
-
-    pub fn on_peer_bitfield(&mut self, bf: &Bitfield) {
-        for piece_index in bf.get_ones() {
-            if let Some(piece) = self.pieces.get_mut(&piece_index) {
-                piece.availability += 1;
-                self.dirty = true;
-            }
-        }
-    }
-
-    pub fn on_peer_have(&mut self, piece_index: &usize) {
-        if let Some(piece) = self.pieces.get_mut(piece_index) {
-            piece.availability += 1;
-            self.dirty = true;
-        }
-    }
-
-    pub fn on_peer_disconnected(&mut self, addr: &SocketAddr, bf: &Bitfield) {
-        self.inflight_per_peer.remove(addr);
-        let mut to_remove = Vec::new();
-        for (key, inflight) in self.requested.iter_mut() {
-            inflight.requested_by.remove(addr);
-            if inflight.requested_by.is_empty() {
-                to_remove.push(*key);
-            }
-        }
-        for key in to_remove {
-            self.requested.remove(&key);
-        }
-        for piece_index in bf.get_ones() {
-            if let Some(piece) = self.pieces.get_mut(&piece_index) {
-                piece.availability = piece.availability.saturating_sub(1);
-                self.dirty = true;
-            }
-        }
-    }
-
-    pub fn reap_timeouts_for_peer(
-        &mut self,
-        addr: &SocketAddr,
-        timeout: Duration,
-    ) -> Vec<(usize, usize)> {
-        let now = Instant::now();
-        let mut reaped = Vec::new();
-        let mut to_remove = Vec::new();
-        for (key, inflight) in self.requested.iter_mut() {
-            if now.duration_since(inflight.first_requested_at) >= timeout {
-                if inflight.requested_by.remove(addr) {
-                    if let Some(count) = self.inflight_per_peer.get_mut(addr) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            self.inflight_per_peer.remove(addr);
+                match block.status {
+                    BlockStatus::NotRequested => {
+                        block.requested_at = now;
+                        block.status = BlockStatus::Pending;
+                    }
+                    BlockStatus::Pending => {
+                        if !block.requested_by.is_empty() {
+                            continue;
                         }
                     }
-                    reaped.push(*key);
+                    BlockStatus::Received => continue,
                 }
+                self.inflight_blocks += 1;
+                block.requested_by.insert(token);
+
+                let offset = block_idx * BLOCK_SIZE;
+                let length = BLOCK_SIZE.min(piece.length as usize - offset);
+
+                requests.push(PeerMessage::Request((
+                    piece_idx as u32,
+                    offset as u32,
+                    length as u32,
+                )));
+
+                count = count.saturating_sub(1);
             }
-            if inflight.requested_by.is_empty() {
-                to_remove.push(*key);
-            }
-        }
-        for key in to_remove {
-            self.requested.remove(&key);
         }
 
-        reaped
+        requests
     }
 
-    pub fn on_block_received(
-        &mut self,
-        addr: &SocketAddr,
-        piece_idx: usize,
-        offset: usize,
-    ) -> Option<PieceReceiveStatus> {
-        let key = (piece_idx, offset);
-        let (complete, expected_hash) = {
-            let piece = self.pieces.get_mut(&piece_idx)?;
-
-            let was_new = piece.mark_block(offset);
-            if !was_new {
-                return None;
-            }
-            (piece.is_complete(), piece.expected_hash)
-        };
-
-        if complete {
-            self.adapt_active_pieces(piece_idx, true);
-        }
-
-        if let Some(inflight) = self.requested.get_mut(&key) {
-            inflight.requested_by.remove(addr);
-            if inflight.requested_by.is_empty() {
-                self.requested.remove(&key);
-            }
-        }
-
-        if let Some(count) = self.inflight_per_peer.get_mut(addr) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.inflight_per_peer.remove(addr);
-            }
-        }
-
-        self.maybe_enter_endgame();
-
-        self.dirty = true;
-
-        Some(PieceReceiveStatus {
-            piece: piece_idx,
-            received: true,
-            complete: complete,
-            expected_hash: expected_hash,
-        })
-    }
-
-    pub fn is_endgame(&self) -> bool {
-        self.endgame
-    }
-
-    pub fn in_flight(&self) -> usize {
-        self.inflight_per_peer.values().sum()
+    pub fn bitfield(&self) -> &Bitfield {
+        &self.bitfield
     }
 
     pub fn opportunistic_downloaded_bytes(&self) -> u64 {
@@ -500,30 +401,125 @@ impl PiecePicker {
         bytes
     }
 
-    fn maybe_enter_endgame(&mut self) {
-        if self.endgame {
-            return;
+    pub fn requeue_blocks(&mut self, blocks: Vec<(u32, u32)>) {
+        for (piece_index, offset) in blocks {
+            let piece = match self.pieces.get_mut(&(piece_index as usize)) {
+                Some(p) => p,
+                None => continue,
+            };
+            let block_idx = offset as usize / BLOCK_SIZE;
+            let block = &mut piece.blocks[block_idx];
+            if block.status == BlockStatus::Received {
+                continue;
+            }
+            block.status = BlockStatus::NotRequested;
+            block.requested_by.clear();
+            self.inflight_blocks = self.inflight_blocks.saturating_sub(1);
+        }
+    }
+
+    pub fn requeue_blocks_for_peer(&mut self, token: Token) -> Vec<(u32, u32)> {
+        let mut requeued = Vec::new();
+
+        for (piece_idx, piece) in self.pieces.iter_mut() {
+            for (block_idx, block) in piece.blocks.iter_mut().enumerate() {
+                if block.requested_by.remove(&token) {
+                    if block.status == BlockStatus::Pending && block.requested_by.is_empty() {
+                        block.status = BlockStatus::NotRequested;
+                        self.inflight_blocks = self.inflight_blocks.saturating_sub(1);
+                        requeued.push((*piece_idx as u32, (block_idx * BLOCK_SIZE) as u32));
+                    }
+                }
+            }
         }
 
-        let remaining: u64 = self
-            .pieces
-            .values()
-            .map(|p| p.received.len() as u64 - p.received_count as u64)
-            .sum();
+        requeued
+    }
 
-        let remaining_ratio = remaining as f64 / self.total_blocks as f64;
-        if remaining <= 50 || remaining_ratio <= 0.02 {
+    pub fn requeue_timed_out_blocks(&mut self, now: Tick, timeout: Tick) -> Vec<(u32, u32)> {
+        let mut requeued = Vec::new();
+
+        for (piece_idx, piece) in self.pieces.iter_mut() {
+            for (block_idx, block) in piece.blocks.iter_mut().enumerate() {
+                if block.status != BlockStatus::Pending {
+                    continue;
+                }
+                if now >= block.requested_at + timeout {
+                    block.status = BlockStatus::NotRequested;
+                    block.requested_by.clear();
+                    self.inflight_blocks = self.inflight_blocks.saturating_sub(1);
+                    requeued.push((*piece_idx as u32, (block_idx * BLOCK_SIZE) as u32));
+                }
+            }
+        }
+
+        if !requeued.is_empty() {
+            eprintln!("> {} blocks timed out based on tick!", requeued.len());
+        }
+
+        requeued
+    }
+
+    pub fn inflight_blocks(&self) -> usize {
+        self.inflight_blocks
+    }
+
+    fn remaining_blocks(&self) -> u64 {
+        self.pieces
+            .values()
+            .map(|piece| {
+                piece
+                    .blocks
+                    .iter()
+                    .filter(|b| b.status != BlockStatus::Received)
+                    .count() as u64
+            })
+            .sum()
+    }
+
+    pub fn maybe_enter_endgame(&mut self) -> bool {
+        if self.endgame {
+            return true;
+        }
+
+        let remaining = self.remaining_blocks();
+        if remaining > 0 && remaining <= self.inflight_blocks as u64 {
             self.endgame = true;
             eprintln!(
-                "entering endgame: {} / {} blocks remaining ({:.2}%)",
-                remaining,
-                self.total_blocks,
-                remaining_ratio * 100.0
+                "entering endgame: {} / {} blocks remaining, inflight: {}",
+                remaining, self.total_blocks, self.inflight_blocks
             );
+            return true;
         }
+
+        false
+    }
+
+    pub fn is_endgame(&self) -> bool {
+        self.endgame
     }
 }
 
-fn blocks_per_piece(piece_len: usize, block_size: usize) -> usize {
-    (piece_len + block_size - 1) / block_size
+fn generate_blocks(piece_length: u32, block_size: u32) -> Vec<Block> {
+    let block_count = (piece_length + block_size - 1) / block_size;
+    let mut blocks = Vec::new();
+
+    for _ in 0..block_count {
+        blocks.push(Block::new());
+    }
+
+    blocks
+}
+
+fn length_for_piece(
+    piece: usize,
+    total_pieces: usize,
+    total_length: u64,
+    piece_length: u32,
+) -> u32 {
+    if piece == total_pieces - 1 {
+        (total_length - piece_length as u64 * (total_pieces as u64 - 1)) as u32
+    } else {
+        piece_length
+    }
 }

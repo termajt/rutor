@@ -1,750 +1,617 @@
 use std::{
-    net::{SocketAddr, TcpStream},
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU8, Ordering},
-        mpsc::{Receiver, Sender},
-    },
-    thread::JoinHandle,
+    collections::VecDeque,
+    fmt,
+    net::SocketAddr,
+    ops::{Add, AddAssign, Rem, RemAssign, Sub, SubAssign},
     time::{Duration, Instant},
 };
 
+use bytes::Bytes;
+use crossbeam::channel::{Receiver, RecvTimeoutError, Sender};
+use mio::Token;
+use rand::{Rng, distr::Alphanumeric};
+
 use crate::{
-    announce::{self, AnnounceManager},
+    announce::{AnnounceEvent, AnnounceManager, TrackerResponse},
     bitfield::Bitfield,
-    connection::ConnectionManager,
-    disk::DiskManager,
-    hasher::Hasher,
-    peer::{MessageHandle, PeerMessage},
-    picker::{self, PiecePicker},
+    disk::{DiskError, DiskJob, DiskManager},
+    net::{NetEvent, NetManager},
+    picker::{PiecePicker, PieceReceiveStatus},
     torrent::Torrent,
 };
 
-use rand::{Rng, distr::Alphanumeric};
-
-pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-#[derive(Debug)]
-pub enum Event {
-    Tick,
-    Complete,
-    Stop,
-    CompareBitfield {
-        addr: SocketAddr,
-        bitfield: Arc<Bitfield>,
-    },
-    DiskStats {
-        files: Vec<(PathBuf, u64, u64)>,
-    },
-    PieceVerified {
-        piece: usize,
-    },
-    PieceVerificationFailed {
-        piece: usize,
-    },
-    PeerIoStats {
-        connected_peers: usize,
-        max_peers: usize,
-        blocks_inflight: usize,
-        available_peers: usize,
-        total_speed_down: f64,
-        opportunistic_downloaded: u64,
-    },
-    Terminate,
+#[derive(Debug, Clone)]
+pub struct EngineStats {
+    pub complete_pieces: usize,
+    pub total_pieces: usize,
+    pub peers: usize,
+    pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub left: u64,
+    pub inflight_blocks: usize,
+    pub files: Vec<(String, u64, u64, u64)>,
 }
 
+impl EngineStats {
+    pub fn new(total_size: u64, total_pieces: usize, files: Vec<(String, u64, u64, u64)>) -> Self {
+        Self {
+            complete_pieces: 0,
+            total_pieces,
+            peers: 0,
+            downloaded_bytes: 0,
+            uploaded_bytes: 0,
+            left: total_size,
+            inflight_blocks: 0,
+            files,
+        }
+    }
+}
+
+pub const TICK_DURATION: Duration = Duration::from_millis(500);
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Tick(pub u64);
+
+impl Tick {
+    pub fn as_f64(&self) -> f64 {
+        self.0 as f64
+    }
+
+    pub fn as_secs_f64(&self) -> f64 {
+        self.0 as f64 * TICK_DURATION.as_secs_f64()
+    }
+}
+
+impl AddAssign for Tick {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+impl Add for Tick {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self(self.0 + rhs.0)
+    }
+}
+
+impl SubAssign for Tick {
+    fn sub_assign(&mut self, rhs: Self) {
+        self.0 -= rhs.0
+    }
+}
+
+impl Sub for Tick {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self(self.0 - rhs.0)
+    }
+}
+
+impl Rem for Tick {
+    type Output = Tick;
+
+    fn rem(self, rhs: Self) -> Self::Output {
+        Tick(self.0 % rhs.0)
+    }
+}
+
+impl RemAssign for Tick {
+    fn rem_assign(&mut self, rhs: Self) {
+        self.0 %= rhs.0
+    }
+}
+
+impl fmt::Display for Tick {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+const FLUSH_INTERVAL: Tick = duration_to_ticks(Duration::from_secs(60));
+// const PIECE_BLOCK_TIMEOUT: Tick = duration_to_ticks(Duration::from_secs(10));
+
 #[derive(Debug)]
-pub enum IoTask {
-    WriteToDisk {
-        piece: usize,
-        offset: usize,
-        data: Arc<Vec<u8>>,
-        complete: bool,
+pub enum EngineEvent {
+    Tick {
+        current_tick: Tick,
     },
-    PrepareHash {
-        piece: usize,
+    PeerConnected {
+        addr: SocketAddr,
     },
-    Stop,
-    CalculateFileStats {
+    PeerDisconnected {
+        addr: SocketAddr,
+        token: Token,
+        bitfield: Option<Bitfield>,
+    },
+    AnnounceResponse {
+        response: TrackerResponse,
+    },
+    PeerHandshakeSuccess {
+        addr: SocketAddr,
+    },
+    PeerBitfield {
+        addr: SocketAddr,
+        bitfield: Bitfield,
+    },
+    PeerHave {
+        addr: SocketAddr,
+        piece: u32,
+    },
+    PeerCount {
+        count: usize,
+    },
+    PickBlocks {
+        token: Token,
+        bitfield: Bitfield,
+        count: usize,
+    },
+    PieceBlock {
+        piece: u32,
+        offset: u32,
+        data: Bytes,
+    },
+    BlockWritten {
+        result: Result<(), DiskError>,
+    },
+    PieceVerification {
+        result: Result<(u32, bool), DiskError>,
+    },
+    ReadBlock {
+        result: Result<(u32, u32, Bytes), DiskError>,
+    },
+    TimeoutBlocks {
+        blocks: Vec<(u32, u32)>,
+    },
+    VerifyPiece {
+        piece: u32,
+        hash: [u8; 20],
+    },
+    Complete,
+    PeerChoked {
+        token: Token,
+    },
+    RequestMissingBlocks {
+        token: Token,
         bitfield: Bitfield,
     },
 }
 
 #[derive(Debug)]
-pub enum PeerIoTask {
-    NewPeers {
-        peers: Vec<SocketAddr>,
-    },
-    ConnectPeer {
-        addr: SocketAddr,
-    },
-    PeerConnected {
-        addr: SocketAddr,
-        stream: TcpStream,
-    },
-    PeerConnectFailed {
-        addr: SocketAddr,
-        reason: String,
-    },
-    MaybeConnectPeers,
-    PeerDisconnected {
-        addr: SocketAddr,
-        reason: String,
-    },
-    Stop,
-    MaybeUpdateInterest {
-        addr: SocketAddr,
-        bitfield_interested: bool,
-    },
-    SendMessage {
-        addr: SocketAddr,
-        msg: PeerMessage,
-    },
-    RequestBlocksForPeer {
-        addr: SocketAddr,
-    },
-    MaybeRequestBlocks,
-    PeriodicReap,
-    PieceVerified {
-        piece: usize,
-    },
-    PieceVerificationFailed {
-        piece: usize,
-    },
-    StatsUpdate,
-    MessageHandle {
-        addr: SocketAddr,
-        message_handle: Arc<MessageHandle>,
-    },
-    Drain {
-        addr: SocketAddr,
-    },
-}
-
-#[derive(Debug)]
-pub enum HashTask {
-    Piece {
-        piece: usize,
-        data: Arc<Vec<u8>>,
-        is_last: bool,
-    },
-    Stop,
-}
-
-#[derive(Debug)]
-pub enum AnnounceIoTask {
-    PerformAnnounce {
-        url: String,
-        info_hash: [u8; 20],
-        peer_id: [u8; 20],
-        uploaded: u64,
-        downloaded: u64,
-        left: u64,
-    },
-    Stop,
-}
-
-#[derive(Debug, Clone)]
-pub struct TorrentStats {
-    pub downloaded: u64,
-    pub uploaded: u64,
-    pub left: u64,
-    pub files: Vec<(PathBuf, u64, u64)>,
-    pub peers: usize,
-    pub bitfield: Bitfield,
-    pub max_peers: usize,
-    pub blocks_inflight: usize,
-    pub available_peers: usize,
-    pub total_speed_down: f64,
-}
-
-impl TorrentStats {
-    fn new(total_size: u64, files: Vec<(PathBuf, u64, u64)>, bitfield: Bitfield) -> Self {
-        Self {
-            downloaded: 0,
-            uploaded: 0,
-            left: total_size,
-            files,
-            peers: 0,
-            bitfield,
-            max_peers: 0,
-            blocks_inflight: 0,
-            available_peers: 0,
-            total_speed_down: 0.0,
-        }
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug, PartialEq, Eq)]
-pub enum ShutdownPhase {
-    Running = 0,
-    Completed = 1,
-    Draining = 2,
-    Terminated = 3,
-}
-
-#[derive(Debug)]
-pub struct ShutdownState {
-    phase: AtomicU8,
-}
-
-impl ShutdownState {
-    pub fn new() -> Self {
-        Self {
-            phase: AtomicU8::new(ShutdownPhase::Running as u8),
-        }
-    }
-
-    fn phase(&self) -> ShutdownPhase {
-        match self.phase.load(Ordering::Acquire) {
-            0 => ShutdownPhase::Running,
-            1 => ShutdownPhase::Completed,
-            2 => ShutdownPhase::Draining,
-            3 => ShutdownPhase::Terminated,
-            _ => unreachable!("ShutdownPhase"),
-        }
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.phase() == ShutdownPhase::Running
-    }
-
-    pub fn is_completed(&self) -> bool {
-        self.phase() == ShutdownPhase::Completed
-    }
-
-    pub fn is_draining(&self) -> bool {
-        self.phase() == ShutdownPhase::Draining
-    }
-
-    pub fn is_terminated(&self) -> bool {
-        self.phase() == ShutdownPhase::Terminated
-    }
-
-    fn mark_completed(&self) -> bool {
-        self.phase
-            .compare_exchange(
-                ShutdownPhase::Running as u8,
-                ShutdownPhase::Completed as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    fn begin_draining(&self) -> bool {
-        self.phase
-            .compare_exchange(
-                ShutdownPhase::Completed as u8,
-                ShutdownPhase::Draining as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    fn terminate(&self) -> bool {
-        self.phase
-            .compare_exchange(
-                ShutdownPhase::Draining as u8,
-                ShutdownPhase::Terminated as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-}
-
-#[derive(Debug)]
 pub struct Engine {
+    disk_mgr: DiskManager,
+    disk_tx: Option<Sender<DiskJob>>,
+    disk_rx: Receiver<DiskJob>,
+    net_mgr: NetManager,
+    net_tx: Option<Sender<NetEvent>>,
+    net_rx: Receiver<NetEvent>,
     announce_mgr: AnnounceManager,
-    event_tx: Sender<Event>,
-    event_rx: Receiver<Event>,
-    io_tx: Sender<IoTask>,
-    peer_io_tx: Sender<PeerIoTask>,
-    announce_io_tx: Sender<AnnounceIoTask>,
-    shutdown_state: Arc<ShutdownState>,
-    torrent: Torrent,
+    announce_tx: Option<Sender<AnnounceEvent>>,
+    announce_rx: Receiver<AnnounceEvent>,
+    engine_tx: Option<Sender<EngineEvent>>,
+    engine_rx: Receiver<EngineEvent>,
+    info_hash: [u8; 20],
     peer_id: [u8; 20],
-    stats: TorrentStats,
-    last_peers_adjust: Option<Instant>,
-    read_limit_bytes_per_sec: usize,
-    write_limit_bytes_per_sec: usize,
-    join_handles: Vec<JoinHandle<()>>,
-    hash_tx: Sender<HashTask>,
+    total_size: u64,
+    stats: EngineStats,
+    piece_picker: PiecePicker,
+    piece_hashes: Vec<[u8; 20]>,
+    max_read_bytes_per_sec: usize,
+    max_write_bytes_per_sec: usize,
+    complete: bool,
+    verify_queue: VecDeque<(u32, [u8; 20])>,
+    verify_inflight: bool,
 }
 
 impl Engine {
     pub fn new(
         torrent: Torrent,
-        event_tx: Sender<Event>,
-        event_rx: Receiver<Event>,
-        io_tx: Sender<IoTask>,
-        peer_io_tx: Sender<PeerIoTask>,
-        announce_io_tx: Sender<AnnounceIoTask>,
-        read_limit_bytes_per_sec: usize,
-        write_limit_bytes_per_sec: usize,
-        hash_tx: Sender<HashTask>,
-    ) -> Self {
+        max_read_bytes_per_sec: usize,
+        max_write_bytes_per_sec: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let disk_mgr = DiskManager::new(&torrent)?;
+        let (disk_tx, disk_rx) = crossbeam::channel::unbounded();
+
+        let net_mgr: NetManager = NetManager::new();
+        let (net_tx, net_rx) = crossbeam::channel::unbounded();
+
         let announce_mgr = AnnounceManager::new(&torrent.announce, &torrent.announce_list);
-        let bitfield = Bitfield::new(torrent.info.piece_hashes.len());
-        let stats = TorrentStats::new(torrent.info.total_size, Vec::new(), bitfield);
-        Self {
+        let (announce_tx, announce_rx) = crossbeam::channel::unbounded();
+
+        let total_pieces = torrent.info.piece_hashes.len();
+        let total_size = torrent.info.total_size;
+        let piece_length = torrent.info.piece_length;
+        let piece_picker = PiecePicker::new(total_pieces, total_size, piece_length);
+
+        let (engine_tx, engine_rx) = crossbeam::channel::unbounded();
+
+        let info_hash = torrent.info_hash;
+        let peer_id = generate_peer_id();
+        let piece_hashes = torrent.info.piece_hashes.clone();
+        let file_progress = disk_mgr.file_progress();
+        Ok(Self {
+            disk_mgr,
+            disk_tx: Some(disk_tx),
+            disk_rx,
+            net_mgr,
+            net_tx: Some(net_tx),
+            net_rx,
             announce_mgr,
-            event_tx,
-            event_rx,
-            io_tx,
-            peer_io_tx,
-            announce_io_tx,
-            shutdown_state: Arc::new(ShutdownState::new()),
-            torrent,
-            peer_id: generate_peer_id(),
-            stats,
-            last_peers_adjust: None,
-            read_limit_bytes_per_sec,
-            write_limit_bytes_per_sec,
-            join_handles: Vec::new(),
-            hash_tx,
-        }
+            announce_tx: Some(announce_tx),
+            announce_rx,
+            engine_tx: Some(engine_tx),
+            engine_rx,
+            info_hash,
+            peer_id,
+            total_size,
+            stats: EngineStats::new(total_size, total_pieces, file_progress),
+            piece_picker,
+            piece_hashes,
+            max_read_bytes_per_sec,
+            max_write_bytes_per_sec,
+            complete: false,
+            verify_queue: VecDeque::new(),
+            verify_inflight: false,
+        })
     }
 
-    fn check_completion(&mut self) {
-        if self.shutdown_state.is_completed() || self.shutdown_state.is_draining() {
-            return;
-        }
-
-        if !self.stats.bitfield.has_any_zero() {
-            self.stats.downloaded = self.torrent.info.total_size;
-            self.stats.left = 0;
-
-            if self.shutdown_state.mark_completed() {
-                let _ = self.event_tx.send(Event::Complete);
-
-                let event_tx = self.event_tx.clone();
-                let shutdown_state = self.shutdown_state.clone();
-                let handle = std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(2));
-                    if shutdown_state.is_completed() {
-                        let _ = event_tx.send(Event::Stop);
-                    }
-                });
-                self.join_handles.push(handle);
-            } else {
-                panic!("failed to mark complete!");
-            }
-        }
-    }
-
-    pub fn join(&mut self) {
-        if self.shutdown_state.is_terminated() {
-            eprintln!("terminating");
-            while let Some(handle) = self.join_handles.pop() {
-                if let Err(_) = handle.join() {
-                    eprintln!("failed to join thread");
-                }
-            }
-        }
-    }
-
-    pub fn poll(&self) -> Result<Event> {
-        let ev = self.event_rx.recv()?;
-        Ok(ev)
-    }
-
-    pub fn handle_event(&mut self, ev: Event) -> Result<()> {
-        match ev {
-            Event::Tick => {
-                self.on_tick();
-            }
-            Event::Complete => {}
-            Event::Stop => {
-                self.stop();
-                let _ = self.event_tx.send(Event::Terminate);
-            }
-            Event::CompareBitfield { addr, bitfield } => {
-                let interested = bitfield.is_interesting_to(&self.stats.bitfield);
-                let _ = self.peer_io_tx.send(PeerIoTask::MaybeUpdateInterest {
-                    addr,
-                    bitfield_interested: interested,
-                });
-            }
-            Event::DiskStats { files } => {
-                self.stats.files = files;
-            }
-            Event::PieceVerified { piece } => {
-                self.stats.bitfield.set(&piece, true);
-                self.check_completion();
-            }
-            Event::PieceVerificationFailed { piece } => {
-                self.stats.bitfield.set(&piece, false);
-            }
-            Event::PeerIoStats {
-                connected_peers,
-                max_peers,
-                blocks_inflight,
-                available_peers,
-                total_speed_down,
-                opportunistic_downloaded,
-            } => {
-                self.stats.peers = connected_peers;
-                self.stats.max_peers = max_peers;
-                self.stats.blocks_inflight = blocks_inflight;
-                self.stats.available_peers = available_peers;
-                self.stats.total_speed_down = total_speed_down;
-                self.stats.downloaded = opportunistic_downloaded;
-                self.stats.left = self
-                    .torrent
-                    .info
-                    .total_size
-                    .saturating_sub(opportunistic_downloaded);
-            }
-            Event::Terminate => {
-                if self.shutdown_state.terminate() {
-                    eprintln!("terminate ev");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn get_stats(&self) -> TorrentStats {
+    pub fn get_stats(&self) -> EngineStats {
         self.stats.clone()
     }
 
-    pub fn start(
-        &mut self,
-        io_rx: Receiver<IoTask>,
-        peer_io_rx: Receiver<PeerIoTask>,
-        announce_io_rx: Receiver<AnnounceIoTask>,
-        hash_rx: Receiver<HashTask>,
-    ) {
-        self.join_handles.push(self.start_disk_thread(io_rx));
-        self.join_handles.push(self.start_tick_thread());
-        self.join_handles
-            .push(self.start_peer_io_thread(peer_io_rx));
-        self.join_handles
-            .push(self.start_announce_io_thread(announce_io_rx));
-        self.join_handles.push(self.start_hash_thread(hash_rx));
+    pub fn get_rx(&self) -> Receiver<EngineEvent> {
+        self.engine_rx.clone()
     }
 
-    pub fn stop(&self) {
-        if self.shutdown_state.begin_draining() {
-            eprintln!("going to draining");
-            let _ = self.io_tx.send(IoTask::Stop);
-            let _ = self.peer_io_tx.send(PeerIoTask::Stop);
-            let _ = self.announce_io_tx.send(AnnounceIoTask::Stop);
-            let _ = self.hash_tx.send(HashTask::Stop);
-        }
-    }
-
-    fn start_hash_thread(&self, hash_rx: Receiver<HashTask>) -> JoinHandle<()> {
-        let event_tx = self.event_tx.clone();
-        let expected_hashes = self.torrent.info.piece_hashes.clone();
-        let peer_io_tx = self.peer_io_tx.clone();
-        let shutdown_state = self.shutdown_state.clone();
-        std::thread::spawn(move || {
-            let mut hasher = Hasher::new(expected_hashes, event_tx, peer_io_tx);
-            loop {
-                if shutdown_state.is_draining() || shutdown_state.is_terminated() {
-                    break;
-                }
-                match hash_rx.recv() {
-                    Ok(ev) => match ev {
-                        HashTask::Piece {
-                            piece,
-                            data,
-                            is_last,
-                        } => {
-                            hasher.update_hash(piece, &data);
-                            if is_last {
-                                hasher.finalize(piece);
-                            }
-                        }
-                        HashTask::Stop => break,
-                    },
-                    Err(e) => {
-                        eprintln!("hash rx error: {}", e);
-                        break;
-                    }
-                }
+    fn handle_event(&mut self, event: EngineEvent, now: Tick) {
+        match event {
+            EngineEvent::PeerConnected { addr } => {
+                eprintln!("> {} connected", addr);
             }
-            eprintln!("exiting hasher thread");
-        })
-    }
-
-    fn start_disk_thread(&self, io_rx: Receiver<IoTask>) -> JoinHandle<()> {
-        let event_tx = self.event_tx.clone();
-        let shutdown_state = self.shutdown_state.clone();
-        let total_pieces = self.stats.bitfield.len();
-        let total_size = self.torrent.info.total_size;
-        let piece_length = self.torrent.info.piece_length as usize;
-        let files = self.torrent.info.files.clone();
-        let io_tx = self.io_tx.clone();
-        let hash_tx = self.hash_tx.clone();
-        std::thread::spawn(move || {
-            let mut disk_mgr = DiskManager::new(total_pieces, total_size, piece_length, files);
-            loop {
-                if shutdown_state.is_draining() || shutdown_state.is_terminated() {
-                    break;
+            EngineEvent::PeerDisconnected {
+                addr,
+                token,
+                bitfield,
+            } => {
+                eprintln!("> {} disconnected", addr);
+                if let Some(bitfield) = bitfield {
+                    self.piece_picker.remove_peer_bitfield(&bitfield);
                 }
-                match io_rx.recv() {
-                    Ok(ev) => match ev {
-                        IoTask::WriteToDisk {
-                            piece,
-                            offset,
-                            data,
-                            complete,
-                        } => {
-                            if let Err(e) = disk_mgr.write_to_disk(piece, offset, &data) {
-                                eprintln!(
-                                    "failed to write piece data to disk, index: {}, offset: {}, bytes: {} :: {}",
-                                    piece,
-                                    offset,
-                                    data.len(),
-                                    e
-                                );
-                                continue;
-                            }
-                            if complete {
-                                let _ = io_tx.send(IoTask::PrepareHash { piece });
-                                if let Err(e) = disk_mgr.flush_piece(piece) {
-                                    eprintln!(
-                                        "failed to flush piece {} to disk before verification: {}",
-                                        piece, e
-                                    );
-                                    continue;
-                                }
-                            }
-                        }
-                        IoTask::Stop => {
-                            eprintln!("flushing disk manager...");
-                            if let Err(e) = disk_mgr.flush_all() {
-                                eprintln!("failed to flush disk manager: {}", e);
-                            }
-                            if let Err(e) = disk_mgr.close() {
-                                eprintln!("failed to close disk manager: {}", e);
-                            }
-                            break;
-                        }
-                        IoTask::CalculateFileStats { bitfield } => {
-                            let files: Vec<(PathBuf, u64, u64)> = disk_mgr
-                                .files()
-                                .iter()
-                                .enumerate()
-                                .map(|(i, f)| {
-                                    let downloaded = disk_mgr.verified_bytes_for_file(i, &bitfield);
-                                    (f.path.clone(), downloaded, f.length)
-                                })
-                                .collect();
-                            let _ = event_tx.send(Event::DiskStats { files });
-                        }
-                        IoTask::PrepareHash { piece } => {
-                            if let Err(e) = disk_mgr.flush_piece(piece) {
-                                eprintln!("failed to flush piece {}: {}", piece, e);
-                                continue;
-                            }
-                            let result = disk_mgr.read_piece_chunks(
-                                piece,
-                                picker::BLOCK_SIZE,
-                                |data, is_last| {
-                                    let data = Arc::new(data);
-                                    let _ = hash_tx.send(HashTask::Piece {
-                                        piece,
-                                        data,
-                                        is_last,
-                                    });
-                                    Ok(())
-                                },
-                            );
-                            if let Err(e) = result {
-                                eprintln!("failed to read chunks for piece {}: {}", piece, e);
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        eprintln!("disk io rx error: {}", e);
-                        break;
-                    }
-                }
+                let _ = self.piece_picker.requeue_blocks_for_peer(token);
             }
-            eprintln!("exiting disk thread");
-        })
-    }
-
-    fn start_tick_thread(&self) -> JoinHandle<()> {
-        let shutdown_state = self.shutdown_state.clone();
-        let event_tx = self.event_tx.clone();
-        std::thread::spawn(move || {
-            while !shutdown_state.is_terminated() {
-                if shutdown_state.is_running() || shutdown_state.is_completed() {
-                    let _ = event_tx.send(Event::Tick);
-                }
-                std::thread::sleep(Duration::from_millis(500));
+            EngineEvent::AnnounceResponse { response } => {
+                eprintln!("> tracker response, {} peers", response.peers.len());
+                self.handle_announce_response(response);
             }
-            eprintln!("exiting tick thread");
-        })
-    }
-
-    fn start_peer_io_thread(&self, peer_io_rx: Receiver<PeerIoTask>) -> JoinHandle<()> {
-        let peer_io_tx = self.peer_io_tx.clone();
-        let total_pieces = self.torrent.info.piece_hashes.len();
-        let info_hash = self.torrent.info_hash;
-        let peer_id = self.peer_id;
-        let piece_length = self.torrent.info.piece_length;
-        let event_tx = self.event_tx.clone();
-        let total_size = self.torrent.info.total_size;
-        let piece_hashes = self.torrent.info.piece_hashes.clone();
-        let io_tx = self.io_tx.clone();
-        let shutdown_state = self.shutdown_state.clone();
-        let read_limit_bytes_per_sec = self.read_limit_bytes_per_sec;
-        let write_limit_bytes_per_sec = self.write_limit_bytes_per_sec;
-        std::thread::spawn(move || {
-            let picker = match PiecePicker::new(piece_length as usize, total_size, piece_hashes) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("failed to create piece picker: {}", e);
-                    let _ = event_tx.send(Event::Stop);
+            EngineEvent::Tick { current_tick } => {
+                self.handle_tick(current_tick);
+            }
+            EngineEvent::PeerHandshakeSuccess { addr } => {
+                eprintln!("> {} handshake success", addr);
+            }
+            EngineEvent::PeerBitfield { addr, bitfield } => {
+                self.piece_picker.register_peer_bitfield(&bitfield);
+                let interested = bitfield.is_interesting_to(self.piece_picker.bitfield());
+                self.notify_interested(addr, interested);
+            }
+            EngineEvent::PeerCount { count } => {
+                self.stats.peers = count;
+            }
+            EngineEvent::PeerHave { addr, piece } => {
+                self.piece_picker.register_peer_have(piece);
+                let piece = piece as usize;
+                let has_piece = self.piece_picker.bitfield().get(&piece);
+                self.notify_interested(addr, !has_piece);
+            }
+            EngineEvent::PickBlocks {
+                token,
+                bitfield,
+                count,
+            } => {
+                if self.complete {
                     return;
                 }
-            };
-            let mut connection_mgr = match ConnectionManager::new(
-                peer_io_tx,
-                event_tx.clone(),
-                io_tx,
-                picker,
-                total_size,
-                shutdown_state.clone(),
-                info_hash,
-                peer_id,
-                total_pieces,
-                read_limit_bytes_per_sec,
-                write_limit_bytes_per_sec,
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("failed to create connection manager: {}", e);
-                    let _ = event_tx.send(Event::Stop);
+                let tx = match &self.net_tx {
+                    Some(t) => t,
+                    None => return,
+                };
+                let requests = self.piece_picker.pick_blocks(token, &bitfield, now, count);
+                if !requests.is_empty() {
+                    let _ = tx.send(NetEvent::SendPeerMessages {
+                        token,
+                        messages: requests,
+                    });
+                }
+            }
+            EngineEvent::PieceBlock {
+                piece,
+                offset,
+                data,
+            } => {
+                let disk_tx = match self.disk_tx.clone() {
+                    Some(d) => d,
+                    None => return,
+                };
+                let engine_tx = match self.engine_tx.clone() {
+                    Some(e) => e,
+                    None => return,
+                };
+                self.on_piece_block(piece, offset, data, &disk_tx, &engine_tx);
+            }
+            EngineEvent::BlockWritten { result } => {
+                if let Err(e) = result {
+                    eprintln!("failed to write block(s) to disk: {:?}", e);
+                }
+            }
+            EngineEvent::PieceVerification { result } => {
+                self.on_piece_verified(result);
+            }
+            EngineEvent::VerifyPiece { piece, hash } => {
+                self.on_verify_ready(piece, hash);
+            }
+            EngineEvent::ReadBlock { result: _ } => todo!(),
+            EngineEvent::TimeoutBlocks { blocks } => {
+                self.piece_picker.requeue_blocks(blocks);
+            }
+            EngineEvent::Complete => {
+                self.stop();
+            }
+            EngineEvent::PeerChoked { token } => {
+                eprintln!("> {:?} choked, requeue blocks!", token);
+                let _ = self.piece_picker.requeue_blocks_for_peer(token);
+            }
+            EngineEvent::RequestMissingBlocks { token, bitfield } => {
+                if self.complete {
                     return;
                 }
+                let tx = match &self.net_tx {
+                    Some(t) => t,
+                    None => return,
+                };
+                let missing_blocks = self.piece_picker.missing_blocks_for_peer(&bitfield);
+                let _ = tx.send(NetEvent::RequestMissingBlocks {
+                    token,
+                    missing_blocks,
+                });
+            }
+        }
+    }
+
+    pub fn start<F>(&mut self, mut on_tick_callback: F)
+    where
+        F: FnMut(Tick, EngineStats),
+    {
+        self.disk_mgr.start(2, &self.disk_rx);
+        if let Some(tx) = &self.engine_tx {
+            self.net_mgr.start(
+                &self.net_rx,
+                self.piece_picker.bitfield().len(),
+                self.info_hash,
+                self.peer_id,
+                tx,
+                self.max_read_bytes_per_sec,
+                self.max_write_bytes_per_sec,
+            );
+        }
+        self.announce_mgr.start(&self.announce_rx);
+        self.begin_loop(&mut on_tick_callback);
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(tx) = self.disk_tx.take() {
+            let _ = tx.send(DiskJob::Flush);
+        }
+        if let Some(tx) = self.net_tx.take() {
+            let _ = tx.send(NetEvent::Shutdown);
+        }
+        self.announce_tx.take();
+        self.engine_tx.take();
+    }
+
+    pub fn join(&mut self) {
+        self.disk_mgr.join();
+        self.net_mgr.join();
+        self.announce_mgr.join();
+    }
+
+    fn begin_loop<F>(&mut self, on_tick_callback: &mut F)
+    where
+        F: FnMut(Tick, EngineStats),
+    {
+        let mut tick = Tick(0);
+        let mut next_tick_deadline = Instant::now() + TICK_DURATION;
+        loop {
+            let now = Instant::now();
+            let timeout = if next_tick_deadline > now {
+                next_tick_deadline - now
+            } else {
+                Duration::from_secs(0)
             };
-            while !shutdown_state.is_terminated() {
-                while let Ok(ev) = peer_io_rx.try_recv() {
-                    match ev {
-                        PeerIoTask::Stop => {
-                            connection_mgr.handle_event(ev);
-                            break;
-                        }
-                        _ => connection_mgr.handle_event(ev),
-                    }
+            match self.engine_rx.recv_timeout(timeout) {
+                Ok(ev) => {
+                    self.handle_event(ev, tick);
                 }
-                if let Err(e) = connection_mgr.poll_peers() {
-                    eprintln!("failed to poll peers: {}", e);
+                Err(RecvTimeoutError::Timeout) => {
+                    self.handle_event(EngineEvent::Tick { current_tick: tick }, tick);
+                    on_tick_callback(tick, self.get_stats());
+                    tick += Tick(1);
+                    next_tick_deadline += TICK_DURATION;
                 }
+                Err(RecvTimeoutError::Disconnected) => break,
             }
-            eprintln!("joining connection manager...");
-            connection_mgr.join();
-            eprintln!("exiting peer io thread");
-        })
-    }
-
-    fn start_announce_io_thread(&self, announce_io_rx: Receiver<AnnounceIoTask>) -> JoinHandle<()> {
-        let peer_io_tx = self.peer_io_tx.clone();
-        let shutdown_state = self.shutdown_state.clone();
-        std::thread::spawn(move || {
-            loop {
-                if shutdown_state.is_draining() || shutdown_state.is_terminated() {
-                    break;
-                }
-                if let Ok(ev) = announce_io_rx.recv() {
-                    match ev {
-                        AnnounceIoTask::Stop => return,
-                        AnnounceIoTask::PerformAnnounce {
-                            url,
-                            info_hash,
-                            peer_id,
-                            uploaded,
-                            downloaded,
-                            left,
-                        } => {
-                            eprintln!("fetching tracker: {}", url);
-                            match announce::announce(
-                                &url, &info_hash, &peer_id, 6881, uploaded, downloaded, left, None,
-                                None,
-                            ) {
-                                Ok(response) => {
-                                    eprintln!(
-                                        "fetched tracker: {} :: {} peers",
-                                        url,
-                                        response.peers.len()
-                                    );
-                                    if !response.peers.is_empty() {
-                                        let _ = peer_io_tx.send(PeerIoTask::NewPeers {
-                                            peers: response.peers,
-                                        });
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("tracker error for {} :: {}", url, e.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            eprintln!("exiting announce thread");
-        })
-    }
-
-    pub fn on_tick(&mut self) {
-        match self.shutdown_state.phase() {
-            ShutdownPhase::Running => {
-                self.check_announce();
-                self.handle_disk_io_tick();
-                self.handle_peer_io_tick();
-            }
-            ShutdownPhase::Completed => {
-                self.handle_disk_io_tick();
-                self.handle_peer_io_tick();
-            }
-            _ => {}
         }
     }
 
-    fn handle_disk_io_tick(&self) {
-        let _ = self.io_tx.send(IoTask::CalculateFileStats {
-            bitfield: self.stats.bitfield.clone(),
-        });
+    fn notify_interested(&self, addr: SocketAddr, interested: bool) {
+        if let Some(tx) = &self.net_tx {
+            let _ = tx.send(NetEvent::UpdatePeerInterest { addr, interested });
+        }
     }
 
-    fn handle_peer_io_tick(&mut self) {
-        let _ = self.peer_io_tx.send(PeerIoTask::StatsUpdate);
-        let _ = self.peer_io_tx.send(PeerIoTask::PeriodicReap);
-        let _ = self.peer_io_tx.send(PeerIoTask::MaybeRequestBlocks);
-        if let Some(last_adjust) = self.last_peers_adjust {
-            if last_adjust.elapsed() >= Duration::from_secs(5) {
-                self.last_peers_adjust = Some(Instant::now());
-                let _ = self.peer_io_tx.send(PeerIoTask::MaybeConnectPeers);
-            }
-        } else {
-            self.last_peers_adjust = Some(Instant::now());
-            let _ = self.peer_io_tx.send(PeerIoTask::MaybeConnectPeers);
+    fn handle_tick(&mut self, tick: Tick) {
+        self.check_announce();
+        self.update_stats();
+        let endgame = self.piece_picker.maybe_enter_endgame();
+        /*
+        if tick % PIECE_BLOCK_TIMEOUT == Tick(0) {
+            self.piece_picker
+                .requeue_timed_out_blocks(tick, PIECE_BLOCK_TIMEOUT);
         }
+        */
+        if let Some(tx) = &self.net_tx {
+            let _ = tx.send(NetEvent::Tick { tick, endgame });
+        }
+        if tick % FLUSH_INTERVAL == Tick(0) {
+            if let Some(tx) = &self.disk_tx {
+                let _ = tx.send(DiskJob::Flush);
+            }
+        }
+        self.check_complete();
+    }
+
+    fn check_complete(&mut self) {
+        if self.complete {
+            return;
+        }
+        if !self.piece_picker.bitfield().has_any_zero() {
+            self.complete = true;
+            if let Some(tx) = &self.engine_tx {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_secs(2));
+                    let _ = tx.send(EngineEvent::Complete);
+                });
+            }
+        }
+    }
+
+    fn update_stats(&mut self) {
+        self.stats.complete_pieces = self.piece_picker.bitfield().count_ones();
+        self.stats.downloaded_bytes = self.piece_picker.opportunistic_downloaded_bytes();
+        if self.stats.downloaded_bytes > self.total_size {
+            self.stats.downloaded_bytes = self.total_size;
+        }
+        self.stats.left = self.total_size.saturating_sub(self.stats.downloaded_bytes);
+        self.stats.inflight_blocks = self.piece_picker.inflight_blocks();
+        self.stats.files = self.disk_mgr.file_progress();
     }
 
     fn check_announce(&mut self) {
-        if self.stats.available_peers == 0 {
-            if let Some(tracker) = self.announce_mgr.next_due_tracker() {
-                tracker.announced();
-                let _ = self.announce_io_tx.send(AnnounceIoTask::PerformAnnounce {
-                    url: tracker.url.clone(),
-                    info_hash: self.torrent.info_hash,
-                    peer_id: self.peer_id,
-                    uploaded: 0,
-                    downloaded: self.stats.downloaded,
-                    left: self.stats.left,
-                });
+        let engine_tx = match &self.engine_tx {
+            Some(e) => e,
+            None => return,
+        };
+        let tx = match &self.announce_tx {
+            Some(t) => t,
+            None => return,
+        };
+        let tracker = match self.announce_mgr.next_due_tracker() {
+            Some(t) => t,
+            None => return,
+        };
+        tracker.announced();
+        let _ = tx.send(AnnounceEvent::Announce {
+            url: tracker.url.clone(),
+            info_hash: self.info_hash,
+            peer_id: self.peer_id,
+            uploaded: 0,
+            downloaded: 0,
+            left: self.total_size,
+            respond_to: engine_tx.clone(),
+        });
+    }
+
+    fn handle_announce_response(&self, response: TrackerResponse) {
+        let net_tx = match &self.net_tx {
+            Some(n) => n,
+            None => return,
+        };
+        let _ = net_tx.send(NetEvent::NewPeers {
+            addrs: response.peers,
+        });
+    }
+
+    fn on_verify_ready(&mut self, piece: u32, hash: [u8; 20]) {
+        self.verify_queue.push_back((piece, hash));
+        self.try_start_verify();
+    }
+
+    fn try_start_verify(&mut self) {
+        if self.verify_inflight {
+            return;
+        }
+
+        if let Some((piece, hash)) = self.verify_queue.pop_front() {
+            let disk_tx = match &self.disk_tx {
+                Some(d) => d,
+                None => return,
+            };
+            let engine_tx = match &self.engine_tx {
+                Some(e) => e,
+                None => return,
+            };
+            let _ = disk_tx.send(DiskJob::VerifyPiece {
+                piece,
+                expected_hash: hash,
+                respond_to: engine_tx.clone(),
+            });
+            self.verify_inflight = true;
+        }
+    }
+
+    fn on_piece_verified(&mut self, result: Result<(u32, bool), DiskError>) {
+        self.verify_inflight = false;
+
+        match result {
+            Ok((piece, verified)) => {
+                self.piece_picker.on_piece_verified(piece, verified);
+                if !verified {
+                    eprintln!("piece {} failed verification", piece);
+                }
+            }
+            Err(e) => {
+                eprintln!("failed to verify piece from disk: {:?}", e);
+            }
+        }
+
+        self.try_start_verify();
+    }
+
+    fn on_piece_block(
+        &mut self,
+        piece: u32,
+        offset: u32,
+        data: Bytes,
+        disk_tx: &Sender<DiskJob>,
+        engine_tx: &Sender<EngineEvent>,
+    ) {
+        let length = data.len();
+        let status = self.piece_picker.on_block_received(piece, offset);
+        if status.contains(PieceReceiveStatus::BLOCK_RECEIVED) {
+            self.disk_mgr.inner.start_write(piece);
+            if status.contains(PieceReceiveStatus::PIECE_COMPLETE) {
+                let hash = self.piece_hashes[piece as usize];
+                let ready_for_verify = self.disk_mgr.inner.queue_verify(piece, hash);
+                if ready_for_verify {
+                    self.on_verify_ready(piece, hash);
+                }
+            }
+            let _ = disk_tx.send(DiskJob::WriteBlock {
+                piece,
+                offset,
+                data,
+                respond_to: engine_tx.clone(),
+            });
+            if self.piece_picker.is_endgame() {
+                if let Some(net_tx) = &self.net_tx {
+                    let _ = net_tx.send(NetEvent::CancelBlock {
+                        piece,
+                        offset,
+                        length: length as u32,
+                    });
+                }
             }
         }
     }
@@ -763,4 +630,8 @@ fn generate_peer_id() -> [u8; 20] {
     }
 
     peer_id
+}
+
+pub const fn duration_to_ticks(duration: Duration) -> Tick {
+    Tick((duration.as_millis() / TICK_DURATION.as_millis()) as u64)
 }
