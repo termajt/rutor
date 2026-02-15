@@ -12,3 +12,5 @@ sysinfo = "0.30"
 mio = { version = "0.8", features = ["net", "os-poll"] }
 crossbeam = "0.8"
 bytes = "1"
+flexi_logger = "0.31"
+log = "0.4"

@@ -225,7 +225,7 @@ impl DiskManager {
         while !self.joinables.is_empty() {
             let j = self.joinables.pop().unwrap();
             if let Err(e) = j.join() {
-                eprintln!("failed to join worker: {:?}", e);
+                log::error!("failed to join worker: {:?}", e);
             }
         }
     }
@@ -236,7 +236,7 @@ impl DiskManager {
             let rx = rx.clone();
             let inner = self.inner.clone();
             self.joinables.push(std::thread::spawn(move || {
-                eprintln!(
+                log::info!(
                     "disk io worker {:?} starting...",
                     std::thread::current().id()
                 );
@@ -284,14 +284,14 @@ impl DiskManager {
                             }
                             DiskJob::FlushPiece { piece } => {
                                 if let Err(e) = flush_piece(piece, &layout) {
-                                    eprintln!("failed to flush piece {}: {:?}", piece, e);
+                                    log::error!("failed to flush piece {}: {:?}", piece, e);
                                 }
                             }
                         },
                         Err(_) => break,
                     }
                 }
-                eprintln!(
+                log::info!(
                     "disk io worker {:?} exiting...",
                     std::thread::current().id()
                 );

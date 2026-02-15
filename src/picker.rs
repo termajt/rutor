@@ -453,10 +453,6 @@ impl PiecePicker {
             }
         }
 
-        if !requeued.is_empty() {
-            eprintln!("> {} blocks timed out based on tick!", requeued.len());
-        }
-
         requeued
     }
 
@@ -485,9 +481,11 @@ impl PiecePicker {
         let remaining = self.remaining_blocks();
         if remaining > 0 && remaining <= self.inflight_blocks as u64 {
             self.endgame = true;
-            eprintln!(
+            log::info!(
                 "entering endgame: {} / {} blocks remaining, inflight: {}",
-                remaining, self.total_blocks, self.inflight_blocks
+                remaining,
+                self.total_blocks,
+                self.inflight_blocks
             );
             return true;
         }

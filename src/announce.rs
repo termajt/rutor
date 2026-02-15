@@ -181,7 +181,7 @@ impl AnnounceManager {
     pub fn start(&mut self, rx: &Receiver<AnnounceEvent>) {
         let rx = rx.clone();
         let join = std::thread::spawn(move || {
-            eprintln!(
+            log::info!(
                 "announce thread {:?} starting...",
                 std::thread::current().id()
             );
@@ -207,7 +207,7 @@ impl AnnounceManager {
                                         respond_to.send(EngineEvent::AnnounceResponse { response });
                                 }
                                 Err(e) => {
-                                    eprintln!("{} failed announce: {}", url, e);
+                                    log::error!("{} failed to announce: {:?}", url, e);
                                 }
                             }
                         }
@@ -215,7 +215,7 @@ impl AnnounceManager {
                     Err(_) => break,
                 }
             }
-            eprintln!(
+            log::info!(
                 "announce thread {:?} exiting...",
                 std::thread::current().id()
             );

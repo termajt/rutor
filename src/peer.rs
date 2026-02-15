@@ -239,19 +239,19 @@ impl PeerManager {
             match peer.state {
                 PeerState::Handshaking => {
                     if now >= peer.handshake_deadline {
-                        eprintln!("<> {} handshake timeout", peer.addr);
+                        log::debug!("{} handshake timeout", peer.addr);
                         actions.push(PeerAction::Close { token: peer.token });
                     }
                 }
                 PeerState::Active => {
                     if now >= peer.last_activity + PEER_IDLE_TIMEOUT {
-                        eprintln!("<> {} idle timeout", peer.addr);
+                        log::info!("{} idle timeout", peer.addr);
                         actions.push(PeerAction::Close { token: peer.token });
                         continue;
                     }
 
                     if now >= peer.last_outbound + KEEPALIVE_INTERVAL {
-                        eprintln!("< {} keepalive", peer.addr);
+                        log::info!("{} keepalive", peer.addr);
                         push_write_peer_msg(peer, &PeerMessage::KeepAlive, &mut actions, now);
                     }
 
@@ -297,27 +297,7 @@ impl PeerManager {
             let count = missing_blocks.len().min(peer.get_request_block_count());
             if count > 0 {
                 return vec![PeerAction::PickBlocks { token, count }];
-            } else {
-                eprintln!(
-                    ">>> {} cannot request blocks, choked={}, interested={}, desired_count={}, inflight={}, missing_block_count={}",
-                    peer.addr,
-                    peer.choked,
-                    peer.interested,
-                    peer.desired_outstanding_requests(),
-                    peer.pending_requests.len(),
-                    missing_blocks.len()
-                )
             }
-        } else {
-            eprintln!(
-                "> {} cannot request blocks, choked={}, interested={}, desired_count={}, inflight={}, missing_block_count={}",
-                peer.addr,
-                peer.choked,
-                peer.interested,
-                peer.desired_outstanding_requests(),
-                peer.pending_requests.len(),
-                missing_blocks.len()
-            )
         }
 
         vec![]
@@ -385,7 +365,7 @@ impl PeerManager {
                     return vec![];
                 }
                 Err(e) => {
-                    eprintln!("{} handshake failed: {}", peer.addr, e);
+                    log::error!("{} handshake failed: {:?}", peer.addr, e);
                     return vec![PeerAction::Close { token }];
                 }
             },
@@ -565,7 +545,7 @@ fn parse_messages(peer: &mut Peer, total_pieces: usize, now: Tick) -> Vec<PeerAc
         let len = header.get_u32() as usize;
 
         if len > MAX_MESSAGE_LEN {
-            eprintln!("{} invalid message length", peer.addr);
+            log::error!("{} invalid message length: {}", peer.addr, len);
             return vec![PeerAction::Close { token: peer.token }];
         }
 
@@ -587,7 +567,7 @@ fn parse_messages(peer: &mut Peer, total_pieces: usize, now: Tick) -> Vec<PeerAc
                 handle_message(peer, msg, now, &mut actions);
             }
             Err(e) => {
-                eprintln!("{} invalid message: {}", peer.addr, e);
+                log::error!("{} invalid message: {:?}", peer.addr, e);
                 actions.push(PeerAction::Close { token: peer.token });
                 break;
             }

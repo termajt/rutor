@@ -130,7 +130,7 @@ impl Connection {
                     self.last_interest = interest;
                 }
                 Err(e) => {
-                    eprintln!("{} failed to reregister poll: {:?}", self.addr, e);
+                    log::error!("{} failed to reregister poll: {:?}", self.addr, e);
                 }
             }
         }
@@ -211,14 +211,14 @@ impl NetManager {
         let rx = rx.clone();
         let engine_tx = engine_tx.clone();
         let join = std::thread::spawn(move || {
-            eprintln!(
+            log::info!(
                 "net io thread {:?} starting...",
                 std::thread::current().id()
             );
             let mut poll = match Poll::new() {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("failed to create poll: {}", e);
+                    log::error!("failed to create poll: {}", e);
                     return;
                 }
             };
@@ -268,7 +268,7 @@ impl NetManager {
                         max_read_bytes_per_sec,
                         max_write_bytes_per_sec,
                     ) {
-                        eprintln!("{} connect failed: {:?}", addr, e);
+                        log::warn!("{} connect failed: {:?}", addr, e);
                     }
                 }
 
@@ -281,7 +281,7 @@ impl NetManager {
 
                 for addr in timed_out {
                     if let Some(conn) = connections.get(&addr) {
-                        eprintln!("<> {} connect timed out, closing", addr);
+                        log::warn!("{} connect timed out", addr);
                         let _ = handle_close(
                             conn.token,
                             &mut poll,
@@ -295,7 +295,7 @@ impl NetManager {
                 }
 
                 if let Err(e) = poll.poll(&mut events, Some(POLL_TIMEOUT)) {
-                    eprintln!("failed to poll connections: {}", e);
+                    log::error!("failed to poll connections: {}", e);
                     continue;
                 }
 
@@ -319,7 +319,7 @@ impl NetManager {
                                 peer_actions.push(actions);
                             }
                             Ok(false) => {
-                                eprintln!("{} closed the connection", conn.addr);
+                                log::warn!("{} closed the connection", conn.addr);
                                 let _ = handle_close(
                                     token,
                                     &mut poll,
@@ -332,7 +332,7 @@ impl NetManager {
                                 continue;
                             }
                             Err(e) => {
-                                eprintln!("{} read error: {:?}", conn.addr, e);
+                                log::error!("{} read error: {:?}", conn.addr, e);
                                 let _ = handle_close(
                                     token,
                                     &mut poll,
@@ -350,7 +350,7 @@ impl NetManager {
                     if event.is_writable() {
                         if conn.connecting {
                             if let Ok(Some(err)) = conn.socket.take_error() {
-                                eprintln!("{} connect error: {:?}", conn.addr, err);
+                                log::warn!("{} connect error: {:?}", conn.addr, err);
                                 let _ = handle_close(
                                     token,
                                     &mut poll,
@@ -367,7 +367,7 @@ impl NetManager {
                             peer_actions.push(actions);
                         }
                         if let Err(e) = socket_write(conn, &mut poll, &mut global_write_limiter) {
-                            eprintln!("{} write error: {:?}", conn.addr, e);
+                            log::error!("{} write error: {:?}", conn.addr, e);
                             let _ = handle_close(
                                 token,
                                 &mut poll,
@@ -413,7 +413,7 @@ impl NetManager {
                 }
             }
 
-            eprintln!("net io thread {:?} exiting...", std::thread::current().id());
+            log::info!("net io thread {:?} exiting...", std::thread::current().id());
         });
         self.join = Some(join);
     }
@@ -674,7 +674,6 @@ fn consume_events(
 fn socket_read(conn: &mut Connection, global_limiter: &mut RateLimiter) -> io::Result<bool> {
     let mut budget = conn.read_limiter.allow().min(global_limiter.allow());
     if budget == 0 {
-        eprintln!("<> {} is rate limited, now available bytes to read", budget);
         return Ok(true);
     }
     let mut buf = [0u8; 16 * 1024];
@@ -707,10 +706,6 @@ fn socket_write(
 ) -> io::Result<()> {
     let mut budget = conn.write_limiter.allow().min(global_limiter.allow());
     if budget == 0 {
-        eprintln!(
-            "<> {} is rate limited, now available bytes to write",
-            budget
-        );
         return Ok(());
     }
     while budget > 0

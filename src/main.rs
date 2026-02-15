@@ -1,3 +1,5 @@
+use flexi_logger::{Age, Cleanup, Criterion, DeferredNow, FileSpec, Logger, Naming};
+use log::{LevelFilter, Record};
 use rutor::bytespeed::ByteSpeed;
 use rutor::engine::{Engine, EngineStats, Tick, duration_to_ticks};
 use rutor::net::MAX_CONNECTIONS;
@@ -305,20 +307,60 @@ fn print_usage_header<W: Write>(writer: &mut W, prog: &str) {
 fn print_usage<W: Write>(writer: &mut W, prog: &str) {
     print_usage_header(writer, prog);
 
-    let mut usage = String::from("\n");
-    usage.push_str("OPTIONS:\n");
-    usage.push_str(
-        "  -d/--destination    destination folder of where the torrent should be downloaded to\n",
-    );
-    usage.push_str("  -c/--consumption    shows cpu and memory consumption used by the client\n");
-    usage
-        .push_str("  -r/--max-read       maximum read bytes per second (e.g., 1024, 1MB, 2.5MB)\n");
-    usage.push_str(
-        "  -w/--max-write      maximum write bytes per second (e.g., 1024, 1MB, 2.5MB)\n",
-    );
-    usage.push_str("  -h/--help           shows this help message and exits");
+    let options = [
+        ("-d/--destination", "Destination folder for the torrent"),
+        ("-c/--consumption", "Show CPU and memory usage"),
+        (
+            "-r/--max-read",
+            "Maximum read bytes per second (e.g., 1024, 1MB, 2.5MB)",
+        ),
+        (
+            "-w/--max-write",
+            "Maximum write bytes per second (e.g., 1024, 1MB, 2.5MB)",
+        ),
+        (
+            "-v",
+            "Set verbosity level:\n\
+               -v     Errors only (default)\n\
+               -vv    Warnings and errors\n\
+               -vvv   Info, warnings, and errors\n\
+               -vvvv  Debug, info, warnings, and errors",
+        ),
+        ("-h/--help", "Show this help message and exit"),
+    ];
 
-    let _ = writeln!(writer, "{}", usage);
+    // Print header
+    let _ = writeln!(writer, "\nOPTIONS:");
+
+    // Compute max flag width for alignment
+    let max_flag_width = options
+        .iter()
+        .map(|(flag, _)| flag.len())
+        .max()
+        .unwrap_or(0);
+
+    for (flag, desc) in &options {
+        let lines: Vec<&str> = desc.split('\n').collect();
+        // First line
+        let first_line = format!(
+            "  {:flag_width$}   {}",
+            flag,
+            lines[0],
+            flag_width = max_flag_width
+        );
+        let _ = writeln!(writer, "{}", first_line);
+
+        // Remaining lines
+        for line in &lines[1..] {
+            let _ = writeln!(
+                writer,
+                "  {:flag_width$}   {}",
+                "",
+                line,
+                flag_width = max_flag_width
+            );
+        }
+    }
 }
 
 fn parse_bytes(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
@@ -350,6 +392,47 @@ fn parse_bytes(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(number as usize)
 }
 
+fn parse_verbosity(verbosity_level: usize) -> LevelFilter {
+    match verbosity_level {
+        0 | 1 => LevelFilter::Error,
+        2 => LevelFilter::Warn,
+        3 => LevelFilter::Info,
+        _ => LevelFilter::Debug,
+    }
+}
+
+fn log_format(w: &mut dyn Write, now: &mut DeferredNow, record: &Record) -> std::io::Result<()> {
+    write!(
+        w,
+        "{} [{}] [{}:{}] {}",
+        now.format_rfc3339(),
+        record.level(),
+        //record.module_path().unwrap_or("unknown"),
+        record.file().unwrap_or("unknown"),
+        record.line().unwrap_or(0),
+        &record.args()
+    )
+}
+
+fn init_logger(level: LevelFilter) -> Result<(), Box<dyn std::error::Error>> {
+    Logger::try_with_env_or_str(level.to_string())?
+        .log_to_file(
+            FileSpec::default()
+                .directory("logs")
+                .basename("rutor")
+                .suffix("log"),
+        )
+        .rotate(
+            Criterion::Age(Age::Day),
+            Naming::Numbers,
+            Cleanup::KeepLogFiles(5),
+        )
+        .format(log_format)
+        .start()?;
+
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = env::args().collect::<Vec<String>>();
     let program = Path::new(&args[0])
@@ -363,6 +446,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut show_consumption = false;
     let mut max_read_bytes_per_sec = 0;
     let mut max_write_bytes_per_sec = 0;
+    let mut verbosity_level = 0;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -407,6 +491,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             }
+            arg if arg.starts_with("-v") => {
+                verbosity_level = arg.chars().skip(1).filter(|&c| c == 'v').count();
+            }
             arg if filename.is_empty() => {
                 filename = arg.to_string();
             }
@@ -424,6 +511,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_usage_header(&mut stderr, &program);
         return Err("missing torrent file".into());
     }
+
+    let log_level = parse_verbosity(verbosity_level);
+    init_logger(log_level)?;
 
     let pid = sysinfo::get_current_pid()?;
     let mut system = System::new_all();
@@ -445,6 +535,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let progress_interval = duration_to_ticks(Duration::from_secs(1));
     let mut first_draw = true;
+    log::debug!("Starting engine");
     engine.start(|now, stats| {
         if now % progress_interval == Tick(0) {
             if show_consumption {
@@ -454,7 +545,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             first_draw = false;
         }
     });
+    log::debug!("Stopping engine");
     engine.stop();
+    log::debug!("Joining engine");
     engine.join();
     progress_tracker.display_peak();
 

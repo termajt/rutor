@@ -268,28 +268,28 @@ impl Engine {
     fn handle_event(&mut self, event: EngineEvent, now: Tick) {
         match event {
             EngineEvent::PeerConnected { addr } => {
-                eprintln!("> {} connected", addr);
+                log::info!("{} connected", addr);
             }
             EngineEvent::PeerDisconnected {
                 addr,
                 token,
                 bitfield,
             } => {
-                eprintln!("> {} disconnected", addr);
+                log::info!("{} disconnected", addr);
                 if let Some(bitfield) = bitfield {
                     self.piece_picker.remove_peer_bitfield(&bitfield);
                 }
                 let _ = self.piece_picker.requeue_blocks_for_peer(token);
             }
             EngineEvent::AnnounceResponse { response } => {
-                eprintln!("> tracker response, {} peers", response.peers.len());
+                log::debug!("tracker response, {} peers", response.peers.len());
                 self.handle_announce_response(response);
             }
             EngineEvent::Tick { current_tick } => {
                 self.handle_tick(current_tick);
             }
             EngineEvent::PeerHandshakeSuccess { addr } => {
-                eprintln!("> {} handshake success", addr);
+                log::debug!("{} handshake success", addr);
             }
             EngineEvent::PeerBitfield { addr, bitfield } => {
                 self.piece_picker.register_peer_bitfield(&bitfield);
@@ -342,7 +342,7 @@ impl Engine {
             }
             EngineEvent::BlockWritten { result } => {
                 if let Err(e) = result {
-                    eprintln!("failed to write block(s) to disk: {:?}", e);
+                    log::error!("failed to write block(s) to disk: {:?}", e);
                 }
             }
             EngineEvent::PieceVerification { result } => {
@@ -359,7 +359,6 @@ impl Engine {
                 self.stop();
             }
             EngineEvent::PeerChoked { token } => {
-                eprintln!("> {:?} choked, requeue blocks!", token);
                 let _ = self.piece_picker.requeue_blocks_for_peer(token);
             }
             EngineEvent::RequestMissingBlocks { token, bitfield } => {
@@ -567,12 +566,14 @@ impl Engine {
         match result {
             Ok((piece, verified)) => {
                 self.piece_picker.on_piece_verified(piece, verified);
-                if !verified {
-                    eprintln!("piece {} failed verification", piece);
+                if verified {
+                    log::debug!("piece {} verified", piece);
+                } else {
+                    log::warn!("piece {} failed verification", piece);
                 }
             }
             Err(e) => {
-                eprintln!("failed to verify piece from disk: {:?}", e);
+                log::error!("failed to verify piece from disk: {:?}", e);
             }
         }
 
