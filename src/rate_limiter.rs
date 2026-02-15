@@ -2,13 +2,14 @@ use std::time::Instant;
 
 #[derive(Debug)]
 pub struct RateLimiter {
-    pub bytes_per_sec: usize,
-    available: usize,
+    bytes_per_sec: f64,
+    available: f64,
     last: Instant,
 }
 
 impl RateLimiter {
     pub fn new(bytes_per_sec: usize) -> Self {
+        let bytes_per_sec = bytes_per_sec as f64;
         Self {
             bytes_per_sec,
             available: bytes_per_sec,
@@ -18,24 +19,24 @@ impl RateLimiter {
 
     fn refill(&mut self) {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last);
+        let elapsed = now.duration_since(self.last).as_secs_f64();
 
-        let added = (elapsed.as_secs_f64() * self.bytes_per_sec as f64) as usize;
-        if added > 0 {
-            self.available = (self.available + added).min(self.bytes_per_sec);
-            self.last = now;
+        self.available += self.bytes_per_sec * elapsed;
+        if self.available > self.bytes_per_sec {
+            self.available = self.bytes_per_sec;
         }
+        self.last = now;
     }
 
-    /// Allow up to `want` bytes.
-    /// Returns how many bytes are allowed **right now**.
-    pub fn allow(&mut self, want: usize) -> usize {
-        if self.bytes_per_sec == 0 {
+    pub fn allow(&mut self) -> usize {
+        if self.bytes_per_sec == 0.0 {
             return usize::MAX;
         }
         self.refill();
-        let granted = want.min(self.available);
-        self.available = self.available.saturating_sub(granted);
-        granted
+
+        let granted = self.available.floor();
+        self.available -= granted;
+
+        granted as usize
     }
 }

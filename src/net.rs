@@ -19,8 +19,6 @@ use crate::{
 };
 
 pub const MAX_CONNECTIONS: usize = 50;
-const MAX_READ_PER_POLL: usize = 64 * 1024;
-const MAX_WRITE_PER_POLL: usize = 64 * 1024;
 const CONNECTION_TIMEOUT: Tick = duration_to_ticks(Duration::from_secs(3));
 
 #[derive(Debug)]
@@ -88,6 +86,8 @@ struct Connection {
     connecting: bool,
     connect_deadline: Tick,
     last_interest: Interest,
+    read_limiter: RateLimiter,
+    write_limiter: RateLimiter,
 }
 
 impl Connection {
@@ -97,6 +97,8 @@ impl Connection {
         socket: TcpStream,
         current_tick: Tick,
         interest: Interest,
+        max_read_bytes_per_sec: usize,
+        max_write_bytes_per_sec: usize,
     ) -> Self {
         Self {
             addr,
@@ -107,6 +109,8 @@ impl Connection {
             connecting: true,
             connect_deadline: current_tick + CONNECTION_TIMEOUT,
             last_interest: interest,
+            read_limiter: RateLimiter::new(max_read_bytes_per_sec),
+            write_limiter: RateLimiter::new(max_write_bytes_per_sec),
         }
     }
 
@@ -224,10 +228,10 @@ impl NetManager {
             let mut token_to_addr = HashMap::new();
             let mut token_gen = TokenGenerator::new();
             let mut current_tick: Tick = Tick(0);
-            let mut read_limiter = RateLimiter::new(max_read_bytes_per_sec);
             let mut connection_pool = ConnectionPool::default();
-            let mut write_limiter = RateLimiter::new(max_write_bytes_per_sec);
             let mut idle_since = None;
+            let mut global_read_limiter = RateLimiter::new(max_read_bytes_per_sec);
+            let mut global_write_limiter = RateLimiter::new(max_write_bytes_per_sec);
             loop {
                 let (shutdown, tick) = consume_events(
                     &rx,
@@ -261,6 +265,8 @@ impl NetManager {
                         &mut connections,
                         &mut token_to_addr,
                         current_tick,
+                        max_read_bytes_per_sec,
+                        max_write_bytes_per_sec,
                     ) {
                         eprintln!("{} connect failed: {:?}", addr, e);
                     }
@@ -306,8 +312,7 @@ impl NetManager {
                     };
 
                     if event.is_readable() {
-                        let budget = read_limiter.allow(MAX_READ_PER_POLL);
-                        match socket_read(conn, budget) {
+                        match socket_read(conn, &mut global_read_limiter) {
                             Ok(true) => {
                                 let actions = peer_mgr.on_data(token, &conn.incoming, current_tick);
                                 conn.incoming.clear();
@@ -361,8 +366,7 @@ impl NetManager {
                             let actions = peer_mgr.on_connected(conn.addr, token, current_tick);
                             peer_actions.push(actions);
                         }
-                        let budget = write_limiter.allow(MAX_WRITE_PER_POLL);
-                        if let Err(e) = socket_write(conn, &mut poll, budget) {
+                        if let Err(e) = socket_write(conn, &mut poll, &mut global_write_limiter) {
                             eprintln!("{} write error: {:?}", conn.addr, e);
                             let _ = handle_close(
                                 token,
@@ -667,7 +671,12 @@ fn consume_events(
     (false, current_tick)
 }
 
-fn socket_read(conn: &mut Connection, mut budget: usize) -> io::Result<bool> {
+fn socket_read(conn: &mut Connection, global_limiter: &mut RateLimiter) -> io::Result<bool> {
+    let mut budget = conn.read_limiter.allow().min(global_limiter.allow());
+    if budget == 0 {
+        eprintln!("<> {} is rate limited, now available bytes to read", budget);
+        return Ok(true);
+    }
     let mut buf = [0u8; 16 * 1024];
     loop {
         if budget == 0 {
@@ -691,7 +700,19 @@ fn socket_read(conn: &mut Connection, mut budget: usize) -> io::Result<bool> {
     Ok(true)
 }
 
-fn socket_write(conn: &mut Connection, poll: &mut Poll, mut budget: usize) -> io::Result<()> {
+fn socket_write(
+    conn: &mut Connection,
+    poll: &mut Poll,
+    global_limiter: &mut RateLimiter,
+) -> io::Result<()> {
+    let mut budget = conn.write_limiter.allow().min(global_limiter.allow());
+    if budget == 0 {
+        eprintln!(
+            "<> {} is rate limited, now available bytes to write",
+            budget
+        );
+        return Ok(());
+    }
     while budget > 0
         && let Some(front) = conn.outgoing.front_mut()
     {
@@ -792,6 +813,8 @@ fn handle_connect(
     connections: &mut HashMap<SocketAddr, Connection>,
     token_to_addr: &mut HashMap<Token, SocketAddr>,
     now: Tick,
+    max_read_bytes_per_sec: usize,
+    max_write_bytes_per_sec: usize,
 ) -> Result<(), NetError> {
     let mut stream =
         TcpStream::connect(addr).map_err(|err| NetError::ConnectFailure { addr, reason: err })?;
@@ -802,7 +825,18 @@ fn handle_connect(
         .map_err(|err| NetError::ConnectFailure { addr, reason: err })?;
 
     token_to_addr.insert(token, addr);
-    connections.insert(addr, Connection::new(addr, token, stream, now, interest));
+    connections.insert(
+        addr,
+        Connection::new(
+            addr,
+            token,
+            stream,
+            now,
+            interest,
+            max_read_bytes_per_sec,
+            max_write_bytes_per_sec,
+        ),
+    );
 
     Ok(())
 }
